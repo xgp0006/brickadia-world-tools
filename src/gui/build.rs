@@ -92,7 +92,7 @@ impl BlockType {
         matches!(self, Self::Studded)
     }
 
-    const fn micro(self) -> bool {
+    pub(crate) const fn micro(self) -> bool {
         matches!(self, Self::Micro)
     }
 }
@@ -110,6 +110,12 @@ pub(crate) struct BuildRequest {
     /// coarser bricks (~1/factor² count). Applied in `downsample` before the
     /// heightmap is built; the greedy mesher itself always runs at `size = 1`.
     pub(crate) density_factor: u16,
+    /// Studs of brick width per DEM cell (1 = legacy 1 stud/cell). Multiplies
+    /// brick XY footprint and position, NOT brick count — the way to make a
+    /// small real-world area walkable-scale. SRTMGL1's ~30 m cells at 1
+    /// stud/cell make a 1 km box ~33 studs wide; raise this (and vertical
+    /// exaggeration to match) for playable proportions.
+    pub(crate) horizontal_scale: u16,
     pub(crate) block_type: BlockType,
     pub(crate) glow: bool,
     pub(crate) no_collision: bool,
@@ -278,9 +284,7 @@ pub(crate) fn run_build(
         Some(im) => generate_bricks(
             &heightmap,
             im,
-            request.block_type,
-            request.glow,
-            request.no_collision,
+            BrickStyle::from_request(&request),
             Arc::clone(&progress),
             Arc::clone(&cancel),
         )?,
@@ -293,9 +297,7 @@ pub(crate) fn run_build(
             generate_bricks(
                 &heightmap,
                 &flat,
-                request.block_type,
-                request.glow,
-                request.no_collision,
+                BrickStyle::from_request(&request),
                 Arc::clone(&progress),
                 Arc::clone(&cancel),
             )?
@@ -747,24 +749,46 @@ fn build_heightmap(raster: &DemRaster, vertical_scale: f32) -> DemHeightmap {
     }
 }
 
+/// Brick-shaping knobs for `generate_bricks`, lifted off `BuildRequest` so
+/// tests can drive generation without constructing a full network request.
+#[derive(Clone, Copy)]
+struct BrickStyle {
+    block_type: BlockType,
+    horizontal_scale: u16,
+    glow: bool,
+    nocollide: bool,
+}
+
+impl BrickStyle {
+    fn from_request(request: &BuildRequest) -> Self {
+        Self {
+            block_type: request.block_type,
+            horizontal_scale: request.horizontal_scale,
+            glow: request.glow,
+            nocollide: request.no_collision,
+        }
+    }
+}
+
 fn generate_bricks(
     heightmap: &DemHeightmap,
     colormap: &dyn Colormap,
-    block_type: BlockType,
-    glow: bool,
-    nocollide: bool,
+    style: BrickStyle,
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
 ) -> Result<Vec<brdb::Brick>, BuildError> {
-    // `size` is the stud→unit conversion (1 stud = 5 units; micro bricks are
-    // ×1), NOT a density knob — density is handled upstream by `downsample`-ing
-    // the DEM grid. Dropping the ×5 builds terrain at 1/5 horizontal scale.
-    // `scale: 1` because vertical exaggeration is applied upstream in
+    let BrickStyle { block_type, horizontal_scale, glow, nocollide } = style;
+    // `size` = stud→unit conversion (1 stud = 5 units; micro ×1) times the
+    // user's studs-per-cell multiplier. It scales brick XY footprint AND
+    // position, never count; the mesher's max_quad clamp (1000/size) shrinks
+    // inversely so world-unit brick caps hold at any multiplier. Density is
+    // handled upstream by `downsample`-ing the DEM grid. `scale: 1` because
+    // vertical exaggeration is applied upstream in
     // `build_heightmap(vertical_scale)`; `cull/img/lrgb/snap/hdmap` change
     // pixel/height semantics that would break a terrain save if exposed — they
     // are not user knobs here.
     let options = GenOptions {
-        size: if block_type.micro() { 1 } else { 5 },
+        size: horizontal_scale.max(1) * if block_type.micro() { 1 } else { 5 },
         scale: 1,
         cull: false,
         asset: block_type.asset(),
@@ -1175,9 +1199,7 @@ mod tests {
         let studded = generate_bricks(
             &heightmap,
             &cm,
-            BlockType::SmoothTile,
-            false,
-            false,
+            BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
             Arc::clone(&progress),
             Arc::clone(&cancel),
         )
@@ -1193,11 +1215,9 @@ mod tests {
         let micro = generate_bricks(
             &heightmap,
             &cm,
-            BlockType::Micro,
-            false,
-            false,
-            progress,
-            cancel,
+            BrickStyle { block_type: BlockType::Micro, horizontal_scale: 1, glow: false, nocollide: false },
+            Arc::clone(&progress),
+            Arc::clone(&cancel),
         )
         .expect("micro gen");
         assert!(!micro.is_empty(), "micro build must emit bricks");
@@ -1205,6 +1225,28 @@ mod tests {
             assert!(
                 (1..=4).contains(&x) && (1..=4).contains(&y),
                 "micro brick XY must stay in ×1 units bounded by the 4-cell grid, got {x}×{y}",
+            );
+        }
+
+        // horizontal_scale multiplies XY footprint (×3 → multiples of 15)
+        // without changing the brick count vs the ×1 build.
+        let scaled = generate_bricks(
+            &heightmap,
+            &cm,
+            BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 3, glow: false, nocollide: false },
+            progress,
+            cancel,
+        )
+        .expect("scaled gen");
+        assert_eq!(
+            scaled.len(),
+            studded.len(),
+            "horizontal_scale must widen bricks, never change their count",
+        );
+        for (x, y) in xy_sizes(&scaled) {
+            assert!(
+                x >= 15 && x % 15 == 0 && y >= 15 && y % 15 == 0,
+                "scale-3 brick XY must be multiples of 15 units, got {x}×{y}",
             );
         }
     }
@@ -1225,9 +1267,7 @@ mod tests {
         let result = generate_bricks(
             &heightmap,
             &cm,
-            BlockType::SmoothTile,
-            false,
-            false,
+            BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
             progress,
             cancel,
         );
@@ -1397,9 +1437,7 @@ mod tests {
             generate_bricks(
                 &hm,
                 &cm,
-                BlockType::SmoothTile,
-                false,
-                false,
+                BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
                 Arc::clone(&progress),
                 Arc::clone(&cancel),
             )
@@ -1467,9 +1505,7 @@ mod tests {
         let colored = generate_bricks(
             &heightmap,
             &img_cm,
-            BlockType::SmoothTile,
-            false,
-            false,
+            BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
             Arc::clone(&progress),
             Arc::clone(&cancel),
         )
@@ -1486,9 +1522,7 @@ mod tests {
         let flat = generate_bricks(
             &heightmap,
             &flat_cm,
-            BlockType::SmoothTile,
-            false,
-            false,
+            BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
             progress,
             cancel,
         )
@@ -1530,6 +1564,7 @@ mod tests {
             opentopo_key: None,
             vertical_scale: 5.0,
             density_factor: 2,
+            horizontal_scale: 1,
             block_type: BlockType::SmoothTile,
             glow: false,
             no_collision: false,
@@ -1609,6 +1644,7 @@ mod tests {
             opentopo_key: Some("otkey".into()),
             vertical_scale: 1.0,
             density_factor: 1,
+            horizontal_scale: 1,
             block_type: BlockType::SmoothTile,
             glow: false,
             no_collision: false,
@@ -1627,6 +1663,7 @@ mod tests {
             opentopo_key: None,
             vertical_scale: 1.0,
             density_factor: 1,
+            horizontal_scale: 1,
             block_type: BlockType::SmoothTile,
             glow: false,
             no_collision: false,
@@ -1666,6 +1703,7 @@ mod tests {
             opentopo_key: None,
             vertical_scale: 5.0,
             density_factor: 2,
+            horizontal_scale: 1,
             block_type: BlockType::SmoothTile,
             glow: false,
             no_collision: false,
@@ -1719,6 +1757,7 @@ mod tests {
             opentopo_key: Some(key),
             vertical_scale: 5.0,
             density_factor: 1,
+            horizontal_scale: 1,
             block_type: BlockType::SmoothTile,
             glow: false,
             no_collision: false,
@@ -1787,6 +1826,7 @@ mod tests {
             opentopo_key: None,
             vertical_scale: 5.0,
             density_factor: 2,
+            horizontal_scale: 1,
             block_type: BlockType::SmoothTile,
             glow: false,
             no_collision: false,
@@ -1836,6 +1876,7 @@ mod tests {
             opentopo_key: None,
             vertical_scale: 5.0,
             density_factor: 1,
+            horizontal_scale: 1,
             block_type: BlockType::SmoothTile,
             glow: false,
             no_collision: false,

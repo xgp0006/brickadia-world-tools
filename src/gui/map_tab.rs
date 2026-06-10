@@ -167,6 +167,7 @@ pub(crate) struct MapTabState {
     imagery_source: ImagerySource,
     block_type: BlockType,
     density_factor: u16,
+    horizontal_scale: u16,
     vertical_scale: f32,
     glow: bool,
     no_collision: bool,
@@ -211,6 +212,7 @@ impl MapTabState {
             imagery_source: ImagerySource::EsriWorldImagery,
             block_type: BlockType::SmoothTile,
             density_factor: 1,
+            horizontal_scale: 1,
             vertical_scale: DEFAULT_VERTICAL_SCALE,
             glow: false,
             no_collision: false,
@@ -551,6 +553,20 @@ fn draw_brick_options(state: &mut MapTabState, ui: &mut Ui) {
     );
 
     ui.add_space(4.0);
+    ui.label("Horizontal scale (studs per cell)");
+    ui.add(
+        egui::DragValue::new(&mut state.horizontal_scale)
+            .range(1..=16)
+            .speed(0.1),
+    )
+    .on_hover_text(
+        "Widens each terrain cell to N studs — same brick count, bigger map. \
+         The cure for tiny output: SRTMGL1's ~30 m cells at 1 stud/cell make a \
+         1 km box only ~33 studs wide. Raise vertical exaggeration to match or \
+         the terrain will look flattened.",
+    );
+
+    ui.add_space(4.0);
     ui.label("Vertical exaggeration");
     ui.add(
         egui::Slider::new(&mut state.vertical_scale, 0.1..=20.0)
@@ -643,6 +659,7 @@ fn start_fetch(state: &mut MapTabState) {
         opentopo_key: state.config.opentopo_api_key.clone(),
         vertical_scale: state.vertical_scale,
         density_factor: state.density_factor,
+        horizontal_scale: state.horizontal_scale,
         block_type: state.block_type,
         glow: state.glow,
         no_collision: state.no_collision,
@@ -766,6 +783,7 @@ fn draw_status(state: &mut MapTabState, ui: &mut Ui) {
     });
     if let Some(b) = state.bbox {
         draw_zoom_readout(state, b, ui);
+        draw_output_estimate(state, b, ui);
     }
     if let Some(err) = &state.bbox_error {
         ui.colored_label(STATUS_ERROR_FG, err);
@@ -794,6 +812,13 @@ fn draw_zoom_readout(state: &MapTabState, b: BBox, ui: &mut Ui) {
         } else {
             ui.small(msg);
         }
+        if area < 100.0 {
+            ui.colored_label(
+                STATUS_WARN_FG,
+                "SRTMGL1 is ~30 m per cell — for areas this small, AWS Terrarium (~5 m/cell at \
+                 z15) gives far finer terrain",
+            );
+        }
     } else if let Some(src) = super::dem_sources::tile_source_for(state.dem_source, token) {
         emit_zoom_line(ui, "DEM", &bbox, src.max_zoom());
     }
@@ -809,6 +834,47 @@ fn emit_zoom_line(ui: &mut Ui, label: &str, bbox: &BBoxLatLon, cap: u32) {
     } else {
         ui.small(format!("{label} zoom {z} (cap z{cap})"));
     }
+}
+
+/// Predicted footprint of the generated map for the current bbox + settings,
+/// shown BEFORE fetching so "why is my map tiny" is answerable from the status
+/// bar. DEM cell size: SRTMGL1 ≈ 30 m; XYZ tile sources use the Web Mercator
+/// ground resolution at the zoom `pick_zoom` will choose. Haversine-side
+/// estimate, not a pixel-exact crop preview.
+fn draw_output_estimate(state: &MapTabState, b: BBox, ui: &mut Ui) {
+    /// SRTM 1 arc-second nominal ground resolution.
+    const SRTMGL1_CELL_M: f64 = 30.0;
+    let bbox = BBoxLatLon { north: b.north, south: b.south, east: b.east, west: b.west };
+    let cell_m = match state.dem_source {
+        DemSource::OpenTopography => Some(SRTMGL1_CELL_M),
+        src => {
+            let token = state.config.mapbox_token.as_deref();
+            super::dem_sources::tile_source_for(src, token).map(|s| {
+                let z = super::tiles::pick_zoom(bbox, s.max_zoom());
+                ground_resolution_m(b.centroid_lat(), z)
+            })
+        }
+    };
+    let Some(cell_m) = cell_m else { return };
+    let density = f64::from(state.density_factor.max(1));
+    let units_per_cell =
+        f64::from(state.horizontal_scale.max(1)) * if state.block_type.micro() { 1.0 } else { 5.0 };
+    let studs_per_km = 1000.0 / cell_m / density * units_per_cell / 5.0;
+    let (w, h) = (b.width_km() * studs_per_km, b.height_km() * studs_per_km);
+    if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
+        return;
+    }
+    let m_per_stud = b.width_km() * 1000.0 / w;
+    ui.small(format!(
+        "Predicted output ≈ {w:.0}×{h:.0} studs ({m_per_stud:.1} m per stud) — raise Horizontal \
+         scale for a bigger map at no brick cost"
+    ));
+}
+
+/// Web Mercator ground resolution (meters per 256px-tile pixel) at a latitude.
+fn ground_resolution_m(lat_deg: f64, zoom: u32) -> f64 {
+    const EQUATOR_M_PER_PX_Z0: f64 = 40_075_016.686 / 256.0;
+    EQUATOR_M_PER_PX_Z0 * lat_deg.to_radians().cos() / f64::from(2_u32.pow(zoom.min(30)))
 }
 
 fn draw_bbox_readout(b: BBox, ui: &mut Ui) {
