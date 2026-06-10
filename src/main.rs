@@ -1,169 +1,166 @@
-pub mod map;
-pub mod opt;
-pub mod util;
-
-use crate::{map::*, opt::*, util::*};
 use brdb::assets::bricks::{
     PB_DEFAULT_BRICK, PB_DEFAULT_MICRO_BRICK, PB_DEFAULT_SMOOTH_TILE, PB_DEFAULT_STUDDED,
     PB_DEFAULT_TILE,
 };
-use clap::clap_app;
+use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use env_logger::Builder;
+use heightmap::{
+    opt::gen_opt_heightmap,
+    util::{GenOptions, maps_from_files, write_save},
+};
 use log::{LevelFilter, error, info};
-use std::{boxed::Box, io::Write, path::PathBuf};
+use std::{io::Write, path::PathBuf, process::ExitCode};
 
-fn main() {
+// exception: data-builder — one chained Arg declaration per CLI flag
+fn cli() -> Command {
+    let flag = |name: &'static str, help: &'static str| {
+        Arg::new(name)
+            .long(name)
+            .action(ArgAction::SetTrue)
+            .help(help)
+    };
+    Command::new("heightmap")
+        .version(env!("CARGO_PKG_VERSION"))
+        .author("github.com/Meshiest")
+        .about("Converts heightmap images (PNG/JPG) to Brickadia save files")
+        .arg(
+            Arg::new("INPUT")
+                .required(true)
+                .num_args(1..)
+                .value_parser(value_parser!(PathBuf))
+                .help("Input heightmap image files (PNG/JPG)"),
+        )
+        .arg(
+            Arg::new("output")
+                .short('o')
+                .long("output")
+                .value_parser(value_parser!(String))
+                .help("Output file (BRDB, BRZ)"),
+        )
+        .arg(
+            Arg::new("colormap")
+                .short('c')
+                .long("colormap")
+                .value_parser(value_parser!(PathBuf))
+                .help("Input colormap image (PNG/JPG)"),
+        )
+        .arg(
+            Arg::new("vertical")
+                .short('v')
+                .long("vertical")
+                .value_parser(value_parser!(u32))
+                .default_value("1")
+                .help("Vertical scale multiplier (default 1)"),
+        )
+        .arg(
+            Arg::new("size")
+                .short('s')
+                .long("size")
+                .value_parser(value_parser!(u16))
+                .default_value("1")
+                .help("Brick stud size (default 1)"),
+        )
+        .arg(flag(
+            "cull",
+            "Automatically remove bottom level bricks and fully transparent bricks",
+        ))
+        .arg(flag("tile", "Render bricks as tiles"))
+        .arg(flag("smooth", "Render bricks as smooth tiles"))
+        .arg(flag("micro", "Render bricks as micro bricks"))
+        .arg(flag("stud", "Render bricks as stud cubes"))
+        .arg(flag("snap", "Snap bricks to the brick grid"))
+        .arg(flag("lrgb", "Use linear rgb input color instead of sRGB"))
+        .arg(
+            Arg::new("img")
+                .short('i')
+                .long("img")
+                .action(ArgAction::SetTrue)
+                .help("Make the heightmap flat and render an image"),
+        )
+        .arg(flag("glow", "Make the heightmap glow at 0 intensity"))
+        .arg(flag("hdmap", "Using a high detail rgb color encoded heightmap"))
+        .arg(flag("nocollide", "Disable brick collision"))
+        .arg(flag("greedy", "Use greedy optimization"))
+}
+
+fn options_from_matches(matches: &ArgMatches) -> GenOptions {
+    let micro = matches.get_flag("micro");
+    GenOptions {
+        // defaulted by clap; the parser already rejected non-u16 values
+        size: matches.get_one::<u16>("size").copied().unwrap_or(1) * if micro { 1 } else { 5 },
+        scale: matches.get_one::<u32>("vertical").copied().unwrap_or(1),
+        cull: matches.get_flag("cull"),
+        asset: if micro {
+            PB_DEFAULT_MICRO_BRICK
+        } else if matches.get_flag("tile") {
+            PB_DEFAULT_TILE
+        } else if matches.get_flag("smooth") {
+            PB_DEFAULT_SMOOTH_TILE
+        } else if matches.get_flag("stud") {
+            PB_DEFAULT_STUDDED
+        } else {
+            PB_DEFAULT_BRICK
+        },
+        micro,
+        stud: matches.get_flag("stud"),
+        snap: matches.get_flag("snap"),
+        img: matches.get_flag("img"),
+        glow: matches.get_flag("glow"),
+        hdmap: matches.get_flag("hdmap"),
+        lrgb: matches.get_flag("lrgb"),
+        nocollide: matches.get_flag("nocollide"),
+        quadtree: true,
+        greedy: matches.get_flag("greedy"),
+    }
+}
+
+fn main() -> ExitCode {
     Builder::new()
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .filter(None, LevelFilter::Info)
         .init();
 
-    let matches = clap_app!(heightmap =>
-        (version: env!("CARGO_PKG_VERSION"))
-        (author: "github.com/Meshiest")
-        (about: "Converts heightmap images (PNG/JPG) to Brickadia save files")
-        (@arg INPUT: +required +multiple "Input heightmap image files (PNG/JPG)")
-        (@arg output: -o --output +takes_value "Output file (BRDB, BRZ)")
-        (@arg colormap: -c --colormap +takes_value "Input colormap image (PNG/JPG)")
-        (@arg vertical: -v --vertical +takes_value "Vertical scale multiplier (default 1)")
-        (@arg size: -s --size +takes_value "Brick stud size (default 1)")
-        (@arg cull: --cull "Automatically remove bottom level bricks and fully transparent bricks")
-        (@arg tile: --tile "Render bricks as tiles")
-        (@arg smooth: --smooth "Render bricks as smooth tiles")
-        (@arg micro: --micro "Render bricks as micro bricks")
-        (@arg stud: --stud "Render bricks as stud cubes")
-        (@arg snap: --snap "Snap bricks to the brick grid")
-        (@arg lrgb: --lrgb "Use linear rgb input color instead of sRGB")
-        (@arg img: -i --img "Make the heightmap flat and render an image")
-        (@arg glow: --glow "Make the heightmap glow at 0 intensity")
-        (@arg hdmap: --hdmap "Using a high detail rgb color encoded heightmap")
-        (@arg nocollide: --nocollide "Disable brick collision")
-        (@arg greedy: --greedy "Use greedy optimization")
-    )
-    .get_matches();
+    let matches = cli().get_matches();
 
-    // get files from matches
-    let heightmap_files = matches
-        .values_of("INPUT")
-        .unwrap()
-        .map(|s| PathBuf::from(s))
-        .collect::<Vec<_>>();
-    let colormap_file = matches
-        .value_of("colormap")
-        .map(PathBuf::from)
-        .unwrap_or(heightmap_files[0].clone());
+    let heightmap_files: Vec<PathBuf> = matches
+        .get_many::<PathBuf>("INPUT")
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let colormap_file = matches.get_one::<PathBuf>("colormap").cloned();
     let out_file = matches
-        .value_of("output")
+        .get_one::<String>("output")
+        .map(String::as_str)
         .unwrap_or("./out.brz")
         .to_string();
-
-    // output options
-    let options = GenOptions {
-        size: matches
-            .value_of("size")
-            .unwrap_or("1")
-            .parse::<u16>()
-            .expect("Size must be integer")
-            * if matches.is_present("micro") { 1 } else { 5 },
-        scale: matches
-            .value_of("vertical")
-            .unwrap_or("1")
-            .parse::<u32>()
-            .expect("Scale must be integer"),
-        cull: matches.is_present("cull"),
-        asset: if matches.is_present("micro") {
-            PB_DEFAULT_MICRO_BRICK
-        } else if matches.is_present("tile") {
-            PB_DEFAULT_TILE
-        } else if matches.is_present("smooth") {
-            PB_DEFAULT_SMOOTH_TILE
-        } else if matches.is_present("stud") {
-            PB_DEFAULT_STUDDED
-        } else {
-            PB_DEFAULT_BRICK
-        },
-        micro: matches.is_present("micro"),
-        stud: matches.is_present("stud"),
-        snap: matches.is_present("snap"),
-        img: matches.is_present("img"),
-        glow: matches.is_present("glow"),
-        hdmap: matches.is_present("hdmap"),
-        lrgb: matches.is_present("lrgb"),
-        nocollide: matches.is_present("nocollide"),
-        quadtree: true,
-        greedy: matches.is_present("greedy"),
-    };
+    let options = options_from_matches(&matches);
 
     info!("Reading image files");
-
-    // colormap file parsing
-    let colormap = match file_ext(&colormap_file)
-        .map(|s| s.to_lowercase())
-        .as_deref()
-    {
-        Some("png") | Some("jpg") | Some("jpeg") => {
-            match ColormapPNG::new(&colormap_file, options.lrgb) {
-                Ok(map) => map,
-                Err(err) => {
-                    return error!("Error reading colormap: {:?}", err);
-                }
-            }
-        }
-        Some(ext) => {
-            return error!("Unsupported colormap format '{}'", ext);
-        }
-        None => {
-            return error!("Missing colormap format for '{}'", colormap_file.display());
+    let (heightmap, colormap) = match maps_from_files(&options, heightmap_files, colormap_file) {
+        Ok(maps) => maps,
+        Err(err) => {
+            error!("{err} — check that the input paths exist and are PNG/JPG images");
+            return ExitCode::FAILURE;
         }
     };
 
-    // heightmap file parsing
-    let heightmap: Box<dyn Heightmap> = if heightmap_files.iter().all(|f| {
-        matches!(
-            file_ext(f).map(|s| s.to_lowercase()).as_deref(),
-            Some("png") | Some("jpg") | Some("jpeg")
-        )
-    }) {
-        if options.img {
-            Box::new(HeightmapFlat::new(colormap.size()).unwrap())
-        } else {
-            match HeightmapPNG::new(heightmap_files.iter().collect(), options.hdmap) {
-                Ok(map) => Box::new(map),
-                Err(error) => {
-                    return error!("Error reading heightmap: {:?}", error);
-                }
-            }
+    let bricks = match gen_opt_heightmap(&*heightmap, &*colormap, options, |_| true) {
+        Ok(bricks) => bricks,
+        Err(err) => {
+            error!(
+                "Generation failed: {err} — try a smaller --size/--vertical scale or a smaller input image"
+            );
+            return ExitCode::FAILURE;
         }
-    } else {
-        return error!("Unsupported heightmap format");
     };
-
-    let bricks = gen_opt_heightmap(&*heightmap, &colormap, options, |_| true)
-        .expect("error during generation");
 
     info!("Writing Save to {}", out_file);
-    let data = bricks_to_save(bricks);
-    if out_file.to_lowercase().ends_with(".brz") {
-        let brz = match data.to_brz_vec() {
-            Ok(b) => b,
-            Err(e) => {
-                error!("failed to encode brz: {e}");
-                return;
-            }
-        };
-        if let Err(e) = std::fs::write(&out_file, brz) {
-            error!("failed to write file: {e}");
-            return;
-        }
-    } else if out_file.to_lowercase().ends_with(".brdb") {
-        if let Err(e) = data.write_brdb(&out_file) {
-            error!("failed to write file: {e}");
-            return;
-        };
-    } else {
-        error!("output file must end with .brz or .brdb");
-        return;
+    if let Err(err) = write_save(&out_file, bricks) {
+        error!("{err} — pass --output with a writable .brz or .brdb path");
+        return ExitCode::FAILURE;
     }
 
     info!("Done!");
+    ExitCode::SUCCESS
 }

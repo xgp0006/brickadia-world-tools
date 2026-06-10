@@ -1,13 +1,8 @@
+use super::generate::{BrickColumn, emit_column_bricks};
 use crate::map::*;
 use crate::util::*;
-use brdb::{
-    Brick, BrickSize, BrickType, Collision, Color, Position,
-    assets::materials::{GLOW, PLASTIC},
-};
-use std::{
-    cmp::{max, min},
-    collections::HashSet,
-};
+use brdb::Brick;
+use std::{cmp::max, collections::HashSet};
 
 #[derive(Debug, Default)]
 struct Tile {
@@ -261,83 +256,180 @@ impl QuadTree {
         let offset_x = -(width as i32 * options.size as i32);
         let offset_y = -(height as i32 * options.size as i32);
 
-        self.tiles
+        let mut bricks = vec![];
+        for t in self.tiles.iter() {
+            if t.parent.is_some() || options.cull && (t.height == 0 || t.color[3] == 0) {
+                continue;
+            }
+
+            let mut z = (options.scale * t.height) as i32;
+
+            // determine the height of this brick (difference of self and smallest neighbor)
+            let raw_height = max(
+                t.height as i32 - t.neighbors.iter().cloned().min().unwrap_or(0) as i32 + 1,
+                2,
+            );
+            let mut desired_height = max(raw_height * options.scale as i32 / 2, 2);
+
+            // snap bricks to grid
+            if options.snap {
+                z += 4 - z % 4;
+                desired_height += 4 - desired_height % 4;
+            }
+
+            emit_column_bricks(
+                &mut bricks,
+                &options,
+                BrickColumn {
+                    z,
+                    desired_height,
+                    size_x: t.size.0 as u16 * options.size,
+                    size_y: t.size.1 as u16 * options.size,
+                    pos_x: (t.center.0 as i32 * 2 + t.size.0 as i32) * options.size as i32
+                        + offset_x,
+                    pos_y: (t.center.1 as i32 * 2 + t.size.1 as i32) * options.size as i32
+                        + offset_y,
+                    color: t.color,
+                },
+            );
+        }
+        bricks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brdb::assets::bricks::PB_DEFAULT_TILE;
+
+    struct TestMap {
+        width: u32,
+        height: u32,
+        heights: Vec<u32>,
+        colors: Vec<[u8; 4]>,
+    }
+
+    impl TestMap {
+        fn uniform(width: u32, height: u32, h: u32, color: [u8; 4]) -> Self {
+            let cells = (width * height) as usize;
+            TestMap {
+                width,
+                height,
+                heights: vec![h; cells],
+                colors: vec![color; cells],
+            }
+        }
+    }
+
+    impl Heightmap for TestMap {
+        fn at(&self, x: u32, y: u32) -> u32 {
+            self.heights[(x + y * self.width) as usize]
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+    }
+
+    impl Colormap for TestMap {
+        fn at(&self, x: u32, y: u32) -> [u8; 4] {
+            self.colors[(x + y * self.width) as usize]
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+    }
+
+    fn test_options() -> GenOptions {
+        GenOptions {
+            size: 5,
+            scale: 1,
+            asset: PB_DEFAULT_TILE,
+            cull: false,
+            micro: false,
+            stud: false,
+            snap: false,
+            img: false,
+            glow: false,
+            hdmap: false,
+            lrgb: false,
+            nocollide: false,
+            quadtree: true,
+            greedy: false,
+        }
+    }
+
+    #[test]
+    fn new_builds_one_tile_per_pixel() {
+        let map = TestMap {
+            width: 2,
+            height: 2,
+            heights: vec![1, 2, 3, 4],
+            colors: vec![
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+                [255, 255, 0, 255],
+            ],
+        };
+        let quad = QuadTree::new(&map, &map).expect("quadtree build");
+
+        assert_eq!(quad.tiles.len(), 4, "2x2 map must produce 4 tiles");
+        for tile in quad.tiles.iter() {
+            let (x, y) = tile.center;
+            assert_eq!(tile.height, map.heights[(x + y * 2) as usize]);
+            assert_eq!(tile.color, map.colors[(x + y * 2) as usize]);
+            assert_eq!(tile.size, (1, 1));
+            assert!(tile.parent.is_none());
+        }
+    }
+
+    #[test]
+    fn new_rejects_mismatched_dimensions() {
+        let hm = TestMap::uniform(2, 2, 1, [255, 0, 0, 255]);
+        let cm = TestMap::uniform(3, 2, 1, [255, 0, 0, 255]);
+        assert!(QuadTree::new(&hm, &cm).is_err());
+    }
+
+    #[test]
+    fn into_bricks_covers_every_unmerged_tile() {
+        // Distinct colors prevent any merge, so a 2x2 map must yield exactly
+        // 4 bricks at the 4 centered footprint positions.
+        let map = TestMap {
+            width: 2,
+            height: 2,
+            heights: vec![1; 4],
+            colors: vec![
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+                [255, 255, 0, 255],
+            ],
+        };
+        let quad = QuadTree::new(&map, &map).expect("quadtree build");
+        let bricks = quad.into_bricks(test_options(), 2, 2);
+
+        assert_eq!(bricks.len(), 4);
+        let mut positions: Vec<(i32, i32)> = bricks
             .iter()
-            .flat_map(|t| {
-                if t.parent.is_some() || options.cull && (t.height == 0 || t.color[3] == 0) {
-                    return vec![];
-                }
+            .map(|b| (b.position.x, b.position.y))
+            .collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![(-5, -5), (-5, 5), (5, -5), (5, 5)]);
+    }
 
-                let mut z = (options.scale * t.height) as i32;
+    #[test]
+    fn line_optimize_merges_a_uniform_row() {
+        let map = TestMap::uniform(4, 1, 1, [128, 128, 128, 255]);
+        let mut quad = QuadTree::new(&map, &map).expect("quadtree build");
 
-                // determine the height of this brick (difference of self and smallest neighbor)
-                let raw_height = max(
-                    t.height as i32 - t.neighbors.iter().cloned().min().unwrap_or(0) as i32 + 1,
-                    2,
-                );
-                let mut desired_height = max(raw_height * options.scale as i32 / 2, 2);
+        let unmerged = quad.into_bricks(test_options(), 4, 1).len();
+        assert_eq!(unmerged, 4, "before optimization every pixel is a brick");
 
-                // snap bricks to grid
-                if options.snap {
-                    z += 4 - z % 4;
-                    desired_height += 4 - desired_height % 4;
-                }
+        let merged = quad.line_optimize(test_options().size as u32);
+        assert!(merged > 0, "uniform row must merge at least one tile");
+        assert_eq!(quad.line_optimize(test_options().size as u32), 0);
 
-                let mut bricks = vec![];
-                // until we've made enough bricks to fill the height
-                // add a brick with a max height of 250
-                while desired_height > 0 {
-                    // pick height for this brick
-
-                    let height =
-                        min(max(desired_height, if options.stud { 5 } else { 2 }), 250) as u16;
-                    let height = height + height % (if options.stud { 5 } else { 2 });
-
-                    bricks.push(Brick {
-                        asset: BrickType::Procedural {
-                            asset: options.asset.clone(),
-                            size: BrickSize::new(
-                                t.size.0 as u16 * options.size,
-                                t.size.1 as u16 * options.size, // if it's a microbrick image, just use the block size so it's cubes
-                                if options.img && options.micro {
-                                    options.size
-                                } else {
-                                    height
-                                },
-                            ),
-                        },
-                        position: Position::new(
-                            (t.center.0 as i32 * 2 + t.size.0 as i32) * options.size as i32
-                                + offset_x,
-                            (t.center.1 as i32 * 2 + t.size.1 as i32) * options.size as i32
-                                + offset_y,
-                            options.base_height() - 5
-                                + if options.img { 0 } else { z - height as i32 },
-                        ),
-                        collision: Collision {
-                            player: !options.nocollide,
-                            weapon: !options.nocollide,
-                            interact: !options.nocollide,
-                            tool: !options.nocollide,
-                            ..Default::default()
-                        },
-                        color: Color {
-                            r: t.color[0],
-                            g: t.color[1],
-                            b: t.color[2],
-                        },
-                        owner_index: None,
-                        material_intensity: 0,
-                        material: if options.glow { GLOW } else { PLASTIC },
-                        ..Default::default()
-                    });
-
-                    // update Z and remaining height
-                    desired_height -= height as i32;
-                    z -= height as i32 * 2;
-                }
-                bricks
-            })
-            .collect()
+        let bricks = quad.into_bricks(test_options(), 4, 1);
+        assert_eq!(bricks.len(), 1, "uniform 4x1 row must merge into one brick");
     }
 }

@@ -5,10 +5,13 @@ use log::SetLoggerError;
 
 struct EguiLogger;
 
+/// In-app log panel keeps at most this many lines; older lines are evicted.
+const LOG_CAPACITY: usize = 1000;
+
 static LOG: OnceLock<Mutex<VecDeque<(log::Level, String)>>> = OnceLock::new();
 
-pub fn get_log() -> &'static Mutex<VecDeque<(log::Level, String)>> {
-    LOG.get_or_init(|| Mutex::new(VecDeque::with_capacity(1000)))
+fn get_log() -> &'static Mutex<VecDeque<(log::Level, String)>> {
+    LOG.get_or_init(|| Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)))
 }
 
 impl log::Log for EguiLogger {
@@ -19,14 +22,10 @@ impl log::Log for EguiLogger {
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
             let mut log = get_log().lock();
-
-            let mut l: VecDeque<(log::Level, String)> = log.clone();
-            l.push_back((record.level(), record.args().to_string()));
-            if l.len() > 1000 {
-                l.drain(0..1);
+            log.push_back((record.level(), record.args().to_string()));
+            if log.len() > LOG_CAPACITY {
+                log.pop_front();
             }
-
-            *log = l;
         }
     }
 

@@ -5,22 +5,21 @@ pub struct BitMask {
     bits: Vec<u128>,
 }
 
+impl Default for BitMask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BitMask {
     /// Create a new empty bitmask
     pub fn new() -> Self {
         BitMask { bits: vec![0] }
     }
 
-    /// Create a new bitmask with the specified capacity (in number of bits)
-    pub fn with_capacity(capacity_bits: u32) -> Self {
-        let num_blocks = ((capacity_bits + 127) / 128) as usize;
-        let mut bits = Vec::with_capacity(num_blocks);
-        bits.push(0); // Start with at least one block
-        BitMask { bits }
-    }
-
-    /// Create a bitmask from a single u128 value
-    pub fn from_u128(value: u128) -> Self {
+    /// Create a bitmask from a single u128 value (test fixture constructor)
+    #[cfg(test)]
+    fn from_u128(value: u128) -> Self {
         BitMask { bits: vec![value] }
     }
 
@@ -96,16 +95,18 @@ impl BitMask {
             };
         }
 
-        // Complex shift with bit spillover
-        let mut result = vec![0u128; self.bits.len() - block_shift];
+        // Complex shift with bit spillover: each output block combines the
+        // low bits of its source block with the high bits of the next one.
         let left_shift = 128 - bit_shift;
-
-        for i in 0..result.len() {
-            result[i] = self.bits[i + block_shift] >> bit_shift;
-            if i + block_shift + 1 < self.bits.len() {
-                result[i] |= self.bits[i + block_shift + 1] << left_shift;
-            }
-        }
+        let src = &self.bits[block_shift..];
+        let mut result: Vec<u128> = src
+            .iter()
+            .enumerate()
+            .map(|(i, &block)| {
+                let next = src.get(i + 1).copied().unwrap_or(0);
+                (block >> bit_shift) | (next << left_shift)
+            })
+            .collect();
 
         // Remove trailing zeros
         while result.len() > 1 && result.last() == Some(&0) {
@@ -113,116 +114,17 @@ impl BitMask {
         }
 
         BitMask { bits: result }
-    }
-
-    /// Left shift operation (mutating)
-    pub fn shl_assign(&mut self, shift: u32) {
-        if shift == 0 {
-            return;
-        }
-
-        let block_shift = (shift / 128) as usize;
-        let bit_shift = shift % 128;
-
-        if bit_shift == 0 {
-            // Simple block shift - insert zeros at the front
-            self.bits
-                .splice(0..0, std::iter::repeat(0).take(block_shift));
-            return;
-        }
-
-        // Complex shift with bit spillover
-        let right_shift = 128 - bit_shift;
-        let mut carry = 0u128;
-
-        // Shift existing blocks in place
-        for block in &mut self.bits {
-            let new_carry = *block >> right_shift;
-            *block = (*block << bit_shift) | carry;
-            carry = new_carry;
-        }
-
-        // Add carry as new block if non-zero
-        if carry != 0 {
-            self.bits.push(carry);
-        }
-
-        // Insert zero blocks at the front if needed
-        if block_shift > 0 {
-            self.bits
-                .splice(0..0, std::iter::repeat(0).take(block_shift));
-        }
-    }
-
-    /// Right shift operation (mutating)
-    pub fn shr_assign(&mut self, shift: u32) {
-        if shift == 0 {
-            return;
-        }
-
-        let block_shift = (shift / 128) as usize;
-        if block_shift >= self.bits.len() {
-            self.bits.clear();
-            self.bits.push(0);
-            return;
-        }
-
-        let bit_shift = shift % 128;
-
-        if bit_shift == 0 {
-            // Simple block shift - remove blocks from the front
-            self.bits.drain(0..block_shift);
-            return;
-        }
-
-        // Remove full blocks first
-        if block_shift > 0 {
-            self.bits.drain(0..block_shift);
-        }
-
-        // Complex shift with bit spillover
-        let left_shift = 128 - bit_shift;
-
-        for i in 0..self.bits.len() {
-            self.bits[i] >>= bit_shift;
-            if i + 1 < self.bits.len() {
-                self.bits[i] |= self.bits[i + 1] << left_shift;
-            }
-        }
-
-        // Remove trailing zeros
-        while self.bits.len() > 1 && self.bits.last() == Some(&0) {
-            self.bits.pop();
-        }
     }
 
     /// Bitwise AND operation
     pub fn and(&self, other: &BitMask) -> Self {
-        let min_len = self.bits.len().min(other.bits.len());
-        let mut result = vec![0u128; min_len];
-
-        for i in 0..min_len {
-            result[i] = self.bits[i] & other.bits[i];
-        }
-
-        // Remove trailing zeros
-        while result.len() > 1 && result.last() == Some(&0) {
-            result.pop();
-        }
-
-        BitMask { bits: result }
-    }
-
-    /// Bitwise XOR operation
-    pub fn xor(&self, other: &BitMask) -> Self {
-        let max_len = self.bits.len().max(other.bits.len());
-        let mut result = vec![0u128; max_len];
-
-        for i in 0..max_len {
-            let a = self.bits.get(i).copied().unwrap_or(0);
-            let b = other.bits.get(i).copied().unwrap_or(0);
-            result[i] = a ^ b;
-        }
+        // zip truncates to the shorter operand; missing blocks AND to zero anyway
+        let mut result: Vec<u128> = self
+            .bits
+            .iter()
+            .zip(&other.bits)
+            .map(|(a, b)| a & b)
+            .collect();
 
         // Remove trailing zeros
         while result.len() > 1 && result.last() == Some(&0) {
@@ -242,26 +144,14 @@ impl BitMask {
         }
 
         // XOR in place
-        for i in 0..max_len {
-            let b = other.bits.get(i).copied().unwrap_or(0);
-            self.bits[i] ^= b;
+        for (block, &b) in self.bits.iter_mut().zip(&other.bits) {
+            *block ^= b;
         }
 
         // Remove trailing zeros
         while self.bits.len() > 1 && self.bits.last() == Some(&0) {
             self.bits.pop();
         }
-    }
-
-    /// Count trailing zeros
-    pub fn trailing_zeros(&self) -> u32 {
-        for (i, &block) in self.bits.iter().enumerate() {
-            if block != 0 {
-                return (i as u32) * 128 + block.trailing_zeros();
-            }
-        }
-        // All zeros
-        self.bits.len() as u32 * 128
     }
 
     /// Count trailing zeros starting from a specific bit offset (avoids allocating a shifted BitMask)
@@ -282,25 +172,14 @@ impl BitMask {
         let mut count = 128 - bit_offset;
 
         // Check remaining blocks
-        for i in (block_index + 1)..self.bits.len() {
-            if self.bits[i] != 0 {
-                return count + self.bits[i].trailing_zeros();
+        for &block in &self.bits[block_index + 1..] {
+            if block != 0 {
+                return count + block.trailing_zeros();
             }
             count += 128;
         }
 
         count
-    }
-
-    /// Count trailing ones
-    pub fn trailing_ones(&self) -> u32 {
-        for (i, &block) in self.bits.iter().enumerate() {
-            if block != u128::MAX {
-                return (i as u32) * 128 + block.trailing_ones();
-            }
-        }
-        // All ones
-        self.bits.len() as u32 * 128
     }
 
     /// Count trailing ones starting from a specific bit offset (avoids allocating a shifted BitMask)
@@ -323,19 +202,14 @@ impl BitMask {
         let mut count = 128 - bit_offset;
 
         // Check remaining blocks
-        for i in (block_index + 1)..self.bits.len() {
-            if self.bits[i] != u128::MAX {
-                return count + self.bits[i].trailing_ones();
+        for &block in &self.bits[block_index + 1..] {
+            if block != u128::MAX {
+                return count + block.trailing_ones();
             }
             count += 128;
         }
 
         count
-    }
-
-    /// Check if all bits are zero
-    pub fn is_zero(&self) -> bool {
-        self.bits.iter().all(|&b| b == 0)
     }
 
     /// Set a specific bit to 1 (mutating)
@@ -349,72 +223,6 @@ impl BitMask {
         }
 
         self.bits[block_index] |= 1u128 << bit_offset;
-    }
-
-    /// Check if the nth bit is set (returns true if the bit is 1, false otherwise)
-    pub fn nth(&self, bit_index: u32) -> bool {
-        let block_index = (bit_index / 128) as usize;
-        let bit_offset = bit_index % 128;
-
-        if block_index >= self.bits.len() {
-            return false;
-        }
-
-        (self.bits[block_index] & (1u128 << bit_offset)) != 0
-    }
-}
-
-impl std::ops::BitAnd for &BitMask {
-    type Output = BitMask;
-
-    fn bitand(self, rhs: &BitMask) -> BitMask {
-        self.and(rhs)
-    }
-}
-
-impl std::ops::BitXor for &BitMask {
-    type Output = BitMask;
-
-    fn bitxor(self, rhs: &BitMask) -> BitMask {
-        self.xor(rhs)
-    }
-}
-
-impl std::ops::BitOr for &BitMask {
-    type Output = BitMask;
-
-    fn bitor(self, rhs: &BitMask) -> BitMask {
-        let max_len = self.bits.len().max(rhs.bits.len());
-        let mut result = vec![0u128; max_len];
-
-        for i in 0..max_len {
-            let a = self.bits.get(i).copied().unwrap_or(0);
-            let b = rhs.bits.get(i).copied().unwrap_or(0);
-            result[i] = a | b;
-        }
-
-        // Remove trailing zeros
-        while result.len() > 1 && result.last() == Some(&0) {
-            result.pop();
-        }
-
-        BitMask { bits: result }
-    }
-}
-
-impl std::ops::Shl<u32> for &BitMask {
-    type Output = BitMask;
-
-    fn shl(self, rhs: u32) -> BitMask {
-        self.shl(rhs)
-    }
-}
-
-impl std::ops::Shr<u32> for &BitMask {
-    type Output = BitMask;
-
-    fn shr(self, rhs: u32) -> BitMask {
-        self.shr(rhs)
     }
 }
 
@@ -503,8 +311,8 @@ mod tests {
     #[test]
     fn test_bitmask_basic() {
         let mask = BitMask::from_u128(0b1111);
-        assert_eq!(mask.trailing_zeros(), 0);
-        assert_eq!(mask.trailing_ones(), 4);
+        assert_eq!(mask.trailing_zeros_from(0), 0);
+        assert_eq!(mask.trailing_ones_from(0), 4);
     }
 
     #[test]
@@ -512,26 +320,24 @@ mod tests {
         let mask = BitMask::from_u128(0b1111);
         let shifted = mask.shl(2);
         // After shifting left by 2: 0b1111 -> 0b111100
-        // This has 2 trailing zeros, not trailing ones
-        assert_eq!(shifted.trailing_zeros(), 2);
-        // To count the ones, we need to skip the zeros first
-        let after_zeros = shifted.shr(2);
-        assert_eq!(after_zeros.trailing_ones(), 4);
+        // This has 2 trailing zeros, then 4 ones starting at bit 2
+        assert_eq!(shifted.trailing_zeros_from(0), 2);
+        assert_eq!(shifted.trailing_ones_from(2), 4);
     }
 
     #[test]
     fn test_bitmask_shift_right() {
         let mask = BitMask::from_u128(0b111100);
         let shifted = mask.shr(2);
-        assert_eq!(shifted.trailing_zeros(), 0);
-        assert_eq!(shifted.trailing_ones(), 4);
+        assert_eq!(shifted.trailing_zeros_from(0), 0);
+        assert_eq!(shifted.trailing_ones_from(0), 4);
     }
 
     #[test]
     fn test_bitmask_ones() {
         let mask = BitMask::ones(5);
-        assert_eq!(mask.trailing_zeros(), 0);
-        assert_eq!(mask.trailing_ones(), 5);
+        assert_eq!(mask.trailing_zeros_from(0), 0);
+        assert_eq!(mask.trailing_ones_from(0), 5);
     }
 
     #[test]
@@ -543,11 +349,10 @@ mod tests {
     }
 
     #[test]
-    fn test_bitmask_xor() {
-        let a = BitMask::from_u128(0b1111);
-        let b = BitMask::from_u128(0b1100);
-        let result = a.xor(&b);
-        assert_eq!(result, BitMask::from_u128(0b0011));
+    fn test_bitmask_xor_assign() {
+        let mut a = BitMask::from_u128(0b1111);
+        a.xor_assign(&BitMask::from_u128(0b1100));
+        assert_eq!(a, BitMask::from_u128(0b0011));
     }
 
     #[test]
@@ -583,5 +388,85 @@ mod tests {
 
         // Should produce two separate quads
         assert_eq!(quads.len(), 2);
+    }
+
+    /// Count how many quads cover each cell of a w x h grid.
+    fn coverage_counts(quads: &[GreedyQuad], w: u32, h: u32) -> Vec<u32> {
+        let mut counts = vec![0u32; (w * h) as usize];
+        for q in quads {
+            for x in q.x..q.x + q.w {
+                for y in q.y..q.y + q.h {
+                    counts[(x * h + y) as usize] += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    #[test]
+    fn greedy_mesh_tiles_l_shape_exactly_once() {
+        // 8x8 plane with an L-shape: rows 0-2 fully set (y 0..8), plus
+        // rows 3-7 set only at y 0..2. Quads must cover every set cell
+        // exactly once and never touch an unset cell.
+        const W: u32 = 8;
+        const H: u32 = 8;
+        let set = |x: u32, y: u32| -> bool { x < 3 || y < 2 };
+
+        let mut data = vec![BitMask::new(); W as usize];
+        for (x, row) in data.iter_mut().enumerate() {
+            for y in 0..H {
+                if set(x as u32, y) {
+                    row.set_bit(y);
+                }
+            }
+        }
+
+        let quads = greedy_mesh_binary_plane(data, W, H, 1000);
+        let counts = coverage_counts(&quads, W, H);
+
+        for x in 0..W {
+            for y in 0..H {
+                let expected = u32::from(set(x, y));
+                assert_eq!(
+                    counts[(x * H + y) as usize],
+                    expected,
+                    "cell ({x},{y}) covered {} times, expected {expected}",
+                    counts[(x * H + y) as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_mesh_clamps_quads_to_max_size() {
+        // A fully solid 16x16 plane with max_size 4 must still tile every
+        // cell exactly once, but no quad may exceed 4 in either dimension.
+        // Removing the max_size clamp would emit a single 16x16 quad.
+        const W: u32 = 16;
+        const H: u32 = 16;
+        const MAX: u32 = 4;
+
+        let mut data = vec![BitMask::new(); W as usize];
+        for row in data.iter_mut() {
+            for y in 0..H {
+                row.set_bit(y);
+            }
+        }
+
+        let quads = greedy_mesh_binary_plane(data, W, H, MAX);
+
+        assert!(!quads.is_empty());
+        for q in &quads {
+            assert!(
+                q.w <= MAX && q.h <= MAX,
+                "quad {q:?} exceeds max_size {MAX}"
+            );
+        }
+
+        let counts = coverage_counts(&quads, W, H);
+        assert!(
+            counts.iter().all(|&c| c == 1),
+            "clamped quads must still tile the plane exactly once"
+        );
     }
 }

@@ -1,14 +1,32 @@
-use super::{BitMask, QuadTree, greedy_mesh_binary_plane};
+use super::{BitMask, GreedyQuad, QuadTree, greedy_mesh_binary_plane};
 use crate::map::*;
 use crate::util::*;
 use brdb::{
     Brick, BrickSize, BrickType, Collision, Color, Position,
     assets::materials::{GLOW, PLASTIC},
 };
-use log::info;
+use log::{info, warn};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Error string returned when the progress callback requests cancellation.
+/// `build.rs` and the GUI converter match on this exact value to distinguish
+/// user-cancel from a real failure — never inline the literal elsewhere.
+pub const CANCELLED_MSG: &str = "Stopped by user";
+
+/// One greedy-mesh plane (per-column bitmasks) tagged with the (height, color)
+/// combination it encodes.
+type TaggedPlane = (Vec<BitMask>, u32, [u8; 4]);
+
+/// A meshed quad tagged with its plane's (height, color).
+type TaggedQuad = (GreedyQuad, u32, [u8; 4]);
+
+/// Upper bound on linear-optimize convergence passes. Convergence is usually
+/// reached in ~5 passes; the bound exists so a `line_optimize` regression can
+/// never hang the worker thread (Rule 2). On exhaustion the bricks are valid,
+/// just less merged.
+const MAX_LINEAR_PASSES: u32 = 64;
 
 /// Generate a heightmap with brick conservation optimizations
 pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
@@ -36,77 +54,69 @@ pub fn gen_quad_heightmap<F: Fn(f32) -> bool>(
     macro_rules! progress {
         ($e:expr) => {
             if !progress_f($e) {
-                return Err("Stopped by user".to_string());
+                return Err(CANCELLED_MSG.to_string());
             }
         };
     }
     progress!(0.0);
 
-    info!("Building initial quadtree");
-    let quadtree_build_start = Instant::now();
     let (width, height) = heightmap.size();
-    let area = width * height;
-    let mut quad = QuadTree::new(heightmap, colormap)?;
-    let quadtree_build_duration = quadtree_build_start.elapsed();
-    info!(
-        "Built quadtree in {:.2}s",
-        quadtree_build_duration.as_secs_f64()
-    );
+    let (mut quad, quadtree_build_duration) = build_quadtree(heightmap, colormap)?;
     progress!(0.2);
 
     let (prog_offset, prog_scale, quad_opt_duration) = if options.quadtree {
-        info!("Optimizing quadtree");
-        let quad_opt_start = Instant::now();
-        let mut scale = 0;
-
-        // loop until the bricks would be too wide or we stop optimizing bricks
-        while 2_i32.pow(scale + 1) * (options.size as i32) < 500 {
-            progress!(0.2 + 0.5 * (scale as f32 / (500.0 / (options.size as f32)).log2()));
-            let count = quad.quad_optimize_level(scale);
-            if count == 0 {
-                break;
-            } else {
-                info!("  Removed {:?} {}x bricks", count, 2_i32.pow(scale));
-            }
-            scale += 1;
-        }
-        let quad_opt_duration = quad_opt_start.elapsed();
-        info!(
-            "Quadtree optimization in {:.2}s",
-            quad_opt_duration.as_secs_f64()
-        );
+        let duration = optimize_quadtree(&mut quad, &options, &progress_f)?;
         progress!(0.7);
-
-        (0.7, 0.25, quad_opt_duration)
+        (0.7, 0.25, duration)
     } else {
-        (0.2, 0.75, std::time::Duration::ZERO)
+        (0.2, 0.75, Duration::ZERO)
     };
 
-    info!("Optimizing linear");
-    let linear_opt_start = Instant::now();
-    let mut i = 0;
-    loop {
-        i += 1;
-
-        let count = quad.line_optimize(options.size as u32);
-        progress!(prog_offset + prog_scale * (i as f32 / 5.0).min(1.0));
-
-        if count == 0 {
-            break;
-        }
-        info!("  Removed {} bricks", count);
-    }
-    let linear_opt_duration = linear_opt_start.elapsed();
-    info!(
-        "Linear optimization in {:.2}s",
-        linear_opt_duration.as_secs_f64()
-    );
-
+    let linear_opt_duration =
+        optimize_linear(&mut quad, &options, prog_offset, prog_scale, &progress_f)?;
     progress!(0.95);
 
-    let brick_convert_start = Instant::now();
+    let (bricks, brick_convert_duration) = quadtree_to_bricks(quad, options, width, height);
+
+    log_total_time(
+        "quadtree",
+        &[
+            ("build", quadtree_build_duration),
+            ("quad-opt", quad_opt_duration),
+            ("linear-opt", linear_opt_duration),
+            ("bricks", brick_convert_duration),
+        ],
+    );
+
+    progress!(1.0);
+    Ok(bricks)
+}
+
+/// Build the per-pixel quadtree, logging its wall time.
+fn build_quadtree(
+    heightmap: &dyn Heightmap,
+    colormap: &dyn Colormap,
+) -> Result<(QuadTree, Duration), String> {
+    info!("Building initial quadtree");
+    let start = Instant::now();
+    let quad = QuadTree::new(heightmap, colormap)?;
+    let duration = start.elapsed();
+    info!("Built quadtree in {:.2}s", duration.as_secs_f64());
+    Ok((quad, duration))
+}
+
+/// Convert the optimized quadtree into bricks, logging reduction stats and
+/// wall time.
+fn quadtree_to_bricks(
+    quad: QuadTree,
+    options: GenOptions,
+    width: u32,
+    height: u32,
+) -> (Vec<Brick>, Duration) {
+    let area = width * height;
+    let start = Instant::now();
     let bricks = quad.into_bricks(options, width, height);
-    let brick_convert_duration = brick_convert_start.elapsed();
+    let duration = start.elapsed();
     let brick_count = bricks.len();
     info!(
         "Reduced {} to {} ({}%; -{} bricks)",
@@ -115,24 +125,93 @@ pub fn gen_quad_heightmap<F: Fn(f32) -> bool>(
         (100. - brick_count as f64 / area as f64 * 100.).floor(),
         area as i32 - brick_count as i32,
     );
-    info!(
-        "Converted to bricks in {:.2}s",
-        brick_convert_duration.as_secs_f64()
-    );
+    info!("Converted to bricks in {:.2}s", duration.as_secs_f64());
+    (bricks, duration)
+}
 
-    let total_duration =
-        quadtree_build_duration + quad_opt_duration + linear_opt_duration + brick_convert_duration;
+/// Log the per-phase and summed wall time of a generation run.
+fn log_total_time(label: &str, phases: &[(&str, Duration)]) {
+    let total: Duration = phases.iter().map(|(_, d)| *d).sum();
+    let detail = phases
+        .iter()
+        .map(|(name, d)| format!("{}: {:.2}s", name, d.as_secs_f64()))
+        .collect::<Vec<_>>()
+        .join(", ");
     info!(
-        "Total quadtree time: {:.2}s (build: {:.2}s, quad-opt: {:.2}s, linear-opt: {:.2}s, bricks: {:.2}s)",
-        total_duration.as_secs_f64(),
-        quadtree_build_duration.as_secs_f64(),
-        quad_opt_duration.as_secs_f64(),
-        linear_opt_duration.as_secs_f64(),
-        brick_convert_duration.as_secs_f64()
+        "Total {} time: {:.2}s ({})",
+        label,
+        total.as_secs_f64(),
+        detail
     );
+}
 
-    progress!(1.0);
-    Ok(bricks)
+/// Run the quadtree merge passes until bricks would exceed the 500-unit width
+/// cap or a pass stops merging. Returns the elapsed time, or `CANCELLED_MSG`
+/// if the progress callback requested cancellation.
+fn optimize_quadtree<F: Fn(f32) -> bool>(
+    quad: &mut QuadTree,
+    options: &GenOptions,
+    progress_f: &F,
+) -> Result<Duration, String> {
+    info!("Optimizing quadtree");
+    let quad_opt_start = Instant::now();
+    let mut scale = 0;
+
+    // loop until the bricks would be too wide or we stop optimizing bricks
+    while 2_i32.pow(scale + 1) * (options.size as i32) < 500 {
+        if !progress_f(0.2 + 0.5 * (scale as f32 / (500.0 / (options.size as f32)).log2())) {
+            return Err(CANCELLED_MSG.to_string());
+        }
+        let count = quad.quad_optimize_level(scale);
+        if count == 0 {
+            break;
+        }
+        info!("  Removed {:?} {}x bricks", count, 2_i32.pow(scale));
+        scale += 1;
+    }
+    let quad_opt_duration = quad_opt_start.elapsed();
+    info!(
+        "Quadtree optimization in {:.2}s",
+        quad_opt_duration.as_secs_f64()
+    );
+    Ok(quad_opt_duration)
+}
+
+/// Run line-merge passes until convergence (bounded by `MAX_LINEAR_PASSES`).
+/// Returns the elapsed time, or `CANCELLED_MSG` on cancellation.
+fn optimize_linear<F: Fn(f32) -> bool>(
+    quad: &mut QuadTree,
+    options: &GenOptions,
+    prog_offset: f32,
+    prog_scale: f32,
+    progress_f: &F,
+) -> Result<Duration, String> {
+    info!("Optimizing linear");
+    let linear_opt_start = Instant::now();
+    let mut converged = false;
+    for i in 1..=MAX_LINEAR_PASSES {
+        let count = quad.line_optimize(options.size as u32);
+        if !progress_f(prog_offset + prog_scale * (i as f32 / 5.0).min(1.0)) {
+            return Err(CANCELLED_MSG.to_string());
+        }
+
+        if count == 0 {
+            converged = true;
+            break;
+        }
+        info!("  Removed {} bricks", count);
+    }
+    if !converged {
+        warn!(
+            "linear optimization did not converge in {MAX_LINEAR_PASSES} passes; continuing with current bricks"
+        );
+    }
+    let linear_opt_duration = linear_opt_start.elapsed();
+    info!(
+        "Linear optimization in {:.2}s",
+        linear_opt_duration.as_secs_f64()
+    );
+    Ok(linear_opt_duration)
 }
 
 /// Generate a heightmap using greedy mesh optimization for each height level
@@ -145,7 +224,7 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     macro_rules! progress {
         ($e:expr) => {
             if !progress_f($e) {
-                return Err("Stopped by user".to_string());
+                return Err(CANCELLED_MSG.to_string());
             }
         };
     }
@@ -158,97 +237,144 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
         return Err("Heightmap and colormap must have same dimensions".to_string());
     }
 
-    // Find all unique (height, color) combinations
+    let pairs_vec = collect_height_color_pairs(heightmap, colormap, options.cull);
+
+    let (planes_with_metadata, plane_build_duration) =
+        build_planes(heightmap, colormap, options.cull, pairs_vec);
+    progress!(0.4);
+
+    let brick_scale = if options.micro { 2 } else { 10 };
+    let max_quad_size = 1000 / brick_scale;
+    let (all_quads, greedy_mesh_duration) =
+        mesh_planes(planes_with_metadata, width, height, max_quad_size);
+    progress!(0.7);
+
+    let (all_bricks, brick_build_duration) =
+        quads_to_bricks(all_quads, &options, width, height, &progress_f)?;
+
+    log_total_time(
+        "greedy mesh",
+        &[
+            ("planes", plane_build_duration),
+            ("mesh", greedy_mesh_duration),
+            ("bricks", brick_build_duration),
+        ],
+    );
+
+    progress!(1.0);
+    Ok(all_bricks)
+}
+
+/// Collect every unique (height, color) combination present in the maps,
+/// skipping transparent/zero-height pixels when `cull` is set.
+fn collect_height_color_pairs(
+    heightmap: &dyn Heightmap,
+    colormap: &dyn Colormap,
+    cull: bool,
+) -> Vec<(u32, [u8; 4])> {
+    let (width, height) = heightmap.size();
     let mut height_color_pairs = std::collections::BTreeSet::new();
     for x in 0..width {
         for y in 0..height {
             let h = heightmap.at(x, y);
             let c = colormap.at(x, y);
-            // Only add non-transparent pixels (or all if not culling)
-            if !options.cull || (h > 0 && c[3] > 0) {
+            if !cull || (h > 0 && c[3] > 0) {
                 height_color_pairs.insert((h, c));
             }
         }
     }
+    info!(
+        "Found {} unique (height, color) combinations",
+        height_color_pairs.len()
+    );
+    height_color_pairs.into_iter().collect()
+}
 
-    let total_pairs = height_color_pairs.len();
-    info!("Found {} unique (height, color) combinations", total_pairs);
+/// Build one binary plane (one `BitMask` per image column) for each
+/// (height, color) pair in a single pass over the image. Logs and returns the
+/// phase wall time.
+fn build_planes(
+    heightmap: &dyn Heightmap,
+    colormap: &dyn Colormap,
+    cull: bool,
+    pairs_vec: Vec<(u32, [u8; 4])>,
+) -> (Vec<TaggedPlane>, Duration) {
+    let start = Instant::now();
+    let (width, height) = heightmap.size();
 
-    // Convert to Vec for processing
-    let pairs_vec: Vec<_> = height_color_pairs.into_iter().collect();
-
-    // Build all planes in a single pass over the image
-    let plane_build_start = Instant::now();
-
-    // Create a map from (h, color) to plane index
     let mut plane_map: HashMap<(u32, [u8; 4]), usize> = HashMap::with_capacity(pairs_vec.len());
     let mut all_planes: Vec<Vec<BitMask>> = Vec::with_capacity(pairs_vec.len());
-
     for (idx, &pair) in pairs_vec.iter().enumerate() {
         plane_map.insert(pair, idx);
-        // Allocate BitMasks more efficiently - start with minimal capacity
-        all_planes.push(Vec::with_capacity(width as usize));
-        for _ in 0..width {
-            all_planes[idx].push(BitMask::new());
-        }
+        all_planes.push(vec![BitMask::new(); width as usize]);
     }
 
-    // Single pass over the image to populate all planes at once
     for x in 0..width {
         for y in 0..height {
             let h = heightmap.at(x, y);
             let c = colormap.at(x, y);
 
-            if !options.cull || (h > 0 && c[3] > 0) {
-                if let Some(&plane_idx) = plane_map.get(&(h, c)) {
-                    all_planes[plane_idx][x as usize].set_bit(y);
-                }
+            if (!cull || (h > 0 && c[3] > 0))
+                && let Some(&plane_idx) = plane_map.get(&(h, c))
+            {
+                all_planes[plane_idx][x as usize].set_bit(y);
             }
         }
     }
 
-    // Build planes_with_metadata from all_planes (consume all_planes to avoid clones)
-    let planes_with_metadata: Vec<_> = all_planes
+    let planes: Vec<_> = all_planes
         .into_iter()
-        .zip(pairs_vec.into_iter())
+        .zip(pairs_vec)
         .map(|(plane, (h, color))| (plane, h, color))
         .collect();
 
-    let plane_build_duration = plane_build_start.elapsed();
+    let duration = start.elapsed();
     info!(
         "Built {} planes in {:.2}s",
-        planes_with_metadata.len(),
-        plane_build_duration.as_secs_f64()
+        planes.len(),
+        duration.as_secs_f64()
     );
+    (planes, duration)
+}
 
-    progress!(0.4);
-
-    // Run greedy mesh in parallel
-
-    let brick_scale = if options.micro { 2 } else { 10 };
-    let max_quad_size = 1000 / brick_scale;
-    let greedy_mesh_start = Instant::now();
-    let all_quads: Vec<_> = planes_with_metadata
+/// Greedy-mesh every plane in parallel, tagging each quad with its plane's
+/// (height, color). Logs and returns the phase wall time.
+fn mesh_planes(
+    planes: Vec<TaggedPlane>,
+    width: u32,
+    height: u32,
+    max_quad_size: u32,
+) -> (Vec<TaggedQuad>, Duration) {
+    let start = Instant::now();
+    let all_quads: Vec<_> = planes
         .into_par_iter()
         .flat_map(|(plane, h, color)| {
-            let quads = greedy_mesh_binary_plane(plane, width, height, max_quad_size);
-            quads
+            greedy_mesh_binary_plane(plane, width, height, max_quad_size)
                 .into_iter()
                 .map(move |quad| (quad, h, color))
                 .collect::<Vec<_>>()
         })
         .collect();
-    let greedy_mesh_duration = greedy_mesh_start.elapsed();
+    let duration = start.elapsed();
     info!(
         "Greedy meshed {} quads in {:.2}s",
         all_quads.len(),
-        greedy_mesh_duration.as_secs_f64()
+        duration.as_secs_f64()
     );
+    (all_quads, duration)
+}
 
-    progress!(0.7);
-
-    // Convert quads to bricks sequentially
-    let brick_build_start = Instant::now();
+/// Convert greedy quads into bricks, reporting progress every 1000 quads and
+/// returning `CANCELLED_MSG` if the callback requests cancellation. Logs and
+/// returns the phase wall time.
+fn quads_to_bricks<F: Fn(f32) -> bool>(
+    all_quads: Vec<TaggedQuad>,
+    options: &GenOptions,
+    width: u32,
+    height: u32,
+    progress_f: &F,
+) -> Result<(Vec<Brick>, Duration), String> {
+    let start = Instant::now();
     let mut all_bricks = Vec::new();
     let total_quads = all_quads.len();
 
@@ -257,87 +383,255 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     let offset_y = -(height as i32 * options.size as i32);
 
     for (idx, (quad, h, color)) in all_quads.into_iter().enumerate() {
-        if idx % 1000 == 0 {
-            progress!(0.7 + 0.25 * (idx as f32 / total_quads as f32));
+        if idx % 1000 == 0 && !progress_f(0.7 + 0.25 * (idx as f32 / total_quads as f32)) {
+            return Err(CANCELLED_MSG.to_string());
         }
-        let x = quad.x;
-        let y = quad.y;
-        let w = quad.w;
-        let h_brick = quad.h;
 
-        let mut z = (options.scale * h) as i32;
-        let mut desired_height = (options.scale * 2) as i32;
-
-        // Create vertical bricks if needed
-        while desired_height > 0 {
-            let brick_height = std::cmp::min(
-                std::cmp::max(desired_height, if options.stud { 5 } else { 2 }),
-                250,
-            ) as u16;
-            let brick_height = brick_height + brick_height % (if options.stud { 5 } else { 2 });
-
-            all_bricks.push(Brick {
-                asset: BrickType::Procedural {
-                    asset: options.asset.clone(),
-                    size: BrickSize::new(
-                        w as u16 * options.size,
-                        h_brick as u16 * options.size,
-                        if options.img && options.micro {
-                            options.size
-                        } else {
-                            brick_height
-                        },
-                    ),
-                },
-                position: Position::new(
-                    x as i32 * options.size as i32 * 2 + w as i32 * options.size as i32 + offset_x,
-                    y as i32 * options.size as i32 * 2
-                        + h_brick as i32 * options.size as i32
-                        + offset_y,
-                    options.base_height() - 5
-                        + if options.img {
-                            0
-                        } else {
-                            z - brick_height as i32
-                        },
-                ),
-                collision: Collision {
-                    player: !options.nocollide,
-                    weapon: !options.nocollide,
-                    interact: !options.nocollide,
-                    ..Default::default()
-                },
-                color: Color {
-                    r: color[0],
-                    g: color[1],
-                    b: color[2],
-                },
-                owner_index: None,
-                material_intensity: if options.glow { 0 } else { 5 },
-                material: if options.glow { GLOW } else { PLASTIC },
-                ..Default::default()
-            });
-
-            desired_height -= brick_height as i32;
-            z -= brick_height as i32 * 2;
-        }
+        emit_column_bricks(
+            &mut all_bricks,
+            options,
+            BrickColumn {
+                z: (options.scale * h) as i32,
+                desired_height: (options.scale * 2) as i32,
+                size_x: quad.w as u16 * options.size,
+                size_y: quad.h as u16 * options.size,
+                pos_x: quad.x as i32 * options.size as i32 * 2
+                    + quad.w as i32 * options.size as i32
+                    + offset_x,
+                pos_y: quad.y as i32 * options.size as i32 * 2
+                    + quad.h as i32 * options.size as i32
+                    + offset_y,
+                color,
+            },
+        );
     }
-    let brick_build_duration = brick_build_start.elapsed();
+
+    let duration = start.elapsed();
     info!(
         "Converted to {} bricks in {:.2}s",
         all_bricks.len(),
-        brick_build_duration.as_secs_f64()
+        duration.as_secs_f64()
     );
+    Ok((all_bricks, duration))
+}
 
-    let total_duration = plane_build_duration + greedy_mesh_duration + brick_build_duration;
-    info!(
-        "Total greedy mesh time: {:.2}s (planes: {:.2}s, mesh: {:.2}s, bricks: {:.2}s)",
-        total_duration.as_secs_f64(),
-        plane_build_duration.as_secs_f64(),
-        greedy_mesh_duration.as_secs_f64(),
-        brick_build_duration.as_secs_f64()
-    );
+/// One vertical column of terrain: its footprint, world position, starting
+/// grid Z, and the total height it must fill.
+pub(crate) struct BrickColumn {
+    /// Grid Z of the column top (post-snap), in heightmap half-units.
+    pub z: i32,
+    /// Total height to fill, in brick height units.
+    pub desired_height: i32,
+    pub size_x: u16,
+    pub size_y: u16,
+    pub pos_x: i32,
+    pub pos_y: i32,
+    pub color: [u8; 4],
+}
 
-    progress!(1.0);
-    Ok(all_bricks)
+/// Emit the stack of bricks for one terrain column, splitting at the 250-unit
+/// procedural-brick height cap. Shared by the greedy and quadtree paths so
+/// their collision/material semantics cannot drift (greedy semantics —
+/// validated in-game 2026-06-09).
+pub(crate) fn emit_column_bricks(out: &mut Vec<Brick>, options: &GenOptions, col: BrickColumn) {
+    let parity = if options.stud { 5 } else { 2 };
+    let mut z = col.z;
+    let mut desired_height = col.desired_height;
+
+    // Bounded (Rule 2): every iteration removes at least `parity` height.
+    while desired_height > 0 {
+        let brick_height = desired_height.max(parity).min(250) as u16;
+        let brick_height = brick_height + brick_height % parity as u16;
+
+        out.push(Brick {
+            asset: BrickType::Procedural {
+                asset: options.asset.clone(),
+                // if it's a microbrick image, just use the block size so it's cubes
+                size: BrickSize::new(
+                    col.size_x,
+                    col.size_y,
+                    if options.img && options.micro {
+                        options.size
+                    } else {
+                        brick_height
+                    },
+                ),
+            },
+            position: Position::new(
+                col.pos_x,
+                col.pos_y,
+                options.base_height() - 5
+                    + if options.img {
+                        0
+                    } else {
+                        z - brick_height as i32
+                    },
+            ),
+            collision: Collision {
+                player: !options.nocollide,
+                weapon: !options.nocollide,
+                interact: !options.nocollide,
+                ..Default::default()
+            },
+            color: Color {
+                r: col.color[0],
+                g: col.color[1],
+                b: col.color[2],
+            },
+            owner_index: None,
+            material_intensity: if options.glow { 0 } else { 5 },
+            material: if options.glow { GLOW } else { PLASTIC },
+            ..Default::default()
+        });
+
+        desired_height -= brick_height as i32;
+        z -= brick_height as i32 * 2;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brdb::assets::bricks::PB_DEFAULT_TILE;
+
+    fn test_options(stud: bool) -> GenOptions {
+        GenOptions {
+            size: 5,
+            scale: 1,
+            asset: PB_DEFAULT_TILE,
+            cull: false,
+            micro: false,
+            stud,
+            snap: false,
+            img: false,
+            glow: false,
+            hdmap: false,
+            lrgb: false,
+            nocollide: false,
+            quadtree: false,
+            greedy: true,
+        }
+    }
+
+    fn brick_height(brick: &Brick) -> u16 {
+        match &brick.asset {
+            BrickType::Procedural { size, .. } => size.z,
+            other => panic!("expected procedural brick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_column_bricks_splits_tall_columns_at_250() {
+        let options = test_options(false);
+        let mut bricks = Vec::new();
+        emit_column_bricks(
+            &mut bricks,
+            &options,
+            BrickColumn {
+                z: 1200,
+                desired_height: 600,
+                size_x: 10,
+                size_y: 15,
+                pos_x: 7,
+                pos_y: -3,
+                color: [10, 20, 30, 255],
+            },
+        );
+
+        let heights: Vec<u16> = bricks.iter().map(brick_height).collect();
+        assert_eq!(
+            heights,
+            vec![250, 250, 100],
+            "600 must split at the 250 cap"
+        );
+        assert_eq!(
+            heights.iter().map(|&h| h as i32).sum::<i32>(),
+            600,
+            "stacked bricks must preserve the total column height"
+        );
+
+        // Each brick's grid Z drops by 2x the previous brick's height; the
+        // stored position Z is base_height - 5 + (z - height).
+        let base = options.base_height() - 5;
+        assert_eq!(bricks[0].position.z, base + 1200 - 250);
+        assert_eq!(bricks[1].position.z, base + (1200 - 500) - 250);
+        assert_eq!(bricks[2].position.z, base + (1200 - 1000) - 100);
+        for b in &bricks {
+            assert_eq!((b.position.x, b.position.y), (7, -3));
+        }
+    }
+
+    #[test]
+    fn emit_column_bricks_rounds_odd_heights_to_parity() {
+        // Non-stud parity is 2: a desired height of 3 must round up to 4.
+        let options = test_options(false);
+        let mut bricks = Vec::new();
+        emit_column_bricks(
+            &mut bricks,
+            &options,
+            BrickColumn {
+                z: 6,
+                desired_height: 3,
+                size_x: 5,
+                size_y: 5,
+                pos_x: 0,
+                pos_y: 0,
+                color: [0, 0, 0, 255],
+            },
+        );
+        let heights: Vec<u16> = bricks.iter().map(brick_height).collect();
+        assert_eq!(heights, vec![4], "odd height must round up to parity 2");
+    }
+
+    #[test]
+    fn emit_column_bricks_respects_stud_minimum() {
+        // Stud parity is 5: a desired height of 2 must become at least 5.
+        let options = test_options(true);
+        let mut bricks = Vec::new();
+        emit_column_bricks(
+            &mut bricks,
+            &options,
+            BrickColumn {
+                z: 10,
+                desired_height: 2,
+                size_x: 5,
+                size_y: 5,
+                pos_x: 0,
+                pos_y: 0,
+                color: [0, 0, 0, 255],
+            },
+        );
+        let heights: Vec<u16> = bricks.iter().map(brick_height).collect();
+        assert_eq!(heights, vec![5], "stud bricks must be at least 5 tall");
+    }
+
+    #[test]
+    fn emit_column_bricks_uses_validated_material_and_collision() {
+        // The greedy-path semantics validated in-game: non-glow bricks get
+        // PLASTIC at intensity 5, and tool collision stays at its default.
+        let options = test_options(false);
+        let mut bricks = Vec::new();
+        emit_column_bricks(
+            &mut bricks,
+            &options,
+            BrickColumn {
+                z: 4,
+                desired_height: 2,
+                size_x: 5,
+                size_y: 5,
+                pos_x: 0,
+                pos_y: 0,
+                color: [1, 2, 3, 255],
+            },
+        );
+        assert_eq!(bricks.len(), 1);
+        assert_eq!(bricks[0].material, PLASTIC);
+        assert_eq!(bricks[0].material_intensity, 5);
+        assert!(bricks[0].collision.player);
+        assert!(bricks[0].collision.tool);
+        assert_eq!(
+            (bricks[0].color.r, bricks[0].color.g, bricks[0].color.b),
+            (1, 2, 3)
+        );
+    }
 }

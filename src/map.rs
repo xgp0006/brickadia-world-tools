@@ -133,3 +133,83 @@ impl ColormapPNG {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgba;
+
+    /// Writes `img` as a PNG into the OS temp dir under a name unique to this
+    /// process and test, and returns the path. Caller removes the file.
+    fn write_png(name: &str, img: &RgbaImage) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "h2brz_map_test_{}_{name}.png",
+            std::process::id()
+        ));
+        img.save(&path).expect("test PNG must be writable");
+        path
+    }
+
+    #[test]
+    fn heightmap_png_decodes_rgba_encoded_pixel_as_big_endian_u32() {
+        let mut img = RgbaImage::new(2, 1);
+        img.put_pixel(0, 0, Rgba([0x00, 0x01, 0x02, 0x03]));
+        img.put_pixel(1, 0, Rgba([0x0A, 0x14, 0x1E, 0x28]));
+        let path = write_png("rgba_encoded", &img);
+
+        let map = HeightmapPNG::new(vec![&path], true).expect("heightmap must load");
+        // hand-computed: [0x00,0x01,0x02,0x03] big-endian -> 0x00010203 = 66051
+        assert_eq!(map.at(0, 0), 66051);
+        // [0x0A,0x14,0x1E,0x28] -> 0x0A141E28 = 169_090_600
+        assert_eq!(map.at(1, 0), 169_090_600);
+        assert_eq!(map.size(), (2, 1));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn heightmap_png_grayscale_mode_reads_red_channel_and_sums_maps() {
+        let mut a = RgbaImage::new(1, 2);
+        a.put_pixel(0, 0, Rgba([200, 5, 9, 255]));
+        a.put_pixel(0, 1, Rgba([7, 90, 90, 255]));
+        let mut b = RgbaImage::new(1, 2);
+        b.put_pixel(0, 0, Rgba([40, 1, 2, 255]));
+        b.put_pixel(0, 1, Rgba([3, 80, 80, 255]));
+        let path_a = write_png("gray_a", &a);
+        let path_b = write_png("gray_b", &b);
+
+        let single = HeightmapPNG::new(vec![&path_a], false).expect("heightmap must load");
+        assert_eq!(single.at(0, 0), 200, "red channel only, not G/B/A");
+        assert_eq!(single.at(0, 1), 7);
+
+        let stacked =
+            HeightmapPNG::new(vec![&path_a, &path_b], false).expect("heightmaps must load");
+        assert_eq!(stacked.at(0, 0), 240, "multiple maps sum their red channels");
+        assert_eq!(stacked.at(0, 1), 10);
+        assert_eq!(stacked.size(), (1, 2));
+
+        let _ = std::fs::remove_file(path_a);
+        let _ = std::fs::remove_file(path_b);
+    }
+
+    #[test]
+    fn heightmap_png_rejects_empty_input_and_mismatched_sizes() {
+        assert!(HeightmapPNG::new(vec![], false).is_err());
+
+        let small = write_png("mismatch_small", &RgbaImage::new(1, 1));
+        let large = write_png("mismatch_large", &RgbaImage::new(2, 1));
+        let result = HeightmapPNG::new(vec![&small, &large], false);
+        assert_eq!(result.err().as_deref(), Some("Mismatched heightmap sizes"));
+
+        let _ = std::fs::remove_file(small);
+        let _ = std::fs::remove_file(large);
+    }
+
+    #[test]
+    fn heightmap_flat_reports_size_and_unit_height_everywhere() {
+        let flat = HeightmapFlat::new((7, 9)).expect("flat heightmap is infallible");
+        assert_eq!(flat.size(), (7, 9));
+        assert_eq!(flat.at(0, 0), 1);
+        assert_eq!(flat.at(6, 8), 1);
+    }
+}
