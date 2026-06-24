@@ -114,6 +114,8 @@ fn options_from_matches(matches: &ArgMatches) -> GenOptions {
         // CLI keeps the legacy flat surface; base-fill is a Map-tab feature
         // (its heights are normalized and brick-capped). Unchanged here.
         fill_to_base: false,
+        // CLI never skips the floor — its output stays byte-identical.
+        skip_floor: false,
     }
 }
 

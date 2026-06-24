@@ -356,6 +356,7 @@ mod tests {
             quadtree: true,
             greedy: false,
             fill_to_base: false,
+            skip_floor: false,
         }
     }
 

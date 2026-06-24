@@ -878,6 +878,17 @@ impl BrickStyle {
             nocollide: request.no_collision,
         }
     }
+
+    /// Build a style directly from shaping knobs, for callers (the sculpt
+    /// convert) that shape a [`HeightField`] rather than fetch a `BuildRequest`.
+    pub(crate) fn new(
+        block_type: BlockType,
+        horizontal_scale: u16,
+        glow: bool,
+        nocollide: bool,
+    ) -> Self {
+        Self { block_type, horizontal_scale, glow, nocollide }
+    }
 }
 
 /// `base_override`: `Some(b)` fills every column down to brick-Z `b` (grid mode
@@ -891,6 +902,32 @@ pub(crate) fn generate_bricks(
     style: BrickStyle,
     base_override: Option<u32>,
     offset: (i32, i32),
+    progress: ProgressFn,
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<brdb::Brick>, BuildError> {
+    // Single-box and grid map builds keep their watertight base plate: the floor
+    // column is real ground there, so `skip_floor = false` keeps output
+    // byte-identical (guarded by the identity tests). The sculpt convert calls
+    // `generate_bricks_skip_floor(true)` instead so a blank canvas reveals the
+    // native Brickadia floor.
+    generate_bricks_skip_floor(
+        heightmap, colormap, style, base_override, offset, false, progress, cancel,
+    )
+}
+
+/// As [`generate_bricks`], but with the additive `skip_floor` seam exposed: when
+/// `true`, a column whose normalized height bottoms out at the base plane emits
+/// no bricks (the native floor stands in). The sculpt/blank-canvas convert sets
+/// it `true`; every map-build caller goes through `generate_bricks` (`false`),
+/// so the map output is unaffected.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_bricks_skip_floor(
+    heightmap: &DemHeightmap,
+    colormap: &dyn Colormap,
+    style: BrickStyle,
+    base_override: Option<u32>,
+    offset: (i32, i32),
+    skip_floor: bool,
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
 ) -> Result<Vec<brdb::Brick>, BuildError> {
@@ -922,6 +959,11 @@ pub(crate) fn generate_bricks(
         // Map terrain is normalized to ~0 and capped by MAX_BRICKS, so fill each
         // column to the base plane for solid, walkable ground.
         fill_to_base: true,
+        // Map/grid terrain keeps its watertight base plate (the floor column is
+        // real ground here). Sculpt convert passes `true` so a blank canvas
+        // reveals the native floor; default-off (every `generate_bricks` caller)
+        // keeps single-box and grid output byte-identical.
+        skip_floor,
     };
     let cancel_check = move |f: f32| -> bool {
         progress(BuildStage::GeneratingBricks, f);
@@ -1118,6 +1160,25 @@ pub(crate) struct FlatColormap {
     width: u32,
     height: u32,
     color: [u8; 4],
+}
+
+impl FlatColormap {
+    /// Test-only constructor: the sculpt passthrough identity test needs a flat
+    /// colormap matching a raster's dims but cannot reach the private fields.
+    /// Uses the same `DEFAULT_BRICK_COLOR` the production None-imagery path does
+    /// so the meshed output is comparable to a real build.
+    #[cfg(test)]
+    pub(crate) fn for_test(width: u32, height: u32) -> Self {
+        Self { width, height, color: DEFAULT_BRICK_COLOR }
+    }
+
+    /// The sculpt convert has no imagery layer (color painting is a later MVP),
+    /// so it meshes terrain against the same `DEFAULT_BRICK_COLOR` flat colormap
+    /// the Map tab's None-imagery path uses. Production constructor (the test one
+    /// above is gated out of release builds).
+    pub(crate) fn sculpt_default(width: u32, height: u32) -> Self {
+        Self { width, height, color: DEFAULT_BRICK_COLOR }
+    }
 }
 
 impl Colormap for FlatColormap {
@@ -1523,6 +1584,7 @@ mod tests {
             quadtree: false,
             greedy: true,
             fill_to_base: false,
+            skip_floor: false,
         };
         let bricks =
             crate::opt::gen_opt_heightmap(&heightmap, &cm, options, None, None, |_| true).expect("gen");

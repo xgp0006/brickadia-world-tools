@@ -21,6 +21,7 @@ mod grid_ui;
 mod imagery_sources;
 mod map_tab;
 mod preview_source;
+mod sculpt;
 mod theme;
 mod tiles;
 pub use theme::install_theme;

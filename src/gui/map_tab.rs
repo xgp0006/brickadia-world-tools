@@ -21,6 +21,7 @@ use super::geocode::{self, GeocodeError, GeocodeHit};
 use super::dem_sources::{Coverage, DemSource, RequiredKey};
 use super::imagery_sources::ImagerySource;
 use super::preview_source::PreviewBasemap;
+use super::sculpt;
 use super::theme::{BBOX_FILL, BBOX_STROKE, STATUS_ERROR_FG, STATUS_WARN_FG};
 use super::tiles::{BBoxLatLon, MERCATOR_LAT_LIMIT};
 
@@ -211,6 +212,14 @@ pub(crate) struct MapTabState {
     /// All grid-build UI + worker state (spec §8). Defaults OFF so the single-box
     /// flow is visually unchanged; lives behind the "Grid build" collapsing header.
     grid: GridUiState,
+    /// "Send to Sculpt" worker: fetches + decodes the DEM for the current bbox,
+    /// builds a `HeightField`, and parks it in `sculpt_handoff` for `app.rs` to
+    /// pick up. Reuses the same `fetch_and_decode_dem` + Promise machinery as the
+    /// build path (spec §7).
+    sculpt_promise: Option<Promise<Result<sculpt::HeightField, BuildError>>>,
+    sculpt_cancel: Arc<AtomicBool>,
+    /// Set when the sculpt fetch completes; `take_sculpt_handoff` drains it.
+    sculpt_handoff: Option<sculpt::HeightField>,
 }
 
 impl MapTabState {
@@ -258,7 +267,20 @@ impl MapTabState {
             last_outcome: None,
             last_error: None,
             grid: GridUiState::new(),
+            sculpt_promise: None,
+            sculpt_cancel: Arc::new(AtomicBool::new(false)),
+            sculpt_handoff: None,
         }
+    }
+
+    fn is_sending_to_sculpt(&self) -> bool {
+        self.sculpt_promise.is_some()
+    }
+
+    /// Drain a completed Send-to-Sculpt handoff. `app.rs` calls this each frame;
+    /// when it returns `Some`, the field is loaded into the Sculpt tab.
+    pub(crate) fn take_sculpt_handoff(&mut self) -> Option<sculpt::HeightField> {
+        self.sculpt_handoff.take()
     }
 
     fn is_fetching(&self) -> bool {
@@ -275,6 +297,9 @@ impl MapTabState {
         // build (fetch + mesh + write) stops instead of running on after the
         // window is gone.
         self.grid.cancel.store(true, Ordering::Relaxed);
+        // The Send-to-Sculpt fetch worker likewise observes a cancel flag so its
+        // detached DEM fetch aborts on shutdown.
+        self.sculpt_cancel.store(true, Ordering::Relaxed);
     }
 
     fn ensure_tiles(&mut self, ctx: &egui::Context) {
@@ -299,11 +324,15 @@ pub(crate) fn draw(state: &mut MapTabState, ctx: &egui::Context, ui: &mut Ui) {
     state.ensure_tiles(ctx);
     poll_fetch_promise(state);
     poll_search_promise(state);
+    poll_sculpt_promise(state);
     grid_ui::poll_grid_promise(&mut state.grid);
     if state.search_promise.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(120));
     }
     if state.is_fetching() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(120));
+    }
+    if state.is_sending_to_sculpt() {
         ctx.request_repaint_after(std::time::Duration::from_millis(120));
     }
     if grid_ui::is_grid_running(&state.grid) {
@@ -348,6 +377,8 @@ fn draw_controls(state: &mut MapTabState, ui: &mut Ui) {
     draw_output_section(state, ui);
     ui.add_space(8.0);
     draw_fetch_button(state, ui);
+    ui.add_space(6.0);
+    draw_send_to_sculpt_button(state, ui);
     ui.add_space(8.0);
     draw_grid_section(state, ui);
     ui.add_space(6.0);
@@ -833,6 +864,149 @@ fn start_fetch(state: &mut MapTabState) {
         Err(e) => {
             // promise + its sender drop together here, never polled.
             state.last_error = Some(format!("could not start build thread: {e}"));
+        }
+    }
+}
+
+/// "Send to Sculpt": fetch + decode the DEM for the current bbox on a worker,
+/// build a `HeightField`, and hand it to the Sculpt tab. Disabled while a build
+/// or another send is in flight, or with no usable bbox/source — reuses the
+/// fetch-button blocker logic so the gate matches.
+fn draw_send_to_sculpt_button(state: &mut MapTabState, ui: &mut Ui) {
+    if state.is_sending_to_sculpt() {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new());
+            ui.label("Fetching terrain for Sculpt…");
+            if ui.button("Cancel").clicked() {
+                state.sculpt_cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        return;
+    }
+    // Gate on the same readiness the Fetch button needs, minus the output name
+    // (Sculpt does not write yet), plus "not already building".
+    let ready = state.bbox.is_some()
+        && !state.is_fetching()
+        && key_ok_for(&state.config, state.dem_source.required_key());
+    let resp = ui.add_enabled(
+        ready,
+        egui::Button::new("✎  Send to Sculpt").min_size(Vec2::new(260.0, 28.0)),
+    );
+    if ready {
+        if resp
+            .on_hover_text(
+                "Fetch this area's elevation and open it in the Sculpt tab to brush by hand.",
+            )
+            .clicked()
+        {
+            start_send_to_sculpt(state);
+        }
+    } else {
+        resp.on_disabled_hover_text("Select a bounding box and a usable elevation source first.");
+    }
+}
+
+fn start_send_to_sculpt(state: &mut MapTabState) {
+    let Some(bbox) = state.bbox else {
+        state.last_error = Some("internal: Send to Sculpt clicked with no bbox".into());
+        return;
+    };
+    // The effective (post-density) cell pitch this box will fetch at — the SAME
+    // value start_fetch derives, so a sculpt convert reproduces the build's scale.
+    let cell_m_eff = predicted_cell_m(state, bbox).unwrap_or(30.0)
+        * f64::from(state.density_factor.max(1));
+
+    let request = BuildRequest {
+        bbox: BBoxLatLon {
+            north: bbox.north,
+            south: bbox.south,
+            east: bbox.east,
+            west: bbox.west,
+        },
+        name: state.output_name.clone(),
+        dem_source: state.dem_source,
+        imagery_source: ImagerySource::None,
+        mapbox_token: state.config.mapbox_token.clone(),
+        opentopo_key: state.config.opentopo_api_key.clone(),
+        // vertical_scale/horizontal_scale are unused by fetch_and_decode_dem; the
+        // sculpt convert re-derives them from FieldMeta. Use safe placeholders.
+        vertical_scale: 1.0,
+        density_factor: state.density_factor,
+        horizontal_scale: 1,
+        block_type: state.block_type,
+        glow: state.glow,
+        no_collision: state.no_collision,
+        install_to_brickadia: false,
+        overwrite_world: false,
+    };
+    let meta = sculpt::FieldMeta {
+        cell_m: cell_m_eff,
+        studs_per_meter: state.studs_per_meter,
+        vertical_exaggeration: state.vertical_exaggeration,
+        micro: state.block_type.micro(),
+        centroid_lat: bbox.centroid_lat(),
+        source_name: if state.output_name.trim().is_empty() {
+            "sculpt".to_owned()
+        } else {
+            state.output_name.clone()
+        },
+    };
+    let density = u32::from(state.density_factor.max(1));
+
+    state.last_error = None;
+    state.sculpt_cancel.store(false, Ordering::Relaxed);
+    let cancel_arc = Arc::clone(&state.sculpt_cancel);
+    // The fetch reports progress through a sink we ignore (the spinner is enough
+    // feedback for this one-shot path).
+    let progress_fn: build::ProgressFn = Arc::new(|_stage, _f| {});
+
+    let (sender, promise) = Promise::new();
+    match std::thread::Builder::new()
+        .name("h2brz-send-sculpt".into())
+        .spawn(move || {
+            let result = fetch_field_for_sculpt(&request, meta, density, progress_fn, cancel_arc);
+            sender.send(result);
+        }) {
+        Ok(_handle) => state.sculpt_promise = Some(promise),
+        Err(e) => {
+            state.last_error = Some(format!("could not start sculpt-fetch thread: {e}"));
+        }
+    }
+}
+
+/// Worker body: fetch + decode the DEM, apply the density downsample, and build a
+/// floor-relative `HeightField`. Runs off the UI thread.
+fn fetch_field_for_sculpt(
+    request: &BuildRequest,
+    meta: sculpt::FieldMeta,
+    density: u32,
+    progress: build::ProgressFn,
+    cancel: Arc<AtomicBool>,
+) -> Result<sculpt::HeightField, BuildError> {
+    let raster = build::fetch_and_decode_dem(request, Arc::clone(&progress), Arc::clone(&cancel))?;
+    let raster = build::downsample(&raster, density);
+    build::enforce_cell_budget(raster.width, raster.height)?;
+    Ok(sculpt::HeightField::from_dem(&raster, meta))
+}
+
+fn poll_sculpt_promise(state: &mut MapTabState) {
+    let Some(promise) = state.sculpt_promise.as_ref() else {
+        return;
+    };
+    if promise.ready().is_none() {
+        return;
+    }
+    let promise = state.sculpt_promise.take().expect("just verified Some");
+    match promise.try_take() {
+        Ok(Ok(field)) => {
+            state.sculpt_handoff = Some(field);
+            state.last_error = None;
+        }
+        Ok(Err(err)) => {
+            state.last_error = Some(err.to_string());
+        }
+        Err(_) => {
+            state.sculpt_promise = None;
         }
     }
 }

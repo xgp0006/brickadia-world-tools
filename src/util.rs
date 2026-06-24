@@ -28,6 +28,15 @@ pub struct GenOptions {
     /// could emit an unbounded brick stack (and those paths have no MAX_BRICKS
     /// guard). img2brick mode ignores it regardless.
     pub fill_to_base: bool,
+    /// Greedy + fill_to_base terrain path only: when set, a column whose fill
+    /// height bottoms out at the common base plane (i.e. `h == min_height`, so
+    /// `(h - min_height) == 0`) emits NO bricks — the native Brickadia flat
+    /// ground serves as the floor, so flat areas reveal the world floor instead
+    /// of a redundant plate. Set `true` by the sculpt/blank-canvas convert.
+    /// Default `false` keeps every existing single-box/grid output
+    /// byte-identical (those paths never skip). Has no effect unless both
+    /// `fill_to_base` is set and `img` is clear (mirrors the fill_to_base gate).
+    pub skip_floor: bool,
 }
 
 impl GenOptions {

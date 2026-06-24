@@ -9,6 +9,7 @@ use std::{
 
 use super::logger;
 use super::map_tab::{self, MapTabState};
+use super::sculpt::{self, SculptState};
 use crate::{opt::*, util::*};
 use brdb::assets::bricks::{
     PB_DEFAULT_BRICK, PB_DEFAULT_MICRO_BRICK, PB_DEFAULT_SMOOTH_TILE, PB_DEFAULT_STUDDED,
@@ -43,6 +44,7 @@ enum OptimizationMode {
 enum AppTab {
     Convert,
     Map,
+    Sculpt,
 }
 
 type Progress = (&'static str, f32);
@@ -144,6 +146,7 @@ pub struct HeightmapApp {
     gen_interrupt: Option<Sender<()>>,
     current_tab: AppTab,
     map_state: MapTabState,
+    sculpt_state: SculptState,
 }
 
 impl Default for HeightmapApp {
@@ -171,6 +174,7 @@ impl Default for HeightmapApp {
             gen_interrupt: None,
             current_tab: AppTab::Convert,
             map_state: MapTabState::new(),
+            sculpt_state: SculptState::new(),
         }
     }
 }
@@ -220,6 +224,8 @@ impl HeightmapApp {
             // 100 with no brick cap, so keep the legacy flat surface (no base
             // fill) to avoid an unbounded brick stack.
             fill_to_base: false,
+            // Convert tab never skips the floor — output stays byte-identical.
+            skip_floor: false,
         }
     }
 
@@ -265,7 +271,7 @@ impl HeightmapApp {
 
     fn draw_header(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.heading("heightmap2brz");
+            ui.heading("Brickadia-World-Tools");
             ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -606,6 +612,7 @@ impl Drop for HeightmapApp {
         // stop so a detached build/convert thread doesn't keep running (and,
         // for the Convert tab, doesn't panic on the orphaned progress channel).
         self.map_state.cancel_fetch();
+        self.sculpt_state.cancel_convert();
         if let Some(tx) = &self.gen_interrupt {
             let _ = tx.send(());
         }
@@ -614,15 +621,25 @@ impl Drop for HeightmapApp {
 
 impl App for HeightmapApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // Map → Sculpt handoff: when the Map tab finishes fetching a DEM for
+        // "Send to Sculpt", it parks a HeightField here. Pick it up, load it into
+        // the Sculpt tab, and switch to that tab.
+        if let Some(field) = self.map_state.take_sculpt_handoff() {
+            self.sculpt_state.set_field(field);
+            self.current_tab = AppTab::Sculpt;
+        }
+
         TopBottomPanel::top("app_tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.current_tab, AppTab::Convert, "Convert");
                 ui.selectable_value(&mut self.current_tab, AppTab::Map, "Map");
+                ui.selectable_value(&mut self.current_tab, AppTab::Sculpt, "Sculpt");
             });
         });
         CentralPanel::default().show(ctx, |ui| match self.current_tab {
             AppTab::Convert => self.draw_convert_tab(ctx, ui),
             AppTab::Map => map_tab::draw(&mut self.map_state, ctx, ui),
+            AppTab::Sculpt => sculpt::draw(&mut self.sculpt_state, ctx, ui),
         });
     }
 }

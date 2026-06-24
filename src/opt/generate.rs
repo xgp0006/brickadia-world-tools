@@ -466,6 +466,22 @@ fn quads_to_bricks<F: Fn(f32) -> bool>(
         // base. Off (Convert tab / CLI, or any img2brick build) keeps the legacy
         // flat 2-unit block — those heights are un-normalized / unbounded, and
         // img mode holds position Z constant so a tall fill would overlap.
+        // Floor-skip (sculpt/blank-canvas convert only): when fill_to_base is on
+        // and this column's normalized height equals the common base plane
+        // (`h == min_height`, so the fill span is zero), the native Brickadia
+        // ground IS the floor here — emit nothing so flat areas reveal the world
+        // floor instead of a redundant plate. Gated on the SAME conditions as the
+        // fill_to_base branch below (`fill_to_base && !img`) so `skip_floor` can
+        // never alter the legacy flat-surface path. Default-off (skip_floor =
+        // false) leaves every existing single-box/grid output byte-identical.
+        if options.skip_floor
+            && options.fill_to_base
+            && !options.img
+            && (h as i32 - min_height as i32) == 0
+        {
+            continue;
+        }
+
         let desired_height = if options.fill_to_base && !options.img {
             (((h as i32 - min_height as i32).max(0)) * options.scale as i32 / 2).max(2)
         } else {
@@ -596,6 +612,7 @@ mod tests {
             quadtree: false,
             greedy: true,
             fill_to_base: false,
+            skip_floor: false,
         }
     }
 
@@ -614,6 +631,80 @@ mod tests {
             BrickType::Procedural { size, .. } => (b.position, *size),
             other => panic!("expected procedural brick, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn skip_floor_default_off_is_byte_identical() {
+        // The additive `skip_floor` flag, default-OFF, must leave the
+        // fill_to_base terrain path byte-identical. A fixed quad set (some quads
+        // AT the base plane `min_height`, which `skip_floor=true` would drop) is
+        // meshed through `quads_to_bricks` with `skip_floor=false`, then compared
+        // against an INDEPENDENT re-derivation of the exact pre-change loop —
+        // the same desired_height formula + `emit_column_bricks`, with NO skip.
+        // Equality proves the flag is a no-op when off (locks the default).
+        let mut options = test_options(false);
+        options.fill_to_base = true; // exercise the fill branch the skip gates on
+        options.skip_floor = false; // the contract under test
+        let (width, height) = (8u32, 6u32);
+        let min_height = 7u32;
+        let quads: Vec<TaggedQuad> = vec![
+            // h == min_height (7): the would-be-skipped floor column.
+            (GreedyQuad { x: 0, y: 0, w: 3, h: 2 }, 7, [1, 2, 3, 255]),
+            (GreedyQuad { x: 3, y: 0, w: 2, h: 4 }, 40, [4, 5, 6, 255]),
+            (GreedyQuad { x: 5, y: 2, w: 3, h: 3 }, 19, [7, 8, 9, 255]),
+        ];
+        let offset = (-(width as i32 * options.size as i32), -(height as i32 * options.size as i32));
+
+        let (actual, _) = quads_to_bricks(
+            quads.clone(),
+            &options,
+            width,
+            height,
+            min_height,
+            Some(offset),
+            &|_| true,
+        )
+        .expect("quads_to_bricks with skip_floor=false must mesh");
+
+        // Independent reference: the pre-change loop verbatim (no skip branch).
+        let mut reference = Vec::new();
+        for (quad, h, color) in &quads {
+            let desired_height = if options.fill_to_base && !options.img {
+                (((*h as i32 - min_height as i32).max(0)) * options.scale as i32 / 2).max(2)
+            } else {
+                (options.scale * 2) as i32
+            };
+            emit_column_bricks(
+                &mut reference,
+                &options,
+                BrickColumn {
+                    z: (options.scale * h) as i32,
+                    desired_height,
+                    size_x: quad.w as u16 * options.size,
+                    size_y: quad.h as u16 * options.size,
+                    pos_x: quad.x as i32 * options.size as i32 * 2
+                        + quad.w as i32 * options.size as i32
+                        + offset.0,
+                    pos_y: quad.y as i32 * options.size as i32 * 2
+                        + quad.h as i32 * options.size as i32
+                        + offset.1,
+                    color: *color,
+                },
+            );
+        }
+
+        assert!(!reference.is_empty(), "fixture must emit bricks");
+        assert_eq!(
+            actual.len(),
+            reference.len(),
+            "skip_floor=false must emit the same brick count as the pre-change loop",
+        );
+        let actual_geom: Vec<_> = actual.iter().map(brick_geom).collect();
+        let reference_geom: Vec<_> = reference.iter().map(brick_geom).collect();
+        assert_eq!(
+            actual_geom, reference_geom,
+            "skip_floor=false must be byte-identical to the pre-change emit (including the floor column)",
+        );
     }
 
     #[test]

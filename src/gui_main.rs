@@ -7,9 +7,10 @@ fn main() -> Result<(), eframe::Error> {
     logger::init().unwrap();
 
     eframe::run_native(
-        "heightmap2brs",
+        "Brickadia-World-Tools",
         NativeOptions {
             viewport: egui::ViewportBuilder::default()
+                .with_title("Brickadia-World-Tools")
                 .with_always_on_top()
                 .with_decorations(true)
                 .with_drag_and_drop(true)
