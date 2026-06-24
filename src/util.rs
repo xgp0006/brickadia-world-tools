@@ -20,6 +20,14 @@ pub struct GenOptions {
     pub nocollide: bool,
     pub quadtree: bool,
     pub greedy: bool,
+    /// Greedy path only: fill each terrain column from its height DOWN to the
+    /// common base plane (solid, watertight ground) instead of a constant 2-unit
+    /// surface tile. Set by the Map tab, whose heights are normalized to ~0 and
+    /// brick-count-capped. The Convert tab and CLI leave it false: their heights
+    /// are un-normalized and `vertical_scale` reaches 100, so filling to base
+    /// could emit an unbounded brick stack (and those paths have no MAX_BRICKS
+    /// guard). img2brick mode ignores it regardless.
+    pub fill_to_base: bool,
 }
 
 impl GenOptions {
@@ -156,22 +164,31 @@ pub fn maps_from_files(
     Ok((heightmap, Box::new(colormap)))
 }
 
-/// Encodes bricks as a save and writes it to `out_file`. The format is picked
-/// from the extension: `.brz` or `.brdb` (case-insensitive).
-pub fn write_save(out_file: &str, bricks: Vec<Brick>) -> Result<(), String> {
-    let data = bricks_to_save(bricks);
+/// Writes an already-built `World` to `out_file`. The format is picked from the
+/// extension: `.brz` or `.brdb` (case-insensitive). Factored out of
+/// [`write_save`] so the grid output layer can write a `World` it built once
+/// (stitched accumulator or per-tile) without rebuilding it per format.
+pub fn write_save_world(world: &World, out_file: &str) -> Result<(), String> {
     let lower = out_file.to_lowercase();
     if lower.ends_with(".brz") {
-        let brz = data
+        let brz = world
             .to_brz_vec()
             .map_err(|e| format!("failed to encode brz: {e}"))?;
         std::fs::write(out_file, brz).map_err(|e| format!("failed to write file: {e}"))
     } else if lower.ends_with(".brdb") {
-        data.write_brdb(out_file)
+        world
+            .write_brdb(out_file)
             .map_err(|e| format!("failed to write file: {e}"))
     } else {
         Err("output file must end with .brz or .brdb".to_string())
     }
+}
+
+/// Encodes bricks as a save and writes it to `out_file`. The format is picked
+/// from the extension: `.brz` or `.brdb` (case-insensitive).
+pub fn write_save(out_file: &str, bricks: Vec<Brick>) -> Result<(), String> {
+    let data = bricks_to_save(bricks);
+    write_save_world(&data, out_file)
 }
 
 #[cfg(test)]

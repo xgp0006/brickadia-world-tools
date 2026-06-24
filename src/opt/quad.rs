@@ -355,6 +355,7 @@ mod tests {
             nocollide: false,
             quadtree: true,
             greedy: false,
+            fill_to_base: false,
         }
     }
 

@@ -12,8 +12,21 @@ use std::time::Duration;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TILES_PER_FETCH: usize = 64;
 pub(crate) const TILE_SIZE_PX: u32 = 256;
-const TARGET_TILE_COUNT_LOW: usize = 4;
-const TARGET_TILE_COUNT_HIGH: usize = 16;
+/// Upper bound on cropped DEM cells (pixels) `pick_zoom` will select, with a
+/// backstop in build.rs. The greedy+imagery mesher allocates one `Vec<u128>`
+/// BitMask per image column per UNIQUE (height,color) pair (opt/generate.rs
+/// build_planes); with per-pixel-unique satellite colors that is ~one plane per
+/// cell, so peak mesh memory scales ~`cells^1.5 * 40 B` — ~3.6 GB theoretical
+/// floor at this value, ~5 GB real once glibc per-allocation overhead on the
+/// ~90 M tiny Vecs is counted (safe on a 16 GB+ host; this box has 60 GB).
+/// Bounding cells keeps that in check: a real-world area larger than this budget
+/// is served at coarser resolution (a lower zoom) instead of OOMing, and the
+/// user can raise Density to cover a bigger area at fewer cells.
+/// ponytail: a streaming/columnar mesher would lift this — it's the lazy guard,
+/// the upgrade path is reworking opt/generate.rs's per-(height,color)-plane model.
+/// `pub(crate)` so build.rs can backstop the OpenTopography single-shot GeoTIFF
+/// path, which bypasses `pick_zoom`.
+pub(crate) const MAX_DEM_CELLS: u64 = 200_000;
 const MIN_ZOOM: u32 = 1;
 const MAX_ZOOM: u32 = 18;
 /// Web Mercator latitude limit — the slippy-map tile grid is undefined beyond it.
@@ -100,11 +113,22 @@ impl StitchedTiles {
     }
 }
 
-/// Pick the smallest zoom level that puts the bbox into the
-/// `[TARGET_TILE_COUNT_LOW, TARGET_TILE_COUNT_HIGH]` window, never exceeding
-/// `source_max_zoom` (the provider's documented data ceiling). A tiny bbox that
-/// under-fills the target at every zoom clamps to that ceiling rather than the
-/// global `MAX_ZOOM`, so we never request tiles the provider does not serve.
+/// Pick the HIGHEST zoom (≤ `source_max_zoom`) whose cropped grid stays within
+/// BOTH the per-fetch tile cap and the [`MAX_DEM_CELLS`] budget — i.e. the most
+/// detail the selected area can carry without blowing the fetch size or the
+/// greedy mesh memory.
+///
+/// Within a zoom band a bigger box yields more cells; at a band boundary the
+/// zoom steps down (cells drop ~4×), so cell count is a sawtooth in area rather
+/// than strictly monotonic — but it is far better than the old behavior, which
+/// targeted a fixed 4–16 *tile* window and returned the SMALLEST zoom reaching
+/// it, so a 2 km box dropped well below a 1 km box and built a physically
+/// smaller world (the "doesn't scale" complaint). True area-proportional output
+/// size would decouple map size from cell count (auto-scale) — deferred; the
+/// honest predicted-size readout reflects the actual chosen zoom meanwhile. A
+/// tiny bbox pins to the provider ceiling; a continent-scale bbox falls through
+/// to MIN_ZOOM, which CAN still exceed MAX_DEM_CELLS — that extreme is the hard
+/// backstop's job (`build::enforce_cell_budget`), not this picker's.
 pub(crate) fn pick_zoom(bbox: BBoxLatLon, source_max_zoom: u32) -> u32 {
     debug_assert!(
         bbox.north > bbox.south && bbox.east >= bbox.west,
@@ -112,16 +136,14 @@ pub(crate) fn pick_zoom(bbox: BBoxLatLon, source_max_zoom: u32) -> u32 {
     );
     // A bogus override can never widen the search past the global ceiling.
     let ceiling = source_max_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-    for z in MIN_ZOOM..=ceiling {
-        let n = tile_count(bbox, z);
-        if (TARGET_TILE_COUNT_LOW..=TARGET_TILE_COUNT_HIGH).contains(&n) {
+    for z in (MIN_ZOOM..=ceiling).rev() {
+        if tile_count(bbox, z) <= MAX_TILES_PER_FETCH
+            && approx_cell_count(bbox, z) <= MAX_DEM_CELLS
+        {
             return z;
         }
-        if n > TARGET_TILE_COUNT_HIGH {
-            return z.saturating_sub(1).max(MIN_ZOOM);
-        }
     }
-    ceiling
+    MIN_ZOOM
 }
 
 pub(crate) fn tile_count(bbox: BBoxLatLon, zoom: u32) -> usize {
@@ -155,7 +177,10 @@ fn lat_lon_to_tile(lat: f64, lon: f64, zoom: u32) -> (u32, u32) {
 
 /// Sub-pixel world coordinate of a lat/lon at the given zoom.
 /// World canvas at zoom z is `TILE_SIZE_PX * 2^z` pixels per side.
-fn lat_lon_to_world_px(lat: f64, lon: f64, zoom: u32) -> (f64, f64) {
+///
+/// `pub(crate)` so the grid planner/tests can project tile-edge corners to
+/// absolute world pixels and prove adjacent tiles share a column by value.
+pub(crate) fn lat_lon_to_world_px(lat: f64, lon: f64, zoom: u32) -> (f64, f64) {
     let n = 2.0_f64.powi(zoom as i32);
     let total = TILE_SIZE_PX as f64 * n;
     let lat_clamped = lat.clamp(-MERCATOR_LAT_LIMIT, MERCATOR_LAT_LIMIT);
@@ -163,6 +188,19 @@ fn lat_lon_to_world_px(lat: f64, lon: f64, zoom: u32) -> (f64, f64) {
     let x = (lon + 180.0) / 360.0 * total;
     let y = (1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0 * total;
     (x, y)
+}
+
+/// Approximate number of cropped DEM cells (pixels) a bbox yields at `zoom`: its
+/// Web-Mercator world-pixel extent. This is the grid the mesher actually
+/// processes after cropping, so `pick_zoom` budgets on it rather than on whole
+/// tiles — a small bbox can sit inside only a few tiles yet still decode to many
+/// pixels, and tile count alone would not bound the mesh.
+pub(crate) fn approx_cell_count(bbox: BBoxLatLon, zoom: u32) -> u64 {
+    let (nw_x, nw_y) = lat_lon_to_world_px(bbox.north, bbox.west, zoom);
+    let (se_x, se_y) = lat_lon_to_world_px(bbox.south, bbox.east, zoom);
+    let w = (se_x - nw_x).abs();
+    let h = (se_y - nw_y).abs();
+    (w * h).round() as u64
 }
 
 /// Fetch every tile covering `bbox` from `source`, composite into a single
@@ -173,6 +211,7 @@ fn lat_lon_to_world_px(lat: f64, lon: f64, zoom: u32) -> (f64, f64) {
 pub(crate) fn fetch_bbox(
     bbox: BBoxLatLon,
     source: &dyn TileSource,
+    forced_zoom: Option<u32>,
     progress: &(dyn Fn(f32) + Send + Sync),
     cancel: &AtomicBool,
 ) -> Result<StitchedTiles, TileFetchError> {
@@ -180,7 +219,11 @@ pub(crate) fn fetch_bbox(
         bbox.north > bbox.south && bbox.east >= bbox.west,
         "fetch_bbox precondition: bbox must be canonical; got {bbox:?}",
     );
-    let zoom = pick_zoom(bbox, source.max_zoom());
+    // Grid mode forces ONE locked zoom across every tile (pillar A); a per-tile
+    // pick_zoom could pick a finer zoom for a smaller remainder tile and break
+    // the seam. The tile-cap check below still guards a forced zoom. Single-box
+    // callers pass None to keep today's per-bbox pick_zoom behavior.
+    let zoom = forced_zoom.unwrap_or_else(|| pick_zoom(bbox, source.max_zoom()));
     let (nw, se) = tile_range(bbox, zoom);
     let count = tile_count(bbox, zoom);
     if count > MAX_TILES_PER_FETCH {
@@ -417,18 +460,81 @@ mod tests {
     }
 
     #[test]
-    fn pick_zoom_lands_in_target_window() {
-        let z = pick_zoom(horsetooth_bbox(), MAX_ZOOM);
-        let n = tile_count(horsetooth_bbox(), z);
+    fn pick_zoom_maximizes_detail_within_budget() {
+        // Contract: the chosen zoom is the HIGHEST whose cropped grid fits both
+        // the cell budget and the per-fetch tile cap; one zoom higher would
+        // breach a bound (or hit the provider ceiling). This is what makes
+        // bigger areas monotonic and bounds mesh memory.
+        let bbox = horsetooth_bbox();
+        let z = pick_zoom(bbox, MAX_ZOOM);
         assert!(
-            (TARGET_TILE_COUNT_LOW..=TARGET_TILE_COUNT_HIGH).contains(&n),
-            "zoom {z} chose {n} tiles; expected in [{TARGET_TILE_COUNT_LOW}, {TARGET_TILE_COUNT_HIGH}]",
+            approx_cell_count(bbox, z) <= MAX_DEM_CELLS
+                && tile_count(bbox, z) <= MAX_TILES_PER_FETCH,
+            "chosen z{z} must fit the budget: {} cells, {} tiles",
+            approx_cell_count(bbox, z),
+            tile_count(bbox, z),
+        );
+        if z < MAX_ZOOM {
+            let next_over = approx_cell_count(bbox, z + 1) > MAX_DEM_CELLS
+                || tile_count(bbox, z + 1) > MAX_TILES_PER_FETCH;
+            assert!(
+                next_over,
+                "z{} would still fit the budget — pick_zoom left detail on the table",
+                z + 1
+            );
+        }
+    }
+
+    #[test]
+    fn pick_zoom_two_km_box_beats_the_old_tile_window() {
+        // The "doesn't scale" regression, probed at the point where it actually
+        // bit: the OLD 4–16-tile window returned the SMALLEST zoom reaching 4
+        // tiles, dropping a 2 km box to ~z13 (~19k cells) — a tiny world. The new
+        // resolution-budget picker must give that exact box MATERIALLY more
+        // detail, not a marginal or equal amount (the earlier test only checked
+        // 1 km vs 2 km equality and never exercised this drop).
+        let center_lat: f64 = 40.5417;
+        let center_lon: f64 = -105.1556;
+        let dlat = 2.0 / 111.0 / 2.0;
+        let dlon = 2.0 / (111.0 * center_lat.to_radians().cos()) / 2.0;
+        let two_km = BBoxLatLon {
+            north: center_lat + dlat,
+            south: center_lat - dlat,
+            east: center_lon + dlon,
+            west: center_lon - dlon,
+        };
+        // Reproduce the retired heuristic: smallest zoom with tile_count in [4,16].
+        let old_zoom = (MIN_ZOOM..=15)
+            .find(|&z| (4..=16).contains(&tile_count(two_km, z)))
+            .unwrap_or(15);
+        let new_zoom = pick_zoom(two_km, 15);
+        let old_cells = approx_cell_count(two_km, old_zoom);
+        let new_cells = approx_cell_count(two_km, new_zoom);
+        assert!(
+            new_cells >= old_cells * 3,
+            "2 km box: new picker gives {new_cells} cells (z{new_zoom}) vs the old window's \
+             {old_cells} (z{old_zoom}) — expected a large improvement (≥3×), not marginal",
+        );
+        // And it must still respect the memory budget it traded up against.
+        assert!(new_cells <= MAX_DEM_CELLS, "new pick must stay within budget, got {new_cells}");
+    }
+
+    #[test]
+    fn pick_zoom_keeps_cells_within_memory_budget() {
+        // A large box must not select a zoom whose cropped grid blows the cell
+        // budget that bounds greedy+imagery mesh memory.
+        let big = BBoxLatLon { north: 41.0, south: 40.0, east: -105.0, west: -106.0 }; // ~100 km
+        let z = pick_zoom(big, MAX_ZOOM);
+        assert!(
+            approx_cell_count(big, z) <= MAX_DEM_CELLS,
+            "pick_zoom chose z{z} with {} cells, over the {MAX_DEM_CELLS}-cell budget",
+            approx_cell_count(big, z),
         );
     }
 
     #[test]
     fn pick_zoom_respects_low_provider_cap_on_tiny_bbox() {
-        // ~11m hairline: under-fills the [LOW, HIGH] window at every zoom, so
+        // ~11m hairline: far under the cell + tile budgets at every zoom, so
         // uncapped it saturates to MAX_ZOOM. A z15 provider cap must clamp it to
         // 15 (the DEM ceiling), and an even lower cap must be honored too.
         let tiny = BBoxLatLon { north: 40.5001, south: 40.5000, east: -105.0000, west: -105.0001 };
@@ -522,6 +628,78 @@ mod tests {
         assert!(!clean.contains("abc123") && !clean.contains("zzz9"), "{clean}");
         assert!(clean.contains("demtype=SRTMGL1"), "non-secret params survive");
         assert_eq!(redact_secrets("plain message"), "plain message");
+    }
+
+    /// Mirror of the zoom-selection + tile-cap gate at the head of `fetch_bbox`,
+    /// extracted so it can be exercised without a live HTTP fetch. Keeps the two
+    /// in lockstep: any change to fetch_bbox's selection logic must change this
+    /// too. `Ok(zoom)` is the zoom fetch_bbox would proceed with; `Err` is the
+    /// BboxTooLarge it would return.
+    fn select_and_gate_zoom(
+        bbox: BBoxLatLon,
+        source_max_zoom: u32,
+        forced_zoom: Option<u32>,
+    ) -> Result<u32, TileFetchError> {
+        let zoom = forced_zoom.unwrap_or_else(|| pick_zoom(bbox, source_max_zoom));
+        let count = tile_count(bbox, zoom);
+        if count > MAX_TILES_PER_FETCH {
+            return Err(TileFetchError::BboxTooLarge {
+                tiles: count,
+                max: MAX_TILES_PER_FETCH,
+                zoom,
+            });
+        }
+        Ok(zoom)
+    }
+
+    #[test]
+    fn forced_zoom_overrides_pick_zoom_and_round_trips() {
+        // A tiny bbox where pick_zoom saturates high; forcing a LOWER zoom must
+        // make fetch_bbox use exactly that forced value, not pick_zoom's choice
+        // (the pillar-A locked-zoom guarantee). None must still reproduce
+        // pick_zoom exactly.
+        let bbox = horsetooth_bbox();
+        let picked = pick_zoom(bbox, MAX_ZOOM);
+
+        // None path is byte-identical to today's pick_zoom selection.
+        assert_eq!(
+            select_and_gate_zoom(bbox, MAX_ZOOM, None).unwrap(),
+            picked,
+            "forced_zoom=None must reproduce pick_zoom",
+        );
+
+        // Forcing a distinct, in-budget zoom round-trips that exact value.
+        let forced = picked.saturating_sub(2).max(MIN_ZOOM);
+        assert_ne!(forced, picked, "test fixture must force a different zoom");
+        assert!(
+            tile_count(bbox, forced) <= MAX_TILES_PER_FETCH,
+            "fixture's forced zoom must be in-budget so it round-trips",
+        );
+        assert_eq!(
+            select_and_gate_zoom(bbox, MAX_ZOOM, Some(forced)).unwrap(),
+            forced,
+            "Some(z) must override pick_zoom and use z verbatim",
+        );
+    }
+
+    #[test]
+    fn forced_zoom_over_tile_cap_is_rejected() {
+        // A forced zoom that blows the per-fetch tile cap must still yield
+        // BboxTooLarge — the override does not bypass the safety gate.
+        let big = BBoxLatLon { north: 41.0, south: 40.0, east: -105.0, west: -106.0 };
+        // A high zoom over a ~100 km box is far past the 64-tile cap.
+        let forced = 14;
+        assert!(
+            tile_count(big, forced) > MAX_TILES_PER_FETCH,
+            "fixture precondition: forced zoom must exceed the tile cap",
+        );
+        match select_and_gate_zoom(big, MAX_ZOOM, Some(forced)) {
+            Err(TileFetchError::BboxTooLarge { zoom, max, .. }) => {
+                assert_eq!(zoom, forced, "error must report the forced zoom");
+                assert_eq!(max, MAX_TILES_PER_FETCH);
+            }
+            other => panic!("expected BboxTooLarge for an over-cap forced zoom, got {other:?}"),
+        }
     }
 
     #[test]

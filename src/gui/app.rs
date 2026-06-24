@@ -75,7 +75,7 @@ fn convert_worker(
     }
     progress("Generating", 0.10);
 
-    let bricks = gen_opt_heightmap(&*heightmap, &*colormap, job.options, |p| {
+    let bricks = gen_opt_heightmap(&*heightmap, &*colormap, job.options, None, None, |p| {
         progress("Generating", 0.1 + 0.85 * p);
         !is_stopped()
     })
@@ -216,6 +216,10 @@ impl HeightmapApp {
             nocollide: self.opt_nocollide,
             quadtree: self.optimization == OptimizationMode::Quad,
             greedy: self.optimization == OptimizationMode::Greedy,
+            // Convert-tab heights are un-normalized and vertical_scale reaches
+            // 100 with no brick cap, so keep the legacy flat surface (no base
+            // fill) to avoid an unbounded brick stack.
+            fill_to_base: false,
         }
     }
 

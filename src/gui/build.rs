@@ -27,11 +27,6 @@ use super::tiles::{BBoxLatLon, TileFetchError, fetch_bbox};
 
 /// Brickadia Proton-prefix App ID for the Worlds/ install path lookup.
 const BRICKADIA_APP_ID: u32 = 2199420;
-/// Vertical multiplier applied to `(meters − min_meters)` before quantizing
-/// to u32 brick height. Matches the legacy `-v` flag of
-/// `Kmschr/GeoTIFF2Heightmap`. Default for the Map tab's vertical-exaggeration
-/// slider.
-pub(crate) const DEFAULT_VERTICAL_SCALE: f32 = 5.0;
 /// Default brick color used by the flat colormap when no imagery source is
 /// selected. A warm slate-green that reads well against the OSM basemap.
 const DEFAULT_BRICK_COLOR: [u8; 4] = [0x9A, 0xA3, 0x7E, 0xFF];
@@ -43,7 +38,23 @@ const DEFAULT_BRICK_COLOR: [u8; 4] = [0x9A, 0xA3, 0x7E, 0xFF];
 /// backstop. NOTE: under the greedy mesher (the GUI path) brick *count* tracks
 /// the DEM grid and vertical span. To reduce the count, lower the vertical
 /// exaggeration or raise the density factor (which downsamples the DEM grid).
-const MAX_BRICKS: usize = 2_000_000;
+pub(crate) const MAX_BRICKS: usize = 2_000_000;
+/// Aggregate cap on the COMBINED grid accumulator (`run_grid_build`). The
+/// per-tile `MAX_BRICKS` cap must NOT gate the stitched world — exceeding it is
+/// the whole point of tiling — so a separate, much larger ceiling guards the
+/// combined `Vec<Brick>` against an unbounded stitch (and the single-threaded
+/// all-in-RAM `.brdb` write that follows). Each tile still respects
+/// `enforce_cell_budget` so no single tile OOMs the mesher.
+pub(crate) const MAX_GRID_BRICKS: usize = 50_000_000;
+/// Upper bound on `vertical_scale`. The Map tab DERIVES vertical_scale via
+/// `derive_scale`, whose structural maximum is `studs_per_meter_max(32) * 5 *
+/// exaggeration_max(8) = 1280` (the `2*hscale*upf/cell_m` form collapses to
+/// `studs_per_meter*5*exaggeration` once hscale tracks the scale). This cap sits
+/// ABOVE that (2000) so a faithful 1:1 build or any in-range exaggeration is
+/// NEVER silently compressed — it only guards an out-of-contract BuildRequest
+/// from overflowing the i32 brick-height math. The practical ceiling on a tall
+/// build is MAX_BRICKS, not this. (Was 64, which silently capped the 1:1 feature.)
+pub(crate) const MAX_VERTICAL_SCALE: f32 = 2000.0;
 
 /// Brick render style for the generated terrain. Selects the brick `asset`
 /// plus the `stud`/`micro` geometry flags in lockstep — these are not purely
@@ -203,6 +214,11 @@ pub(crate) enum BuildError {
     Fetch(TileFetchError),
     EmptyDem,
     TooManyBricks { count: usize, max: usize },
+    /// Cropped DEM grid exceeds the cell budget that bounds greedy-mesh memory
+    /// (`tiles::MAX_DEM_CELLS`). Reached in practice only via OpenTopography —
+    /// the tile path is already capped by `pick_zoom` — so the remedy is more
+    /// Density or a smaller box.
+    GridTooLarge { cells: u64, max: u64 },
     WorldNameExhausted { stem: String },
     BrickGen(String),
     Io { stage: BuildStage, source: std::io::Error },
@@ -235,7 +251,11 @@ impl std::fmt::Display for BuildError {
             ),
             Self::TooManyBricks { count, max } => write!(
                 f,
-                "terrain produced {count} bricks (limit {max}) — shrink the bounding box or lower the vertical exaggeration"
+                "terrain produced {count} bricks (limit {max}) — raise Density, lower the vertical exaggeration, or shrink the bounding box"
+            ),
+            Self::GridTooLarge { cells, max } => write!(
+                f,
+                "elevation grid is {cells} cells (limit {max}) — raise Density or draw a smaller box (this bounds memory for the colored mesh)"
             ),
             Self::WorldNameExhausted { stem } => write!(
                 f,
@@ -261,6 +281,27 @@ impl std::error::Error for BuildError {}
 pub(crate) type ProgressFn =
     Arc<dyn Fn(BuildStage, f32) + Send + Sync + 'static>;
 
+/// Reject a cropped DEM grid whose cell count would blow the greedy-mesh memory
+/// budget BEFORE the mesher allocates its per-(height,color) planes (which can
+/// reach GBs with per-pixel-unique imagery colors). The tile path is already
+/// bounded by `pick_zoom`; this backstops OpenTopography's single-shot GeoTIFF
+/// and is defense-in-depth for everything else.
+pub(crate) fn enforce_cell_budget(width: u32, height: u32) -> Result<(), BuildError> {
+    let cells = u64::from(width) * u64::from(height);
+    if cells > super::tiles::MAX_DEM_CELLS {
+        return Err(BuildError::GridTooLarge { cells, max: super::tiles::MAX_DEM_CELLS });
+    }
+    Ok(())
+}
+
+/// World-unit footprint of one DEM cell on one axis. Mirrors the `size` that
+/// `generate_bricks` feeds `GenOptions` (`horizontal_scale * (1 micro | 5)`),
+/// kept in lockstep so the centered single-box offset and the grid world
+/// offsets are computed against the SAME pitch the mesher emits.
+pub(crate) fn cell_size_units(style_horizontal_scale: u16, micro: bool) -> u16 {
+    style_horizontal_scale.max(1) * if micro { 1 } else { 5 }
+}
+
 pub(crate) fn run_build(
     request: BuildRequest,
     progress: ProgressFn,
@@ -271,38 +312,32 @@ pub(crate) fn run_build(
     // reads the raster (heightmap, imagery target dims, reported dims/elevation)
     // so every downstream consumer sees the reduced grid consistently.
     let raster = downsample(&raster, u32::from(request.density_factor.max(1)));
-    let heightmap = build_heightmap(&raster, request.vertical_scale.max(0.01));
-    let imagery = fetch_imagery_if_requested(
+    // Bound mesh memory before building planes/heightmap (OpenTopography can
+    // return a grid larger than pick_zoom would ever choose).
+    enforce_cell_budget(raster.width, raster.height)?;
+
+    // Single-box placement: center the build on the origin exactly as the
+    // pre-grid `quads_to_bricks` did — `offset = -(width*size), -(height*size)`.
+    // The grid orchestrator computes a per-tile world offset instead and calls
+    // `build_one_tile` directly. global_min = raster.min_m and base_override =
+    // None make this path byte-identical to the pre-grid behavior.
+    let size = i32::from(cell_size_units(request.horizontal_scale, request.block_type.micro()));
+    let offset = (-(raster.width as i32 * size), -(raster.height as i32 * size));
+    let dem_width = raster.width;
+    let dem_height = raster.height;
+    let elevation_min_m = raster.min_m;
+    let elevation_max_m = raster.max_m;
+    let global_min_m = raster.min_m;
+
+    let bricks = build_one_tile(
         &request,
-        (raster.width, raster.height),
+        raster,
+        global_min_m,
+        offset,
+        None,
         Arc::clone(&progress),
         Arc::clone(&cancel),
     )?;
-
-    progress(BuildStage::GeneratingBricks, 0.0);
-    let bricks = match &imagery {
-        Some(im) => generate_bricks(
-            &heightmap,
-            im,
-            BrickStyle::from_request(&request),
-            Arc::clone(&progress),
-            Arc::clone(&cancel),
-        )?,
-        None => {
-            let flat = FlatColormap {
-                width: raster.width,
-                height: raster.height,
-                color: DEFAULT_BRICK_COLOR,
-            };
-            generate_bricks(
-                &heightmap,
-                &flat,
-                BrickStyle::from_request(&request),
-                Arc::clone(&progress),
-                Arc::clone(&cancel),
-            )?
-        }
-    };
 
     if bricks.len() > MAX_BRICKS {
         return Err(BuildError::TooManyBricks { count: bricks.len(), max: MAX_BRICKS });
@@ -321,7 +356,7 @@ pub(crate) fn run_build(
         // Any install failure is non-fatal: the .brdb is already on disk, so
         // degrade to "wrote but did not install" + a warning instead of
         // throwing away a successful build (the user can import it manually).
-        match install_to_worlds(&brdb_path, request.overwrite_world) {
+        match install_save(&brdb_path, "brdb", request.overwrite_world) {
             Ok(dest) => Some(dest),
             Err(BuildError::NoBrickadiaPrefix(prefix)) => {
                 install_warning = Some(format!(
@@ -348,14 +383,78 @@ pub(crate) fn run_build(
         installed_path,
         install_warning,
         brick_count,
-        dem_width: raster.width,
-        dem_height: raster.height,
-        elevation_min_m: raster.min_m,
-        elevation_max_m: raster.max_m,
+        dem_width,
+        dem_height,
+        elevation_min_m,
+        elevation_max_m,
     })
 }
 
-fn fetch_and_decode_dem(
+/// Mesh ONE already-decoded (downsampled, budget-checked) tile into bricks.
+/// Factored out of [`run_build`] so the grid orchestrator can mesh each tile
+/// through the SAME code path with a per-tile world `offset`, a shared
+/// `global_min_m` datum, and `base_override = Some(0)` for a global fill floor.
+/// `run_build` is the single-tile special case (global_min = raster.min_m,
+/// centered offset, base_override = None). Consumes `raster` — the caller has
+/// already captured any dims/elevation it needs to report.
+pub(crate) fn build_one_tile(
+    request: &BuildRequest,
+    raster: DemRaster,
+    global_min_m: f32,
+    offset: (i32, i32),
+    base_override: Option<u32>,
+    progress: ProgressFn,
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<brdb::Brick>, BuildError> {
+    // Clamp both ends (Rule 2/3): the GUI slider already caps at 20, but a
+    // BuildRequest can be constructed elsewhere — clamp only as an out-of-contract
+    // i32-overflow guard. The ceiling (MAX_VERTICAL_SCALE = 2000) sits ABOVE
+    // derive_scale's structural max (1280), so a faithful 1:1 build and any
+    // in-range exaggeration pass through UNCLAMPED (the old 64 silently broke 1:1).
+    let heightmap = build_heightmap(
+        &raster,
+        request.vertical_scale.clamp(0.01, MAX_VERTICAL_SCALE),
+        global_min_m,
+    );
+    let imagery = fetch_imagery_if_requested(
+        request,
+        (raster.width, raster.height),
+        Arc::clone(&progress),
+        Arc::clone(&cancel),
+    )?;
+
+    progress(BuildStage::GeneratingBricks, 0.0);
+    let bricks = match &imagery {
+        Some(im) => generate_bricks(
+            &heightmap,
+            im,
+            BrickStyle::from_request(request),
+            base_override,
+            offset,
+            Arc::clone(&progress),
+            Arc::clone(&cancel),
+        )?,
+        None => {
+            let flat = FlatColormap {
+                width: raster.width,
+                height: raster.height,
+                color: DEFAULT_BRICK_COLOR,
+            };
+            generate_bricks(
+                &heightmap,
+                &flat,
+                BrickStyle::from_request(request),
+                base_override,
+                offset,
+                Arc::clone(&progress),
+                Arc::clone(&cancel),
+            )?
+        }
+    };
+    Ok(bricks)
+}
+
+pub(crate) fn fetch_and_decode_dem(
     request: &BuildRequest,
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
@@ -382,6 +481,7 @@ fn fetch_and_decode_dem(
     let stitched = fetch_bbox(
         request.bbox,
         source.as_ref(),
+        None,
         &move |f| p_for_fetch(BuildStage::FetchingTiles, f),
         &cancel,
     )
@@ -599,7 +699,7 @@ fn decode_geotiff_dem(bytes: &[u8]) -> Result<DemRaster, BuildError> {
     Ok(DemRaster { width: w, height: h, heights_m, min_m, max_m })
 }
 
-fn fetch_imagery_if_requested(
+pub(crate) fn fetch_imagery_if_requested(
     request: &BuildRequest,
     target_dims: (u32, u32),
     progress: ProgressFn,
@@ -621,6 +721,7 @@ fn fetch_imagery_if_requested(
     let stitched = fetch_bbox(
         request.bbox,
         source.as_ref(),
+        None,
         &move |f| p_for_fetch(BuildStage::FetchingImagery, f),
         &cancel,
     )
@@ -644,12 +745,12 @@ fn fetch_imagery_if_requested(
 }
 
 #[derive(Clone, Debug)]
-struct DemRaster {
-    width: u32,
-    height: u32,
-    heights_m: Vec<f32>,
-    min_m: f32,
-    max_m: f32,
+pub(crate) struct DemRaster {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) heights_m: Vec<f32>,
+    pub(crate) min_m: f32,
+    pub(crate) max_m: f32,
 }
 
 /// Box-mean downsample of the elevation grid by an integer `factor`. This is
@@ -663,7 +764,7 @@ struct DemRaster {
 /// subtracts `min_m` for its zero-floor, so the extremes must match the cells
 /// actually emitted. Averaging smooths the extremes slightly, so the reported
 /// elevation range narrows a little at higher factors — correct, not a bug.
-fn downsample(raster: &DemRaster, factor: u32) -> DemRaster {
+pub(crate) fn downsample(raster: &DemRaster, factor: u32) -> DemRaster {
     debug_assert!(factor >= 1, "downsample factor must be >= 1");
     if factor <= 1 {
         return raster.clone();
@@ -735,12 +836,21 @@ fn decode_to_raster(image: &RgbaImage, source: DemSource) -> Result<DemRaster, B
     Ok(DemRaster { width: w, height: h, heights_m: heights, min_m, max_m })
 }
 
-fn build_heightmap(raster: &DemRaster, vertical_scale: f32) -> DemHeightmap {
+/// Normalize a raster's meter heights to u32 brick heights against a reference
+/// minimum. The single-box caller passes `global_min_m = raster.min_m` (the
+/// per-raster minimum → byte-identical to the pre-grid behavior). Grid mode
+/// passes the GLOBAL minimum across all tiles so every tile shares one datum:
+/// two tiles at the same real elevation map to the same brick-Z (pillar B).
+pub(crate) fn build_heightmap(
+    raster: &DemRaster,
+    vertical_scale: f32,
+    global_min_m: f32,
+) -> DemHeightmap {
     debug_assert!(vertical_scale > 0.0, "vertical_scale must be positive");
     let normalized: Vec<u32> = raster
         .heights_m
         .iter()
-        .map(|m| (((m - raster.min_m) * vertical_scale).max(0.0).round() as i64).max(0) as u32)
+        .map(|m| (((m - global_min_m) * vertical_scale).max(0.0).round() as i64).max(0) as u32)
         .collect();
     DemHeightmap {
         width: raster.width,
@@ -752,7 +862,7 @@ fn build_heightmap(raster: &DemRaster, vertical_scale: f32) -> DemHeightmap {
 /// Brick-shaping knobs for `generate_bricks`, lifted off `BuildRequest` so
 /// tests can drive generation without constructing a full network request.
 #[derive(Clone, Copy)]
-struct BrickStyle {
+pub(crate) struct BrickStyle {
     block_type: BlockType,
     horizontal_scale: u16,
     glow: bool,
@@ -760,7 +870,7 @@ struct BrickStyle {
 }
 
 impl BrickStyle {
-    fn from_request(request: &BuildRequest) -> Self {
+    pub(crate) fn from_request(request: &BuildRequest) -> Self {
         Self {
             block_type: request.block_type,
             horizontal_scale: request.horizontal_scale,
@@ -770,10 +880,17 @@ impl BrickStyle {
     }
 }
 
-fn generate_bricks(
+/// `base_override`: `Some(b)` fills every column down to brick-Z `b` (grid mode
+/// passes `Some(0)` so all tiles share the global floor); `None` keeps the
+/// per-tile present minimum (single-box behavior). `offset`: world placement in
+/// units — the single-box caller passes the centered `-(width*size),
+/// -(height*size)`; grid mode passes a per-tile world offset so tiles abut.
+pub(crate) fn generate_bricks(
     heightmap: &DemHeightmap,
     colormap: &dyn Colormap,
     style: BrickStyle,
+    base_override: Option<u32>,
+    offset: (i32, i32),
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
 ) -> Result<Vec<brdb::Brick>, BuildError> {
@@ -802,18 +919,22 @@ fn generate_bricks(
         nocollide,
         quadtree: false,
         greedy: true,
+        // Map terrain is normalized to ~0 and capped by MAX_BRICKS, so fill each
+        // column to the base plane for solid, walkable ground.
+        fill_to_base: true,
     };
     let cancel_check = move |f: f32| -> bool {
         progress(BuildStage::GeneratingBricks, f);
         !cancel.load(std::sync::atomic::Ordering::Relaxed)
     };
-    gen_opt_heightmap(heightmap, colormap, options, cancel_check).map_err(|e| {
-        if e == crate::opt::CANCELLED_MSG {
-            BuildError::Cancelled
-        } else {
-            BuildError::BrickGen(e)
-        }
-    })
+    gen_opt_heightmap(heightmap, colormap, options, base_override, Some(offset), cancel_check)
+        .map_err(|e| {
+            if e == crate::opt::CANCELLED_MSG {
+                BuildError::Cancelled
+            } else {
+                BuildError::BrickGen(e)
+            }
+        })
 }
 
 fn write_brdb(name: &str, bricks: Vec<brdb::Brick>) -> Result<PathBuf, BuildError> {
@@ -824,6 +945,16 @@ fn write_brdb(name: &str, bricks: Vec<brdb::Brick>) -> Result<PathBuf, BuildErro
     })?;
     let safe_name = sanitize_name(name);
     let brdb_path = builds_dir.join(format!("{safe_name}.brdb"));
+    // Delete a stale destination before writing: `.brdb` is open-if-exists +
+    // append (`Brdb::new` → `Brdb::open`, not truncate), so repeated same-name
+    // single-box builds would pile revisions in the builds_dir copy. Mirror the
+    // grid path's delete-then-write (spec correction #7); non-fatal if missing.
+    if brdb_path.exists() {
+        std::fs::remove_file(&brdb_path).map_err(|e| BuildError::Io {
+            stage: BuildStage::WritingSave,
+            source: e,
+        })?;
+    }
     let world = bricks_to_save(bricks);
     world
         .write_brdb(&brdb_path)
@@ -833,43 +964,45 @@ fn write_brdb(name: &str, bricks: Vec<brdb::Brick>) -> Result<PathBuf, BuildErro
     Ok(brdb_path)
 }
 
-fn install_to_worlds(brdb_path: &Path, overwrite: bool) -> Result<PathBuf, BuildError> {
-    let worlds = brickadia_worlds_dir()?;
-    std::fs::create_dir_all(&worlds).map_err(|e| BuildError::Io {
+/// Copy a written save into Brickadia's Saved tree under the subdir for `ext`,
+/// returning the installed path. `.brdb` → `Worlds/`, `.brz` → `Prefabs/` (both
+/// paths confirmed against a live install). `overwrite`
+/// writes `<stem>.<ext>` in place so a re-run updates the world already open
+/// in-game; default-off suffixes `-2`, `-3`, … so a hand-authored world is
+/// never clobbered. Mirrors the previous `install_to_worlds` for `.brdb`.
+pub(crate) fn install_save(path: &Path, ext: &str, overwrite: bool) -> Result<PathBuf, BuildError> {
+    let dir = saved_subdir(ext)?;
+    std::fs::create_dir_all(&dir).map_err(|e| BuildError::Io {
         stage: BuildStage::Installing,
         source: e,
     })?;
-    let stem = brdb_path
+    let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| BuildError::BrdbWrite("output path has no file name".to_owned()))?;
-    // `overwrite` writes `<stem>.brdb` in place, so re-running the same output
-    // name updates the world the user already has open. Default-off keeps the
-    // non-destructive behaviour: suffix `-2`, `-3`, … so a hand-authored world
-    // is never clobbered. Either way the caller surfaces the installed path.
     let dest = if overwrite {
-        worlds.join(format!("{stem}.brdb"))
+        dir.join(format!("{stem}.{ext}"))
     } else {
-        unique_world_path(&worlds, stem)?
+        unique_save_path(&dir, stem, ext)?
     };
-    std::fs::copy(brdb_path, &dest).map_err(|e| BuildError::Io {
+    std::fs::copy(path, &dest).map_err(|e| BuildError::Io {
         stage: BuildStage::Installing,
         source: e,
     })?;
     Ok(dest)
 }
 
-/// First non-colliding `<stem>.brdb` / `<stem>-N.brdb` path in `worlds`.
+/// First non-colliding `<stem>.<ext>` / `<stem>-N.<ext>` path in `dir`.
 /// Bounded loop (Rule 2): up to 1000 attempts. On exhaustion returns a checked
-/// error — never an existing path, or the caller's `fs::copy` would silently
+/// error — never an existing path, or a caller's `fs::copy` would silently
 /// break the "never overwrite" guarantee.
-fn unique_world_path(worlds: &Path, stem: &str) -> Result<PathBuf, BuildError> {
-    let first = worlds.join(format!("{stem}.brdb"));
+pub(crate) fn unique_save_path(dir: &Path, stem: &str, ext: &str) -> Result<PathBuf, BuildError> {
+    let first = dir.join(format!("{stem}.{ext}"));
     if !first.exists() {
         return Ok(first);
     }
     for n in 2..=1000 {
-        let candidate = worlds.join(format!("{stem}-{n}.brdb"));
+        let candidate = dir.join(format!("{stem}-{n}.{ext}"));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -877,11 +1010,11 @@ fn unique_world_path(worlds: &Path, stem: &str) -> Result<PathBuf, BuildError> {
     Err(BuildError::WorldNameExhausted { stem: stem.to_owned() })
 }
 
-/// Staging directory for generated `.brdb` files, in the XDG data dir
+/// Staging directory for generated saves, in the XDG data dir
 /// (`~/.local/share/heightmap2brz/builds`) — not a hardcoded project path.
-/// The GUI auto-installs into Brickadia's Worlds/, so this is just a copy
-/// the user can re-import later.
-fn builds_dir() -> Result<PathBuf, BuildError> {
+/// The GUI auto-installs `.brdb` into Brickadia's Worlds/, so this is just a
+/// copy the user can re-import later (and the sole home for `.brz` prefabs).
+pub(crate) fn builds_dir() -> Result<PathBuf, BuildError> {
     let base = dirs::data_dir().ok_or_else(|| BuildError::Io {
         stage: BuildStage::WritingSave,
         source: std::io::Error::other("no XDG data directory"),
@@ -889,7 +1022,9 @@ fn builds_dir() -> Result<PathBuf, BuildError> {
     Ok(base.join("heightmap2brz").join("builds"))
 }
 
-fn brickadia_worlds_dir() -> Result<PathBuf, BuildError> {
+/// Root of Brickadia's `Saved` tree inside the Steam Proton prefix. Errors
+/// `NoBrickadiaPrefix` if the prefix has never been created (game not yet run).
+fn brickadia_saved_dir() -> Result<PathBuf, BuildError> {
     let home = dirs::home_dir().ok_or_else(|| BuildError::NoBrickadiaPrefix(PathBuf::new()))?;
     let prefix = home
         .join(".steam/steam/steamapps/compatdata")
@@ -898,7 +1033,21 @@ fn brickadia_worlds_dir() -> Result<PathBuf, BuildError> {
     if !prefix.exists() {
         return Err(BuildError::NoBrickadiaPrefix(prefix));
     }
-    Ok(prefix.join("Worlds"))
+    Ok(prefix)
+}
+
+/// Per-extension install subdir under `Saved`. `.brdb` → `Worlds/` (loaded as a
+/// world); `.brz` → `Prefabs/` (loaded as a build/prefab). Both paths confirmed
+/// against a live install: `Saved/Prefabs/*.brz` is exactly where the in-game
+/// prefab browser reads from (resolves spec correction #8's open question).
+fn saved_subdir(ext: &str) -> Result<PathBuf, BuildError> {
+    match ext {
+        "brdb" => Ok(brickadia_saved_dir()?.join("Worlds")),
+        "brz" => Ok(brickadia_saved_dir()?.join("Prefabs")),
+        other => Err(BuildError::BrdbWrite(format!(
+            "no Brickadia install path for .{other} saves (only .brdb→Worlds/, .brz→Prefabs/)"
+        ))),
+    }
 }
 
 fn require_token_if_needed(
@@ -935,7 +1084,7 @@ fn imagery_source_label(source: ImagerySource) -> &'static str {
     }
 }
 
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return String::from("untitled-build");
@@ -947,7 +1096,7 @@ fn sanitize_name(name: &str) -> String {
 }
 
 /// In-memory `Heightmap` impl: each pixel is the pre-scaled u32 brick height.
-struct DemHeightmap {
+pub(crate) struct DemHeightmap {
     width: u32,
     height: u32,
     values: Vec<u32>,
@@ -965,7 +1114,7 @@ impl Heightmap for DemHeightmap {
 
 /// In-memory `Colormap` returning a single color across the whole grid.
 /// Used when the user picks `ImagerySource::None`.
-struct FlatColormap {
+pub(crate) struct FlatColormap {
     width: u32,
     height: u32,
     color: [u8; 4],
@@ -983,7 +1132,7 @@ impl Colormap for FlatColormap {
 /// In-memory `Colormap` backed by an RGBA image (typically a satellite
 /// tile composite resampled to the DEM's pixel grid). Applies sRGB → linear
 /// gamma conversion on read to match the existing `ColormapPNG` semantics.
-struct ImageColormap {
+pub(crate) struct ImageColormap {
     image: image::RgbaImage,
 }
 
@@ -1025,24 +1174,28 @@ mod tests {
     }
 
     #[test]
-    fn unique_world_path_never_collides_with_existing() {
+    fn unique_save_path_never_collides_with_existing() {
         let dir = std::env::temp_dir().join(format!("h2brz-worlds-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
 
         // (a) no collision -> bare name
-        let p0 = unique_world_path(&dir, "mtfuji").expect("no collision");
+        let p0 = unique_save_path(&dir, "mtfuji", "brdb").expect("no collision");
         assert_eq!(p0, dir.join("mtfuji.brdb"));
 
         // (b) bare exists -> -2
         std::fs::write(dir.join("mtfuji.brdb"), b"x").unwrap();
-        let p1 = unique_world_path(&dir, "mtfuji").expect("-2");
+        let p1 = unique_save_path(&dir, "mtfuji", "brdb").expect("-2");
         assert_eq!(p1, dir.join("mtfuji-2.brdb"));
 
         // (c) bare and -2 exist -> -3 (never returns an existing path)
         std::fs::write(dir.join("mtfuji-2.brdb"), b"x").unwrap();
-        let p2 = unique_world_path(&dir, "mtfuji").expect("-3");
+        let p2 = unique_save_path(&dir, "mtfuji", "brdb").expect("-3");
         assert_eq!(p2, dir.join("mtfuji-3.brdb"));
         assert!(!p2.exists(), "returned path must not already exist");
+
+        // (d) the ext is honored: a .brz with the same stem is independent.
+        let pbrz = unique_save_path(&dir, "mtfuji", "brz").expect("brz bare");
+        assert_eq!(pbrz, dir.join("mtfuji.brz"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1056,9 +1209,40 @@ mod tests {
             min_m: 100.0,
             max_m: 105.0,
         };
-        let hm = build_heightmap(&raster, 5.0);
+        let hm = build_heightmap(&raster, 5.0, raster.min_m);
         assert_eq!(hm.at(0, 0), 0, "min height pixel must normalize to 0");
         assert_eq!(hm.at(1, 0), 25, "max pixel = (105-100)*5 = 25 brick units");
+    }
+
+    /// Grid-foundation identity guard: passing `global_min_m = raster.min_m`
+    /// (the single-box caller's value) must reproduce the legacy per-raster
+    /// normalization byte-for-byte — every pixel equals
+    /// `(((m - raster.min_m) * v).max(0).round() as i64).max(0) as u32`. This is
+    /// the build.rs half of the single-box byte-identity contract: the new
+    /// `global_min_m` parameter is a no-op on the single-box path.
+    #[test]
+    fn build_heightmap_single_box_identity() {
+        let raster = DemRaster {
+            width: 3,
+            height: 2,
+            heights_m: vec![100.0, 105.0, 100.5, 130.0, 100.0, 162.7],
+            min_m: 100.0,
+            max_m: 162.7,
+        };
+        let vertical = 5.0_f32;
+        // Independent re-derivation of the pre-grid per-raster normalization.
+        let reference: Vec<u32> = raster
+            .heights_m
+            .iter()
+            .map(|m| (((m - raster.min_m) * vertical).max(0.0).round() as i64).max(0) as u32)
+            .collect();
+        let hm = build_heightmap(&raster, vertical, raster.min_m);
+        assert_eq!(
+            hm.values, reference,
+            "global_min_m = raster.min_m must be byte-identical to the legacy per-raster normalization",
+        );
+        assert_eq!((hm.width, hm.height), (raster.width, raster.height));
+        assert_eq!(hm.at(0, 0), 0, "the present minimum still maps to brick-Z 0");
     }
 
     /// Encode a single-strip grayscale I16 GeoTIFF in memory — same storage
@@ -1111,7 +1295,7 @@ mod tests {
         );
         // Regression for the NaN fix: a surviving NaN normalizes to height 0
         // in build_heightmap, punching a hole at the cell.
-        let hm = build_heightmap(&raster, 1.0);
+        let hm = build_heightmap(&raster, 1.0, raster.min_m);
         assert_eq!(hm.at(0, 0), 0, "floored cell sits at the terrain floor");
         assert_eq!(hm.at(0, 1), 5, "valid 10 m cell = (10-5)*1 brick units");
     }
@@ -1181,7 +1365,7 @@ mod tests {
             min_m: 0.0,
             max_m: 2.0,
         };
-        let heightmap = build_heightmap(&raster, 1.0);
+        let heightmap = build_heightmap(&raster, 1.0, raster.min_m);
         let cm = FlatColormap { width: 4, height: 4, color: DEFAULT_BRICK_COLOR };
         let progress: ProgressFn = Arc::new(|_, _| {});
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1200,6 +1384,8 @@ mod tests {
             &heightmap,
             &cm,
             BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
+            None,
+            (0, 0),
             Arc::clone(&progress),
             Arc::clone(&cancel),
         )
@@ -1216,6 +1402,8 @@ mod tests {
             &heightmap,
             &cm,
             BrickStyle { block_type: BlockType::Micro, horizontal_scale: 1, glow: false, nocollide: false },
+            None,
+            (0, 0),
             Arc::clone(&progress),
             Arc::clone(&cancel),
         )
@@ -1234,6 +1422,8 @@ mod tests {
             &heightmap,
             &cm,
             BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 3, glow: false, nocollide: false },
+            None,
+            (0, 0),
             progress,
             cancel,
         )
@@ -1251,6 +1441,210 @@ mod tests {
         }
     }
 
+    /// Regression for the "hollow floating shell" population bug. The greedy GUI
+    /// path emitted a constant 2-unit column per cell, so a cell 50 m above its
+    /// neighbor became a 2-unit tile FLOATING ~50 units up with nothing beneath
+    /// it — the player falls through gaps and tall features look like floating
+    /// platforms. Terrain must instead fill each column from its height down to
+    /// the common base plane (watertight, walkable). With the half-unit z
+    /// convention (z -= brick_height*2 in emit_column_bricks) the fill height is
+    /// `(h - min)/2`, so a 50-unit cell yields a ~25-unit column, not a 2-unit
+    /// tile.
+    #[test]
+    fn greedy_terrain_fills_columns_to_base_not_floating_shell() {
+        let raster = DemRaster {
+            width: 2,
+            height: 1,
+            heights_m: vec![0.0, 50.0],
+            min_m: 0.0,
+            max_m: 50.0,
+        };
+        let heightmap = build_heightmap(&raster, 1.0, raster.min_m); // normalized values [0, 50]
+        let cm = FlatColormap { width: 2, height: 1, color: DEFAULT_BRICK_COLOR };
+        let progress: ProgressFn = Arc::new(|_, _| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let bricks = generate_bricks(
+            &heightmap,
+            &cm,
+            BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
+            None,
+            (0, 0),
+            progress,
+            cancel,
+        )
+        .expect("gen");
+
+        let zsize = |b: &brdb::Brick| match &b.asset {
+            brdb::BrickType::Procedural { size, .. } => size.z,
+            other => panic!("expected procedural terrain brick, got {other:?}"),
+        };
+        // The 50-unit cell must produce a TALL column filled to the base, not a
+        // 2-unit floating tile. The old constant-2 behavior caps every brick at
+        // 2 units; the fill makes the tall cell ~25 units.
+        let tallest = bricks.iter().map(zsize).max().expect("some bricks emitted");
+        assert!(
+            tallest >= 20,
+            "tallest terrain brick is {tallest} units — expected a ~25-unit column \
+             filling the 50 m cell down to the base. A <=2-unit max means the \
+             floating-shell bug is back (no solid ground under the terrain).",
+        );
+    }
+
+    /// R1 regression guard: the Convert/CLI path (fill_to_base=false) must NOT
+    /// fill columns to the base — it keeps the legacy flat 2-unit surface tile,
+    /// so a tall cell cannot emit an unbounded brick stack from un-normalized
+    /// heights × a vertical_scale up to 100 (those paths have no MAX_BRICKS cap).
+    /// Only the Map path opts in (fill_to_base=true).
+    #[test]
+    fn fill_to_base_false_keeps_flat_surface_tiles() {
+        use brdb::assets::bricks::PB_DEFAULT_SMOOTH_TILE;
+        let raster = DemRaster {
+            width: 2,
+            height: 1,
+            heights_m: vec![0.0, 50.0],
+            min_m: 0.0,
+            max_m: 50.0,
+        };
+        let heightmap = build_heightmap(&raster, 1.0, raster.min_m);
+        let cm = FlatColormap { width: 2, height: 1, color: DEFAULT_BRICK_COLOR };
+        let options = GenOptions {
+            size: 5,
+            scale: 1,
+            asset: PB_DEFAULT_SMOOTH_TILE,
+            cull: false,
+            micro: false,
+            stud: false,
+            snap: false,
+            img: false,
+            glow: false,
+            hdmap: false,
+            lrgb: false,
+            nocollide: false,
+            quadtree: false,
+            greedy: true,
+            fill_to_base: false,
+        };
+        let bricks =
+            crate::opt::gen_opt_heightmap(&heightmap, &cm, options, None, None, |_| true).expect("gen");
+        let tallest = bricks
+            .iter()
+            .map(|b| match &b.asset {
+                brdb::BrickType::Procedural { size, .. } => size.z,
+                other => panic!("expected procedural terrain brick, got {other:?}"),
+            })
+            .max()
+            .expect("some bricks emitted");
+        assert!(
+            tallest <= 2,
+            "fill_to_base=false must keep flat 2-unit tiles (legacy Convert/CLI \
+             behavior), got tallest {tallest}",
+        );
+    }
+
+    #[test]
+    fn cell_budget_rejects_oversized_grid_but_accepts_normal() {
+        use crate::gui::tiles::MAX_DEM_CELLS;
+        // A typical ~1 km grid is well within budget.
+        assert!(enforce_cell_budget(275, 275).is_ok(), "a normal grid must pass");
+        // A grid past the budget is rejected, surfacing its oversized cell count
+        // so the user can raise Density / shrink the box rather than OOM the mesh.
+        let side = (MAX_DEM_CELLS as f64).sqrt() as u32 + 100;
+        match enforce_cell_budget(side, side) {
+            Err(BuildError::GridTooLarge { cells, max }) => {
+                assert_eq!(max, MAX_DEM_CELLS);
+                assert!(cells > MAX_DEM_CELLS, "must report the oversized count, got {cells}");
+            }
+            other => panic!("expected GridTooLarge, got {other:?}"),
+        }
+    }
+
+    /// Adjacent terrain cells are spaced `2 * options.size` world units apart —
+    /// BrickSize is a half-extent, so a cell's footprint equals its pitch
+    /// (contiguous tiling). The Map-tab "Predicted output ≈ W×H studs" readout
+    /// relies on this 2× pitch (studs/cell = size*2/5); pin it so the estimate
+    /// can never silently drift from the geometry again.
+    #[test]
+    fn greedy_brick_pitch_is_twice_size() {
+        let raster = DemRaster {
+            width: 2,
+            height: 1,
+            heights_m: vec![0.0, 50.0],
+            min_m: 0.0,
+            max_m: 50.0,
+        };
+        let heightmap = build_heightmap(&raster, 1.0, raster.min_m);
+        let cm = FlatColormap { width: 2, height: 1, color: DEFAULT_BRICK_COLOR };
+        let progress: ProgressFn = Arc::new(|_, _| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let hscale: u16 = 1;
+        let bricks = generate_bricks(
+            &heightmap,
+            &cm,
+            BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: hscale, glow: false, nocollide: false },
+            None,
+            (0, 0),
+            progress,
+            cancel,
+        )
+        .expect("gen");
+        let size = i32::from(hscale) * 5; // GenOptions.size for non-micro
+        let mut xs: Vec<i32> = bricks.iter().map(|b| b.position.x).collect();
+        xs.sort_unstable();
+        xs.dedup();
+        assert_eq!(xs.len(), 2, "two distinct-height cells must yield two columns, got {xs:?}");
+        assert_eq!(
+            xs[1] - xs[0],
+            2 * size,
+            "adjacent-cell pitch must be 2*size = {}; the studs readout assumes it",
+            2 * size,
+        );
+    }
+
+    /// Micro bricks must work end-to-end as terrain: still fill each column to
+    /// the base plane (solid, 1:1) and carry the micro brick asset — so a user
+    /// can pick Micro "for nice resolution" and get a faithful, walkable world.
+    #[test]
+    fn micro_terrain_fills_to_base_and_uses_micro_asset() {
+        use brdb::assets::bricks::PB_DEFAULT_MICRO_BRICK;
+        let raster = DemRaster {
+            width: 2,
+            height: 1,
+            heights_m: vec![0.0, 50.0],
+            min_m: 0.0,
+            max_m: 50.0,
+        };
+        let heightmap = build_heightmap(&raster, 1.0, raster.min_m);
+        let cm = FlatColormap { width: 2, height: 1, color: DEFAULT_BRICK_COLOR };
+        let progress: ProgressFn = Arc::new(|_, _| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let bricks = generate_bricks(
+            &heightmap,
+            &cm,
+            BrickStyle { block_type: BlockType::Micro, horizontal_scale: 1, glow: false, nocollide: false },
+            None,
+            (0, 0),
+            progress,
+            cancel,
+        )
+        .expect("micro gen");
+        let tallest = bricks
+            .iter()
+            .map(|b| match &b.asset {
+                brdb::BrickType::Procedural { size, .. } => size.z,
+                other => panic!("expected procedural, got {other:?}"),
+            })
+            .max()
+            .expect("some bricks");
+        assert!(tallest >= 20, "micro terrain must fill the 50 m cell to base too, got {tallest}");
+        assert!(
+            bricks.iter().all(|b| matches!(
+                &b.asset,
+                brdb::BrickType::Procedural { asset, .. } if *asset == PB_DEFAULT_MICRO_BRICK
+            )),
+            "micro terrain must use the micro brick asset",
+        );
+    }
+
     #[test]
     fn generate_bricks_cancelled_before_start_returns_cancelled() {
         let raster = DemRaster {
@@ -1260,7 +1654,7 @@ mod tests {
             min_m: 0.0,
             max_m: 3.0,
         };
-        let heightmap = build_heightmap(&raster, 1.0);
+        let heightmap = build_heightmap(&raster, 1.0, raster.min_m);
         let cm = FlatColormap { width: 2, height: 2, color: DEFAULT_BRICK_COLOR };
         let progress: ProgressFn = Arc::new(|_, _| {});
         let cancel = Arc::new(AtomicBool::new(true));
@@ -1268,6 +1662,8 @@ mod tests {
             &heightmap,
             &cm,
             BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
+            None,
+            (0, 0),
             progress,
             cancel,
         );
@@ -1432,12 +1828,14 @@ mod tests {
         let progress: ProgressFn = Arc::new(|_, _| {});
         let cancel = Arc::new(AtomicBool::new(false));
         let gen_for = |r: &DemRaster| {
-            let hm = build_heightmap(r, 1.0);
+            let hm = build_heightmap(r, 1.0, r.min_m);
             let cm = FlatColormap { width: r.width, height: r.height, color: DEFAULT_BRICK_COLOR };
             generate_bricks(
                 &hm,
                 &cm,
                 BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
+                None,
+                (0, 0),
                 Arc::clone(&progress),
                 Arc::clone(&cancel),
             )
@@ -1489,7 +1887,7 @@ mod tests {
             min_m: 0.0,
             max_m: 10.0,
         };
-        let heightmap = build_heightmap(&raster, 5.0);
+        let heightmap = build_heightmap(&raster, 5.0, raster.min_m);
 
         let mut img = image::RgbaImage::new(4, 4);
         for y in 0..4 {
@@ -1506,6 +1904,8 @@ mod tests {
             &heightmap,
             &img_cm,
             BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
+            None,
+            (0, 0),
             Arc::clone(&progress),
             Arc::clone(&cancel),
         )
@@ -1523,6 +1923,8 @@ mod tests {
             &heightmap,
             &flat_cm,
             BrickStyle { block_type: BlockType::SmoothTile, horizontal_scale: 1, glow: false, nocollide: false },
+            None,
+            (0, 0),
             progress,
             cancel,
         )

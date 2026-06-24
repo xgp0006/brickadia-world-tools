@@ -2,8 +2,8 @@
 //! fetch/build kickoff. The map preview is always OSM regardless of the
 //! selected imagery source — imagery only affects the generated bricks.
 
-use egui::{Align, Color32, Layout, Pos2, Rect, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2};
-use walkers::{HttpTiles, Map, MapMemory, Position, Projector, lat_lon, sources::OpenStreetMap};
+use egui::{Align, Color32, Layout, Pos2, Rect, Stroke, StrokeKind, TextEdit, Ui, Vec2};
+use walkers::{HttpTiles, Map, MapMemory, Position, Projector, lat_lon};
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -12,13 +12,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use poll_promise::Promise;
 
 use super::build::{
-    self, BlockType, BuildError, BuildOutcome, BuildRequest, BuildStage, DEFAULT_VERTICAL_SCALE,
+    self, BlockType, BuildError, BuildOutcome, BuildRequest, BuildStage,
 };
 use super::config::Config;
+use super::grid_ui::{self, GridInputs, GridUiState};
 use super::coords::{format_lat_lon, parse_lat_lon};
 use super::geocode::{self, GeocodeError, GeocodeHit};
 use super::dem_sources::{Coverage, DemSource, RequiredKey};
 use super::imagery_sources::ImagerySource;
+use super::preview_source::PreviewBasemap;
 use super::theme::{BBOX_FILL, BBOX_STROKE, STATUS_ERROR_FG, STATUS_WARN_FG};
 use super::tiles::{BBoxLatLon, MERCATOR_LAT_LIMIT};
 
@@ -31,6 +33,23 @@ const KEY_INPUT_MAX_LEN: usize = 256;
 /// crop that, while now safe (crop_window forces >=1px), produces a
 /// pointless 1-pixel terrain. Symmetric gate for both latitude and longitude.
 const MIN_SPAN_DEG: f64 = 1e-4;
+
+/// Default + bounds for the true-scale "studs per real meter" control. 4 studs/m
+/// makes a ~1 km AWS-Terrarium box (~3.6 m/cell at z15) a ~3,850-stud world at
+/// faithful 1:1 relief — a big, walkable map out of the box. Bigger = bigger
+/// world at NO brick cost; the bounds keep the derived integer brick scale in a
+/// safe, useful range.
+const DEFAULT_STUDS_PER_METER: f32 = 4.0;
+const STUDS_PER_METER_MIN: f32 = 0.5;
+const STUDS_PER_METER_MAX: f32 = 32.0;
+/// Hard cap on the derived integer horizontal brick scale. The widest single
+/// brick is `max_quad * size = 500 * hscale` units in BOTH brick classes (normal:
+/// 100 * hscale*5; micro: 500 * hscale*1), which must stay under the u16
+/// `BrickSize` ceiling (65535) → hscale ≤ 131. 128 (= 64000, safe) lets MICRO —
+/// which needs ~5× the integer scale of normal bricks to hit the same physical
+/// scale — reach a fine, faithful 1:1 model instead of clamping early; normal
+/// bricks rarely want more than ~32 (above that each cell is a very wide plate).
+const MAX_HORIZONTAL_SCALE: u16 = 128;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BBox {
@@ -151,6 +170,9 @@ struct DragState {
 
 pub(crate) struct MapTabState {
     tiles: Option<HttpTiles>,
+    /// Which basemap `tiles` currently holds, so `ensure_tiles` rebuilds the
+    /// `HttpTiles` only when the selected imagery (or its token) actually changes.
+    tiles_basemap: Option<PreviewBasemap>,
     map_memory: MapMemory,
     config: Config,
     config_error: Option<String>,
@@ -167,8 +189,13 @@ pub(crate) struct MapTabState {
     imagery_source: ImagerySource,
     block_type: BlockType,
     density_factor: u16,
-    horizontal_scale: u16,
-    vertical_scale: f32,
+    /// True-scale controls. `studs_per_meter` sets horizontal world size (more =
+    /// bigger, free); `vertical_exaggeration` scales relief (1.0 = faithful
+    /// 1:1). The integer brick `horizontal_scale` + `vertical_scale` fed to the
+    /// build are DERIVED from these + the DEM resolution at fetch time
+    /// (`derive_scale`), so the world is true-to-life at the chosen scale.
+    studs_per_meter: f32,
+    vertical_exaggeration: f32,
     glow: bool,
     no_collision: bool,
     overwrite_world: bool,
@@ -181,6 +208,9 @@ pub(crate) struct MapTabState {
     fetch_cancel: Arc<AtomicBool>,
     last_outcome: Option<BuildOutcome>,
     last_error: Option<String>,
+    /// All grid-build UI + worker state (spec §8). Defaults OFF so the single-box
+    /// flow is visually unchanged; lives behind the "Grid build" collapsing header.
+    grid: GridUiState,
 }
 
 impl MapTabState {
@@ -196,6 +226,7 @@ impl MapTabState {
         let key_input_mapbox = config.mapbox_token.clone().unwrap_or_default();
         Self {
             tiles: None,
+            tiles_basemap: None,
             map_memory: MapMemory::default(),
             config,
             config_error,
@@ -212,8 +243,8 @@ impl MapTabState {
             imagery_source: ImagerySource::EsriWorldImagery,
             block_type: BlockType::SmoothTile,
             density_factor: 1,
-            horizontal_scale: 1,
-            vertical_scale: DEFAULT_VERTICAL_SCALE,
+            studs_per_meter: DEFAULT_STUDS_PER_METER,
+            vertical_exaggeration: 1.0,
             glow: false,
             no_collision: false,
             overwrite_world: false,
@@ -226,6 +257,7 @@ impl MapTabState {
             fetch_cancel: Arc::new(AtomicBool::new(false)),
             last_outcome: None,
             last_error: None,
+            grid: GridUiState::new(),
         }
     }
 
@@ -238,11 +270,23 @@ impl MapTabState {
     /// the full network + brick generation after the window is gone.
     pub(crate) fn cancel_fetch(&self) {
         self.fetch_cancel.store(true, Ordering::Relaxed);
+        // The grid worker shares the same poll-promise + cancel-flag contract; on
+        // shutdown it must observe cancellation too so its detached two-phase
+        // build (fetch + mesh + write) stops instead of running on after the
+        // window is gone.
+        self.grid.cancel.store(true, Ordering::Relaxed);
     }
 
     fn ensure_tiles(&mut self, ctx: &egui::Context) {
-        if self.tiles.is_none() {
-            self.tiles = Some(HttpTiles::new(OpenStreetMap, ctx.clone()));
+        // The preview basemap mirrors the selected imagery source, so changing
+        // the Imagery picker visibly swaps the map and the user watches the new
+        // tiles stream in (walkers fetches + repaints per tile on its own). Pure
+        // derive-from-state: rebuild HttpTiles only when the resolved basemap key
+        // (including the Mapbox token) differs from what is currently loaded.
+        let want = PreviewBasemap::resolve(self.imagery_source, self.config.mapbox_token.as_deref());
+        if self.tiles.is_none() || self.tiles_basemap.as_ref() != Some(&want) {
+            self.tiles = Some(want.build_tiles(ctx));
+            self.tiles_basemap = Some(want);
         }
     }
 
@@ -255,10 +299,14 @@ pub(crate) fn draw(state: &mut MapTabState, ctx: &egui::Context, ui: &mut Ui) {
     state.ensure_tiles(ctx);
     poll_fetch_promise(state);
     poll_search_promise(state);
+    grid_ui::poll_grid_promise(&mut state.grid);
     if state.search_promise.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(120));
     }
     if state.is_fetching() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(120));
+    }
+    if grid_ui::is_grid_running(&state.grid) {
         ctx.request_repaint_after(std::time::Duration::from_millis(120));
     }
     egui::SidePanel::right("map_controls")
@@ -283,19 +331,59 @@ fn draw_controls(state: &mut MapTabState, ui: &mut Ui) {
     draw_box_controls(state, ui);
     ui.add_space(8.0);
     draw_source_pickers(state, ui);
-    ui.small("Preview is OpenStreetMap only — it does not reflect the imagery source. Brick colors use the selected imagery at build time.");
+    let basemap = state.tiles_basemap.as_ref().map_or("OpenStreetMap", PreviewBasemap::label);
+    ui.small(format!(
+        "Preview basemap: {basemap}. Brick colors use the selected imagery at build \
+         time (often a higher zoom than the preview shows)."
+    ));
+    if state.imagery_source == ImagerySource::MapboxSatellite && !state.config.mapbox_token_set() {
+        ui.colored_label(
+            STATUS_WARN_FG,
+            "No Mapbox token — preview falls back to OpenStreetMap (set one in Settings).",
+        );
+    }
     ui.add_space(8.0);
     draw_brick_options(state, ui);
     ui.add_space(8.0);
     draw_output_section(state, ui);
     ui.add_space(8.0);
     draw_fetch_button(state, ui);
+    ui.add_space(8.0);
+    draw_grid_section(state, ui);
     ui.add_space(6.0);
     draw_last_result(state, ui);
     ui.add_space(12.0);
     if ui.button("Settings…").clicked() {
         state.settings_open = true;
     }
+}
+
+/// Render the grid-build section (spec §8). Constructs [`GridInputs`] from the
+/// single-box shaping fields (immutable borrows of disjoint `MapTabState` fields)
+/// and passes `&mut state.grid` — Rust splits the borrow because each side
+/// touches a different field. The section is gated internally by `grid.enabled`,
+/// so the single-box flow is visually unchanged when grid mode is off.
+fn draw_grid_section(state: &mut MapTabState, ui: &mut Ui) {
+    let bbox = state.bbox.map(|b| BBoxLatLon {
+        north: b.north,
+        south: b.south,
+        east: b.east,
+        west: b.west,
+    });
+    let inputs = GridInputs {
+        bbox,
+        dem_source: state.dem_source,
+        imagery_source: state.imagery_source,
+        block_type: state.block_type,
+        glow: state.glow,
+        no_collision: state.no_collision,
+        overwrite: state.overwrite_world,
+        studs_per_meter: state.studs_per_meter,
+        vertical_exaggeration: state.vertical_exaggeration,
+        output_name: &state.output_name,
+        config: &state.config,
+    };
+    grid_ui::draw_grid_section(&mut state.grid, ui, &inputs);
 }
 
 fn draw_coord_entry(state: &mut MapTabState, ui: &mut Ui) {
@@ -427,10 +515,13 @@ fn poll_search_promise(state: &mut MapTabState) {
 fn draw_box_controls(state: &mut MapTabState, ui: &mut Ui) {
     ui.label("Bounding box");
     ui.horizontal(|ui| {
-        let label = if state.draw_mode { "Drawing… (click & drag)" } else { "Draw Box" };
+        let label = if state.draw_mode { "Drawing… (left-drag; right-drag pans)" } else { "Draw Box" };
         if ui
             .selectable_label(state.draw_mode, label)
-            .on_hover_text("Toggle draw mode, then click-drag on the map to select an area")
+            .on_hover_text(
+                "Toggle draw mode, then LEFT-drag on the map to select an area. While drawing, \
+                 RIGHT- or MIDDLE-drag still pans and scroll / double-click zooms.",
+            )
             .clicked()
         {
             state.draw_mode = !state.draw_mode;
@@ -466,15 +557,24 @@ fn draw_dem_picker(state: &mut MapTabState, ui: &mut Ui) {
         .width(260.0)
         .show_ui(ui, |ui| {
             for src in DemSource::ALL {
-                let usable = key_ok_for(&state.config, src.required_key());
+                let wired = src.is_fetchable();
+                let usable = wired && key_ok_for(&state.config, src.required_key());
                 let mut item_label = src.display_label().to_owned();
                 push_coverage_badge(&mut item_label, src.coverage());
+                if !wired {
+                    item_label.push_str("  (coming soon)");
+                }
                 let resp = ui
                     .add_enabled(
                         usable,
                         egui::Button::selectable(state.dem_source == *src, item_label),
                     )
                     .on_hover_text(src.tooltip());
+                let resp = if wired {
+                    resp
+                } else {
+                    resp.on_disabled_hover_text("Not wired for in-app fetch yet")
+                };
                 if resp.clicked() && usable {
                     state.dem_source = *src;
                 }
@@ -494,15 +594,24 @@ fn draw_imagery_picker(state: &mut MapTabState, ui: &mut Ui) {
         .width(260.0)
         .show_ui(ui, |ui| {
             for src in ImagerySource::ALL {
-                let usable = key_ok_for(&state.config, src.required_key());
+                let wired = src.is_fetchable();
+                let usable = wired && key_ok_for(&state.config, src.required_key());
                 let mut item_label = src.display_label().to_owned();
                 push_coverage_badge(&mut item_label, src.coverage());
+                if !wired {
+                    item_label.push_str("  (coming soon)");
+                }
                 let resp = ui
                     .add_enabled(
                         usable,
                         egui::Button::selectable(state.imagery_source == *src, item_label),
                     )
                     .on_hover_text(src.tooltip());
+                let resp = if wired {
+                    resp
+                } else {
+                    resp.on_disabled_hover_text("Not wired for in-app fetch yet")
+                };
                 if resp.clicked() && usable {
                     state.imagery_source = *src;
                 }
@@ -539,6 +648,12 @@ fn draw_brick_options(state: &mut MapTabState, ui: &mut Ui) {
                 }
             }
         });
+    if state.block_type.micro() {
+        ui.small(
+            "Micro: finest bricks (1/5 size) — best for detailed / small-scale models. \
+             The world stays true 1:1.",
+        );
+    }
 
     ui.add_space(4.0);
     ui.label("Density (terrain resolution)");
@@ -553,31 +668,41 @@ fn draw_brick_options(state: &mut MapTabState, ui: &mut Ui) {
     );
 
     ui.add_space(4.0);
-    ui.label("Horizontal scale (studs per cell)");
+    ui.label("Scale (studs per real meter)");
     ui.add(
-        egui::DragValue::new(&mut state.horizontal_scale)
-            .range(1..=16)
+        egui::DragValue::new(&mut state.studs_per_meter)
+            .range(STUDS_PER_METER_MIN..=STUDS_PER_METER_MAX)
             .speed(0.1),
     )
     .on_hover_text(
-        "Widens each terrain cell to N studs — same brick count, bigger map. \
-         The cure for tiny output: SRTMGL1's ~30 m cells at 1 stud/cell make a \
-         1 km box only ~33 studs wide. Raise vertical exaggeration to match or \
-         the terrain will look flattened.",
+        "True-to-life horizontal scale: this many studs reproduce one real meter. \
+         Higher = a bigger world at the SAME brick count (free). Vertical height \
+         auto-matches for faithful 1:1 relief — see the predicted size below.",
     );
 
     ui.add_space(4.0);
     ui.label("Vertical exaggeration");
     ui.add(
-        egui::Slider::new(&mut state.vertical_scale, 0.1..=20.0)
+        egui::Slider::new(&mut state.vertical_exaggeration, 0.25..=8.0)
             .logarithmic(true)
             .text("×"),
     )
-    .on_hover_text("Height multiplier. Higher relief = more vertical bricks (toward the cap).");
+    .on_hover_text(
+        "1× = faithful 1:1 relief (height matched to the true ground at the chosen \
+         scale). Raise it to exaggerate hills; lower it to flatten.",
+    );
 
     ui.add_space(4.0);
-    ui.checkbox(&mut state.no_collision, "No collision (decorative)");
-    ui.checkbox(&mut state.glow, "Glowing terrain (emissive)");
+    ui.checkbox(&mut state.no_collision, "No collision (decorative)")
+        .on_hover_text(
+            "Bricks have no player/weapon/interaction collision — a look-only \
+             model you walk through, not on.",
+        );
+    ui.checkbox(&mut state.glow, "Glowing terrain (emissive)")
+        .on_hover_text(
+            "Terrain uses the emissive GLOW material instead of plastic, so it \
+             self-illuminates in-game.",
+        );
 }
 
 fn draw_output_section(state: &mut MapTabState, ui: &mut Ui) {
@@ -645,6 +770,19 @@ fn start_fetch(state: &mut MapTabState) {
         state.last_error = Some("internal: Fetch clicked with no bbox".into());
         return;
     };
+    // Derive the integer brick horizontal_scale + the 1:1-matched vertical_scale
+    // from the user's true-scale controls and the DEM resolution this box will
+    // fetch at (the SAME prediction the size readout shows). Fall back to the
+    // default cell size if the resolution can't be predicted (shouldn't happen
+    // once Fetch is enabled, which requires a usable source).
+    let cell_m_eff = predicted_cell_m(state, bbox).unwrap_or(30.0)
+        * f64::from(state.density_factor.max(1));
+    let (horizontal_scale, vertical_scale) = derive_scale(
+        cell_m_eff,
+        state.studs_per_meter,
+        state.vertical_exaggeration,
+        state.block_type.micro(),
+    );
     let request = BuildRequest {
         bbox: BBoxLatLon {
             north: bbox.north,
@@ -657,9 +795,9 @@ fn start_fetch(state: &mut MapTabState) {
         imagery_source: state.imagery_source,
         mapbox_token: state.config.mapbox_token.clone(),
         opentopo_key: state.config.opentopo_api_key.clone(),
-        vertical_scale: state.vertical_scale,
+        vertical_scale,
         density_factor: state.density_factor,
-        horizontal_scale: state.horizontal_scale,
+        horizontal_scale,
         block_type: state.block_type,
         glow: state.glow,
         no_collision: state.no_collision,
@@ -760,12 +898,10 @@ fn fetch_disabled_reasons(state: &MapTabState) -> Vec<&'static str> {
     if !key_ok_for(&state.config, state.dem_source.required_key()) {
         reasons.push("Selected elevation source needs an API key");
     }
-    if matches!(state.dem_source, DemSource::Usgs3Dep) {
-        reasons.push("USGS 3DEP is not wired yet; pick AWS Terrarium, Mapbox, or OpenTopography");
-    }
-    if matches!(state.imagery_source, ImagerySource::UsgsOrthoimagery) {
-        reasons.push("USGS orthoimagery is not wired yet; pick ESRI, Mapbox, or None");
-    }
+    // USGS 3DEP / USGS orthoimagery are shown DISABLED ("coming soon") in the
+    // pickers and can never be SELECTED (the picker gates the click on
+    // is_fetchable), so state.dem_source / state.imagery_source is always a
+    // fetch-wired source — no dead-source Fetch blocker is needed here.
     if !key_ok_for(&state.config, state.imagery_source.required_key()) {
         reasons.push("Selected imagery source needs an API key");
     }
@@ -806,7 +942,10 @@ fn draw_zoom_readout(state: &MapTabState, b: BBox, ui: &mut Ui) {
     if state.dem_source == DemSource::OpenTopography {
         let area = build::bbox_area_km2(&bbox);
         let cap = build::OPENTOPO_MAX_AREA_KM2;
-        let msg = format!("DEM area {area:.0} km² (OpenTopography cap {cap:.0} km²)");
+        let msg = format!(
+            "DEM: {} · area {area:.0} km² (cap {cap:.0} km²)",
+            state.dem_source.display_label(),
+        );
         if area > cap {
             ui.colored_label(STATUS_ERROR_FG, format!("{msg} — over limit, shrink the box"));
         } else {
@@ -820,7 +959,20 @@ fn draw_zoom_readout(state: &MapTabState, b: BBox, ui: &mut Ui) {
             );
         }
     } else if let Some(src) = super::dem_sources::tile_source_for(state.dem_source, token) {
-        emit_zoom_line(ui, "DEM", &bbox, src.max_zoom());
+        // Name the DEM source + its per-cell resolution so switching the DEM
+        // picker visibly changes this line (zero extra fetch — pure prediction).
+        let cap = src.max_zoom();
+        let z = super::tiles::pick_zoom(bbox, cap);
+        let m_per_cell = ground_resolution_m(b.centroid_lat(), z);
+        let line = format!(
+            "DEM: {} · zoom {z} (cap z{cap}) · ~{m_per_cell:.0} m/cell",
+            state.dem_source.display_label(),
+        );
+        if z >= cap {
+            ui.colored_label(STATUS_WARN_FG, line);
+        } else {
+            ui.small(line);
+        }
     }
     if let Some(src) = super::imagery_sources::tile_source_for(state.imagery_source, token) {
         emit_zoom_line(ui, "Imagery", &bbox, src.max_zoom());
@@ -842,11 +994,81 @@ fn emit_zoom_line(ui: &mut Ui, label: &str, bbox: &BBoxLatLon, cap: u32) {
 /// ground resolution at the zoom `pick_zoom` will choose. Haversine-side
 /// estimate, not a pixel-exact crop preview.
 fn draw_output_estimate(state: &MapTabState, b: BBox, ui: &mut Ui) {
-    /// SRTM 1 arc-second nominal ground resolution.
-    const SRTMGL1_CELL_M: f64 = 30.0;
+    let Some(cell_m) = predicted_cell_m(state, b) else { return };
+    let cell_m_eff = cell_m * f64::from(state.density_factor.max(1));
+    let (hscale, _vertical) = derive_scale(
+        cell_m_eff,
+        state.studs_per_meter,
+        state.vertical_exaggeration,
+        state.block_type.micro(),
+    );
+    // studs/cell = 2*size/5 = 2*hscale*upf/5 (BrickSize is a half-extent, so a
+    // cell's footprint equals its 2*size pitch — verified by
+    // greedy_brick_pitch_is_twice_size). World studs/side = cells/side *
+    // studs/cell. The integer hscale is derived from the Scale control, so the
+    // realized size may differ slightly from the exact target (shown live).
+    let upf = if state.block_type.micro() { 1.0 } else { 5.0 };
+    let studs_per_cell = 2.0 * f64::from(hscale) * upf / 5.0;
+    let cells_w = b.width_km() * 1000.0 / cell_m_eff;
+    let cells_h = b.height_km() * 1000.0 / cell_m_eff;
+    let (w, h) = (cells_w * studs_per_cell, cells_h * studs_per_cell);
+    if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
+        return;
+    }
+    let achieved = w / (b.width_km() * 1000.0); // studs per real meter
+    let relief = if (state.vertical_exaggeration - 1.0).abs() < 0.05 {
+        "1:1".to_owned()
+    } else {
+        format!("×{:.1}", state.vertical_exaggeration)
+    };
+    ui.small(format!(
+        "World ≈ {w:.0}×{h:.0} studs · ~{achieved:.1} studs/m · relief {relief} (auto) · \
+         ~{cell_m_eff:.0} m/cell"
+    ));
+    // The requested scale needs a per-cell brick the mesher can't reach (the u16
+    // BrickSize ceiling caps the integer scale at MAX_HORIZONTAL_SCALE), so the
+    // achieved studs/m is BELOW what was set and each coarse cell renders as a
+    // large brick — the "why are my micro bricks huge?" case. Tell the user
+    // loudly and point at the real fix (a smaller box → finer cells), since
+    // raising Scale further does nothing here.
+    let ideal_hscale = f64::from(state.studs_per_meter) * 5.0 * cell_m_eff / (2.0 * upf);
+    if ideal_hscale > f64::from(MAX_HORIZONTAL_SCALE) + 0.5 {
+        ui.colored_label(
+            STATUS_WARN_FG,
+            format!(
+                "Scale capped: you set {:.1} studs/m, but this area's ~{cell_m_eff:.0} m cells max \
+                 out at ~{achieved:.1} studs/m — so each cell is a large brick (micro or not). Draw \
+                 a SMALLER box for finer cells + your full scale; a big area can't also be fine.",
+                state.studs_per_meter,
+            ),
+        );
+    } else {
+        ui.small("Bigger = raise Scale (free). Micro = finer brick TYPE, not smaller bricks.");
+    }
+}
+
+/// DEM ground resolution (meters per cell) predicted for this bbox + DEM source,
+/// BEFORE density downsampling — mirrors what `fetch_and_decode_dem` resolves so
+/// the size readout and `start_fetch` derive the SAME scale. `None` when the
+/// source has no usable fetch path (e.g. a token-gated source with no token).
+fn predicted_cell_m(state: &MapTabState, b: BBox) -> Option<f64> {
+    /// SRTMGL1 N-S cell size: 1 arc-second of LATITUDE ≈ 30.92 m, ~constant.
+    const SRTMGL1_NS_M: f64 = 30.92;
     let bbox = BBoxLatLon { north: b.north, south: b.south, east: b.east, west: b.west };
-    let cell_m = match state.dem_source {
-        DemSource::OpenTopography => Some(SRTMGL1_CELL_M),
+    match state.dem_source {
+        DemSource::OpenTopography => {
+            // OpenTopography SRTMGL1 is a GEOGRAPHIC (EPSG:4326) grid, NOT Web
+            // Mercator: a cell is 1 arc-second square in degrees, so its E-W
+            // ground size shrinks with cos(lat) (≈30.92*cos) while N-S stays
+            // ~30.92. The mesher renders SQUARE bricks, so no single cell size
+            // captures both axes (geographic sources are inherently aspect-
+            // distorted away from the equator — use AWS Terrarium / Mapbox, which
+            // are Mercator and isotropic, for a faithful 1:1 SHAPE). Use the
+            // geometric mean of the two axes so the relief error is symmetric
+            // (±sqrt over each axis) rather than one axis exact and the other off.
+            let cos_lat = b.centroid_lat().to_radians().cos().max(0.01);
+            Some(SRTMGL1_NS_M * cos_lat.sqrt())
+        }
         src => {
             let token = state.config.mapbox_token.as_deref();
             super::dem_sources::tile_source_for(src, token).map(|s| {
@@ -854,25 +1076,37 @@ fn draw_output_estimate(state: &MapTabState, b: BBox, ui: &mut Ui) {
                 ground_resolution_m(b.centroid_lat(), z)
             })
         }
-    };
-    let Some(cell_m) = cell_m else { return };
-    let density = f64::from(state.density_factor.max(1));
-    let units_per_cell =
-        f64::from(state.horizontal_scale.max(1)) * if state.block_type.micro() { 1.0 } else { 5.0 };
-    let studs_per_km = 1000.0 / cell_m / density * units_per_cell / 5.0;
-    let (w, h) = (b.width_km() * studs_per_km, b.height_km() * studs_per_km);
-    if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
-        return;
     }
-    let m_per_stud = b.width_km() * 1000.0 / w;
-    ui.small(format!(
-        "Predicted output ≈ {w:.0}×{h:.0} studs ({m_per_stud:.1} m per stud) — raise Horizontal \
-         scale for a bigger map at no brick cost"
-    ));
+}
+
+/// Derive the integer horizontal brick scale and the 1:1-matched vertical scale
+/// from the user's target studs-per-meter + exaggeration, the effective
+/// (post-density) DEM cell size in meters, and whether micro bricks are used.
+///
+/// True 1:1: a cell spans `2*size = 2*hscale*upf` world units (`upf` = the
+/// GenOptions size multiplier — 5 for normal bricks, 1 for micro; 1 stud = 5
+/// units) over `cell_m_eff` meters → `2*hscale*upf/cell_m_eff` units/m
+/// horizontally. Surface-Z is `(m-min)*vertical` units → `vertical` units/m.
+/// Setting them equal makes relief faithful; `exaggeration` scales it.
+pub(crate) fn derive_scale(
+    cell_m_eff: f64,
+    studs_per_meter: f32,
+    exaggeration: f32,
+    micro: bool,
+) -> (u16, f32) {
+    debug_assert!(cell_m_eff > 0.0, "derive_scale: cell_m_eff must be positive, got {cell_m_eff}");
+    let upf = if micro { 1.0 } else { 5.0 };
+    // Solve `2*hscale*upf / cell_m_eff == studs_per_meter * 5` (5 units/stud).
+    let hscale = ((f64::from(studs_per_meter) * 5.0 * cell_m_eff) / (2.0 * upf))
+        .round()
+        .clamp(1.0, f64::from(MAX_HORIZONTAL_SCALE)) as u16;
+    // 1:1 vertical (units/m) == achieved horizontal units/m, times exaggeration.
+    let vertical = ((2.0 * f64::from(hscale) * upf / cell_m_eff) * f64::from(exaggeration)) as f32;
+    (hscale, vertical)
 }
 
 /// Web Mercator ground resolution (meters per 256px-tile pixel) at a latitude.
-fn ground_resolution_m(lat_deg: f64, zoom: u32) -> f64 {
+pub(crate) fn ground_resolution_m(lat_deg: f64, zoom: u32) -> f64 {
     const EQUATOR_M_PER_PX_Z0: f64 = 40_075_016.686 / 256.0;
     EQUATOR_M_PER_PX_Z0 * lat_deg.to_radians().cos() / f64::from(2_u32.pow(zoom.min(30)))
 }
@@ -891,6 +1125,7 @@ fn draw_bbox_readout(b: BBox, ui: &mut Ui) {
 
 fn draw_map_area(state: &mut MapTabState, ui: &mut Ui) {
     let center = state.default_center();
+    let draw_mode = state.draw_mode;
     let Some(tiles) = state.tiles.as_mut() else {
         ui.colored_label(
             Color32::from_rgb(220, 100, 100),
@@ -898,7 +1133,23 @@ fn draw_map_area(state: &mut MapTabState, ui: &mut Ui) {
         );
         return;
     };
-    let response = ui.add(Map::new(Some(tiles), &mut state.map_memory, center));
+    // Double-click zooms in — an obvious framing affordance (Ctrl+scroll is not
+    // discoverable). While armed for drawing, move the map's drag-to-pan OFF the
+    // primary button onto secondary/middle. walkers' Map allocates
+    // `click_and_drag` over the whole rect and pans on PRIMARY by default, which
+    // would fight the box draw; the old overlaid SECOND interact couldn't fix
+    // that — two widgets over one rect both claim the pointer drag (egui tracks a
+    // drag per widget Id, button-agnostically), so it was deleted. With ONE
+    // widget the response can still be queried PER BUTTON via `*_by`, so we
+    // re-key the map's pan to secondary/middle and key the box to the primary
+    // button (update_bbox_drag) — left-drag draws while the user can STILL
+    // right/middle-drag to pan and reposition the map, no armed navigation trap.
+    // Outside draw mode the map keeps default PRIMARY drag-pan.
+    let mut map = Map::new(Some(tiles), &mut state.map_memory, center).double_click_to_zoom(true);
+    if draw_mode {
+        map = map.drag_pan_buttons(egui::DragPanButtons::SECONDARY | egui::DragPanButtons::MIDDLE);
+    }
+    let response = ui.add(map);
     let rect = response.rect;
     debug_assert!(
         rect.width() > 0.0 && rect.height() > 0.0,
@@ -906,16 +1157,38 @@ fn draw_map_area(state: &mut MapTabState, ui: &mut Ui) {
     );
     let projector = Projector::new(rect, &state.map_memory, center);
 
-    if state.draw_mode {
+    if draw_mode {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-        let map_sense = Sense::click_and_drag();
-        let drag_resp = ui.interact(rect, ui.id().with("bbox_drag"), map_sense);
-        update_bbox_drag(state, &drag_resp, &projector);
+        // Drive the bbox drag from the map widget's OWN response (no overlaid
+        // second interact, which would steal the drag). The box keys off the
+        // PRIMARY button; secondary/middle drags pan the map underneath.
+        update_bbox_drag(state, &response, &projector);
     } else {
         state.drag = None;
+        // Grid Click-mask tile pick reuses the SAME map `Response` (NO second
+        // interact widget — spec §8). It runs ONLY when grid is enabled, the mode
+        // is ClickMask, and Draw Box is OFF, so box-draw and tile-pick never fight
+        // for the pointer.
+        if grid_ui::wants_pick(&state.grid, draw_mode) {
+            grid_ui::update_grid_pick(&mut state.grid, &response, &projector);
+        }
     }
 
     draw_bbox_overlay(state, ui, &projector, rect);
+
+    // "loading N tiles" cue so a source/basemap swap visibly shows progress.
+    // walkers repaints per tile arrival, so this counter ticks down on its own.
+    // (The &mut tiles borrow ended when `ui.add(map)` consumed the Map above.)
+    let loading = state.tiles.as_ref().map_or(0, |t| t.stats().in_progress);
+    if loading > 0 {
+        ui.painter_at(rect).text(
+            rect.left_top() + Vec2::new(8.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            format!("loading {loading} tile{}…", if loading == 1 { "" } else { "s" }),
+            egui::FontId::proportional(12.0),
+            Color32::from_rgba_unmultiplied(0xE4, 0xE0, 0xD2, 0xC0),
+        );
+    }
 }
 
 fn update_bbox_drag(state: &mut MapTabState, resp: &egui::Response, projector: &Projector) {
@@ -930,32 +1203,45 @@ fn update_bbox_drag(state: &mut MapTabState, resp: &egui::Response, projector: &
         // unproject directly — NO rect.min subtraction. Verified by
         // `projector_returns_absolute_screen_coords`.
         let pos = projector.unproject(pointer_pos.to_vec2());
-        if resp.drag_started() {
+        // Gate strictly on the PRIMARY button: the map pans on secondary/middle
+        // while armed, and egui's drag_started()/dragged()/drag_stopped() flags
+        // are button-AGNOSTIC, so a right/middle-drag pan would otherwise draw a
+        // box too. `*_by(Primary)` keeps the box on the left button only.
+        if resp.drag_started_by(egui::PointerButton::Primary) {
             state.drag = Some(DragState { start: pos, current: pos });
             state.bbox_error = None;
-        } else if resp.dragged()
+        } else if resp.dragged_by(egui::PointerButton::Primary)
             && let Some(d) = state.drag.as_mut()
         {
             d.current = pos;
         }
     }
-    if resp.drag_stopped()
-        && let Some(d) = state.drag.take()
-    {
-        match BBox::from_corners(d.start, d.current) {
-            Ok(bbox) => {
-                state.bbox = Some(bbox);
-                state.bbox_error = None;
-                // Only a successful box exits draw mode.
-                state.draw_mode = false;
-            }
-            Err(rejection) => {
-                state.bbox = None;
-                state.bbox_error = Some(rejection.message().to_owned());
-                // Stay armed so a too-small drag can be retried immediately
-                // without re-toggling Draw Box.
+    if resp.drag_stopped_by(egui::PointerButton::Primary) {
+        if let Some(d) = state.drag.take() {
+            match BBox::from_corners(d.start, d.current) {
+                Ok(bbox) => {
+                    state.bbox = Some(bbox);
+                    state.bbox_error = None;
+                    // Stay armed (do NOT auto-exit draw mode): the next drag
+                    // simply replaces the box, so a slightly-off selection is
+                    // re-drawn in one gesture instead of re-toggling Draw Box.
+                    // Toggle Draw Box off (or Clear) to leave draw mode and pan.
+                }
+                Err(rejection) => {
+                    // A stray too-small drag must NOT wipe a good existing box —
+                    // only report the error. Stay armed to retry immediately.
+                    state.bbox_error = Some(rejection.message().to_owned());
+                }
             }
         }
+    } else if state.drag.is_some()
+        && !resp.dragged_by(egui::PointerButton::Primary)
+        && !resp.drag_started_by(egui::PointerButton::Primary)
+    {
+        // The primary draw drag ended WITHOUT a drag_stopped event (Escape, or a
+        // multi-button gesture that released Primary early). Discard the
+        // in-progress box so no ghost rectangle lingers until the next drag.
+        state.drag = None;
     }
 }
 
@@ -968,6 +1254,11 @@ fn draw_bbox_overlay(state: &MapTabState, ui: &Ui, projector: &Projector, rect: 
     }
     if let Some(bbox) = state.bbox {
         paint_bbox(&painter, projector, bbox, BBOX_FILL, BBOX_STROKE);
+    }
+    // Additive grid-lattice paint: only when grid mode is enabled, so the
+    // single-box overlay is visually unchanged when grid is off (spec §8).
+    if state.grid.enabled {
+        grid_ui::draw_grid_overlay(&state.grid, &painter, projector);
     }
     if state.draw_mode && state.drag.is_none() {
         // Armed but not yet dragging — this is exactly when the user needs the
@@ -1103,6 +1394,109 @@ fn trimmed_or_none(s: &str) -> Option<String> {
 mod tests {
     use super::*;
     use egui::{Pos2, Rect, Vec2};
+
+    /// The whole point of the scale control: at exaggeration 1.0 the world is
+    /// FAITHFUL 1:1 — vertical units per meter equals horizontal units per meter,
+    /// so a real hill keeps its true aspect ratio in-game. Horizontal units/m =
+    /// `2*hscale*upf/cell_m`; vertical units/m = the returned `vertical_scale`.
+    #[test]
+    fn derive_scale_is_true_1to1_at_exaggeration_1() {
+        let cell_m = 3.63; // AWS Terrarium z15, ~1 km box at 40.5°N
+        let (hs, v) = derive_scale(cell_m, 4.0, 1.0, false);
+        // hscale = round(4 * 5 * 3.63 / (2*5)) = round(7.26) = 7
+        assert_eq!(hs, 7, "horizontal scale derivation");
+        let horiz_units_per_m = 2.0 * f64::from(hs) * 5.0 / cell_m;
+        assert!(
+            (f64::from(v) - horiz_units_per_m).abs() < 1e-3,
+            "1:1 broken: vertical {v} units/m != horizontal {horiz_units_per_m} units/m",
+        );
+        // Micro keeps the SAME physical scale (upf=1 → hscale ×5 to compensate),
+        // and stays 1:1.
+        let (hs_m, v_m) = derive_scale(cell_m, 4.0, 1.0, true);
+        let horiz_m = 2.0 * f64::from(hs_m) * 1.0 / cell_m;
+        assert!((f64::from(v_m) - horiz_m).abs() < 1e-3, "micro 1:1 broken");
+    }
+
+    #[test]
+    fn derive_scale_exaggeration_only_scales_vertical() {
+        let (hs1, v1) = derive_scale(3.63, 4.0, 1.0, false);
+        let (hs2, v2) = derive_scale(3.63, 4.0, 2.0, false);
+        assert_eq!(hs1, hs2, "exaggeration must NOT change horizontal scale");
+        assert!((v2 - 2.0 * v1).abs() < 1e-3, "2× exaggeration must double vertical, {v1}->{v2}");
+    }
+
+    #[test]
+    fn derive_scale_micro_matches_normal_physical_scale_at_1to1() {
+        // Micro bricks must produce the SAME physical world (same studs/m, same
+        // 1:1 relief) as normal bricks at the same Scale — micro just needs ~5×
+        // the integer brick scale because each micro brick is 1/5 the size. This
+        // is what lets a user pick Micro "for nice resolution" without changing
+        // the true-scale geometry.
+        let cell_m = 3.63;
+        let (hs_n, v_n) = derive_scale(cell_m, 4.0, 1.0, false);
+        let (hs_m, v_m) = derive_scale(cell_m, 4.0, 1.0, true);
+        let horiz_n = 2.0 * f64::from(hs_n) * 5.0 / cell_m; // normal units/m
+        let horiz_m = 2.0 * f64::from(hs_m) * 1.0 / cell_m; // micro units/m
+        assert!(
+            (horiz_n - horiz_m).abs() / horiz_n < 0.05,
+            "micro physical scale must match normal within integer rounding: {horiz_n} vs {horiz_m}",
+        );
+        assert!(
+            (f64::from(v_n) - horiz_n).abs() < 1e-3 && (f64::from(v_m) - horiz_m).abs() < 1e-3,
+            "both micro and normal must stay true 1:1",
+        );
+        // Micro reaches FINER scales than normal: at hscale 1 its cell is 1/5 the
+        // footprint, so a very small / detailed model is achievable where normal
+        // bricks floor out.
+        let (hs_fine_n, _) = derive_scale(cell_m, 0.1, 1.0, false);
+        let (hs_fine_m, _) = derive_scale(cell_m, 0.1, 1.0, true);
+        let fine_n = 2.0 * f64::from(hs_fine_n) * 5.0 / cell_m / 5.0; // studs/m floor, normal
+        let fine_m = 2.0 * f64::from(hs_fine_m) * 1.0 / cell_m / 5.0; // studs/m floor, micro
+        assert!(fine_m < fine_n, "micro must reach a finer studs/m floor than normal ({fine_m} < {fine_n})");
+    }
+
+    #[test]
+    fn derive_scale_bigger_studs_per_meter_means_bigger_world_clamped() {
+        let (small, _) = derive_scale(3.63, 1.0, 1.0, false);
+        let (big, _) = derive_scale(3.63, 8.0, 1.0, false);
+        assert!(big > small, "more studs/m must raise horizontal scale ({small} -> {big})");
+        assert_eq!(derive_scale(3.63, 1000.0, 1.0, false).0, MAX_HORIZONTAL_SCALE, "caps at MAX");
+        assert_eq!(derive_scale(3.63, 0.0001, 1.0, false).0, 1, "floors at 1");
+    }
+
+    #[test]
+    fn derive_scale_clamps_on_a_huge_coarse_box() {
+        // The user's report: a ~28 km box forces ~58 m cells (the DEM cell
+        // budget downsamples a big area), so studs_per_meter=4 wants hscale ~580
+        // and clamps to the u16 brick-size ceiling — yielding LARGE bricks (micro
+        // or not) at a much lower achieved scale than requested. Lock that case.
+        let cell_m = 58.0; // ~z11 over a 28 km box at mid latitude
+        let (hs, _) = derive_scale(cell_m, 4.0, 1.0, true);
+        assert_eq!(hs, MAX_HORIZONTAL_SCALE, "coarse cells + 4 studs/m must hit the brick-scale cap");
+        let achieved = 2.0 * f64::from(hs) * 1.0 / cell_m / 5.0; // studs/m
+        assert!(achieved < 1.5, "capped achieved studs/m ~{achieved} is well below the set 4");
+    }
+
+    #[test]
+    fn derive_scale_vertical_stays_under_the_build_clamp() {
+        // TS-1 guard (the regression an earlier 64.0 clamp introduced): the
+        // vertical derive_scale produces must NEVER exceed the build.rs ceiling,
+        // or build_heightmap would silently compress 1:1 / the exaggeration. Sweep
+        // cell_m across the realizable range (fine high-latitude tiles → coarse
+        // OpenTopography) at the control maxima for BOTH brick classes.
+        use crate::gui::build::MAX_VERTICAL_SCALE;
+        const EXAGGERATION_MAX: f32 = 8.0; // matches the slider range below
+        for &cell_m in &[0.4_f64, 3.63, 8.0, 30.0, 120.0] {
+            for &micro in &[false, true] {
+                let (_, v) = derive_scale(cell_m, STUDS_PER_METER_MAX, EXAGGERATION_MAX, micro);
+                assert!(
+                    v < MAX_VERTICAL_SCALE,
+                    "derive_scale vertical {v} (cell_m={cell_m}, micro={micro}) must stay under the \
+                     build clamp {MAX_VERTICAL_SCALE}, else 1:1/exaggeration is silently capped",
+                );
+            }
+        }
+    }
 
     /// Lock down the `walkers::Projector` semantics our bbox math depends on.
     /// `project(p)` returns ABSOLUTE screen coordinates: `project(map_center)`

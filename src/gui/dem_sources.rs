@@ -21,6 +21,14 @@ impl DemSource {
         Self::Usgs3Dep,
     ];
 
+    /// True when this source has a real fetch path (a tile source or the
+    /// OpenTopography REST GeoTIFF). The picker greys the rest as "coming soon"
+    /// so an unwired source can never be selected into a dead state that only
+    /// blocks Fetch — the user's "this option does nothing" complaint.
+    pub(crate) const fn is_fetchable(self) -> bool {
+        !matches!(self, Self::Usgs3Dep)
+    }
+
     pub(crate) const fn display_label(self) -> &'static str {
         match self {
             Self::AwsTerrarium => "AWS Terrarium (free, global, 30m)",
@@ -274,5 +282,22 @@ mod tests {
         // AWS Terrarium is public S3; passing a token must not change behavior.
         assert!(tile_source_for(DemSource::AwsTerrarium, None).is_some());
         assert!(tile_source_for(DemSource::AwsTerrarium, Some("ignored")).is_some());
+    }
+
+    #[test]
+    fn dem_is_fetchable_matches_real_fetch_path() {
+        // is_fetchable() must agree with whether a real fetch path exists, so the
+        // picker greys EXACTLY the sources that cannot fetch (USGS 3DEP) instead
+        // of offering a dead, Fetch-blocking option (the "does nothing" complaint).
+        assert!(!DemSource::Usgs3Dep.is_fetchable(), "USGS 3DEP has no fetch path");
+        for &s in DemSource::ALL {
+            let has_path = matches!(s, DemSource::OpenTopography) // REST GeoTIFF
+                || tile_source_for(s, Some("pk.token")).is_some();
+            assert_eq!(
+                s.is_fetchable(),
+                has_path,
+                "{s:?}: is_fetchable() must match whether a fetch path exists",
+            );
+        }
     }
 }

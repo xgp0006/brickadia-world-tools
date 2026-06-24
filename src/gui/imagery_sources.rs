@@ -21,6 +21,13 @@ impl ImagerySource {
         Self::UsgsOrthoimagery,
     ];
 
+    /// True when this source is a real, selectable choice (`None` or a wired tile
+    /// source). The picker greys the rest as "coming soon" so an unwired source
+    /// can never be selected into a dead state that only blocks Fetch.
+    pub(crate) const fn is_fetchable(self) -> bool {
+        !matches!(self, Self::UsgsOrthoimagery)
+    }
+
     pub(crate) const fn display_label(self) -> &'static str {
         match self {
             Self::None => "None (terrain only, no colormap)",
@@ -186,5 +193,22 @@ mod tests {
     #[test]
     fn usgs_ortho_not_yet_wired() {
         assert!(tile_source_for(ImagerySource::UsgsOrthoimagery, None).is_none());
+    }
+
+    #[test]
+    fn imagery_is_fetchable_matches_real_fetch_path() {
+        // USGS orthoimagery is unwired, so is_fetchable() must be false and the
+        // picker greys it — never a selectable dead option. Every other entry
+        // (incl. the explicit None) is a real, working choice.
+        assert!(!ImagerySource::UsgsOrthoimagery.is_fetchable(), "USGS ortho has no fetch path");
+        for &s in ImagerySource::ALL {
+            let has_path = matches!(s, ImagerySource::None) // valid "skip colormap"
+                || tile_source_for(s, Some("pk.token")).is_some();
+            assert_eq!(
+                s.is_fetchable(),
+                has_path,
+                "{s:?}: is_fetchable() must match whether a fetch path exists",
+            );
+        }
     }
 }

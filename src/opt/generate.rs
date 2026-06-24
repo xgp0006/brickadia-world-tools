@@ -28,29 +28,64 @@ type TaggedQuad = (GreedyQuad, u32, [u8; 4]);
 /// just less merged.
 const MAX_LINEAR_PASSES: u32 = 64;
 
-/// Generate a heightmap with brick conservation optimizations
+/// Generate a heightmap with brick conservation optimizations.
+///
+/// `base_height_override` and `offset` are additive grid-tiling hooks forwarded
+/// to the chosen mesher; passing `(None, None)` reproduces the single-box
+/// behavior exactly (per-tile min fill-floor + origin centering).
 pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
     heightmap: &dyn Heightmap,
     colormap: &dyn Colormap,
     options: GenOptions,
+    base_height_override: Option<u32>,
+    offset: Option<(i32, i32)>,
     progress_f: F,
 ) -> Result<Vec<Brick>, String> {
     // Use greedy mesh if requested
     if options.greedy {
-        return gen_greedy_heightmap(heightmap, colormap, options, progress_f);
+        return gen_greedy_heightmap(
+            heightmap,
+            colormap,
+            options,
+            base_height_override,
+            offset,
+            progress_f,
+        );
     }
 
     // Use quad tree optimization
-    gen_quad_heightmap(heightmap, colormap, options, progress_f)
+    gen_quad_heightmap(
+        heightmap,
+        colormap,
+        options,
+        base_height_override,
+        offset,
+        progress_f,
+    )
 }
 
-/// Generate a heightmap using quadtree optimization
+/// Generate a heightmap using quadtree optimization.
+///
+/// `base_height_override`/`offset` are accepted for signature parity with the
+/// greedy path but the quadtree mesher keeps its own origin-centering and
+/// per-tile fill-floor (`quad.rs::into_bricks`); grid tiling uses the greedy
+/// path exclusively (spec §1, correction #5), so these stay `None` here and the
+/// quadtree output is byte-identical to before.
 pub fn gen_quad_heightmap<F: Fn(f32) -> bool>(
     heightmap: &dyn Heightmap,
     colormap: &dyn Colormap,
     options: GenOptions,
+    base_height_override: Option<u32>,
+    offset: Option<(i32, i32)>,
     progress_f: F,
 ) -> Result<Vec<Brick>, String> {
+    // Grid tiling never routes through the quadtree path; assert the contract so
+    // a future caller that wires tiling here can't silently get un-offset output.
+    debug_assert!(
+        base_height_override.is_none() && offset.is_none(),
+        "gen_quad_heightmap does not support grid base/offset overrides; use the greedy path",
+    );
+    let _ = (base_height_override, offset);
     macro_rules! progress {
         ($e:expr) => {
             if !progress_f($e) {
@@ -214,11 +249,23 @@ fn optimize_linear<F: Fn(f32) -> bool>(
     Ok(linear_opt_duration)
 }
 
-/// Generate a heightmap using greedy mesh optimization for each height level
+/// Generate a heightmap using greedy mesh optimization for each height level.
+///
+/// `base_height_override`: when `Some(b)`, every column fills down to brick
+/// height `b` instead of the per-tile present minimum — grid mode passes
+/// `Some(0)` so all tiles share one global floor. `None` reproduces the
+/// single-box behavior (floor = this map's minimum height).
+///
+/// `offset`: when `Some((dx, dy))`, the meshed bricks are placed at that world
+/// offset (units) instead of being centered on the origin — grid mode passes a
+/// per-tile world offset so tiles abut. `None` defaults to exactly
+/// `-(width*size), -(height*size)`, byte-identical to the prior centering.
 pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     heightmap: &dyn Heightmap,
     colormap: &dyn Colormap,
     options: GenOptions,
+    base_height_override: Option<u32>,
+    offset: Option<(i32, i32)>,
     progress_f: F,
 ) -> Result<Vec<Brick>, String> {
     macro_rules! progress {
@@ -238,6 +285,14 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     }
 
     let pairs_vec = collect_height_color_pairs(heightmap, colormap, options.cull);
+    // Lowest height present, used as the common base plane each terrain column
+    // fills down to (see quads_to_bricks). With cull off (the terrain path) this
+    // is the true grid minimum; with cull on (img2brick) it is the min non-zero
+    // height, which is moot because img mode keeps the flat per-pixel height.
+    // Grid mode overrides this with a global floor (Some(0)) so all tiles fill to
+    // the same base; None reproduces the single-box per-tile minimum exactly.
+    let min_height = base_height_override
+        .unwrap_or_else(|| pairs_vec.iter().map(|(h, _)| *h).min().unwrap_or(0));
 
     let (planes_with_metadata, plane_build_duration) =
         build_planes(heightmap, colormap, options.cull, pairs_vec);
@@ -249,8 +304,15 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
         mesh_planes(planes_with_metadata, width, height, max_quad_size);
     progress!(0.7);
 
-    let (all_bricks, brick_build_duration) =
-        quads_to_bricks(all_quads, &options, width, height, &progress_f)?;
+    let (all_bricks, brick_build_duration) = quads_to_bricks(
+        all_quads,
+        &options,
+        width,
+        height,
+        min_height,
+        offset,
+        &progress_f,
+    )?;
 
     log_total_time(
         "greedy mesh",
@@ -372,27 +434,50 @@ fn quads_to_bricks<F: Fn(f32) -> bool>(
     options: &GenOptions,
     width: u32,
     height: u32,
+    min_height: u32,
+    offset: Option<(i32, i32)>,
     progress_f: &F,
 ) -> Result<(Vec<Brick>, Duration), String> {
     let start = Instant::now();
     let mut all_bricks = Vec::new();
     let total_quads = all_quads.len();
 
-    // Calculate offsets to center the bricks
-    let offset_x = -(width as i32 * options.size as i32);
-    let offset_y = -(height as i32 * options.size as i32);
+    // World placement offset (units). Grid mode passes a per-tile world offset so
+    // tiles abut; single-box passes None and falls back to the origin-centering
+    // this function used to compute internally — byte-identical to before.
+    let (offset_x, offset_y) = offset.unwrap_or((
+        -(width as i32 * options.size as i32),
+        -(height as i32 * options.size as i32),
+    ));
 
     for (idx, (quad, h, color)) in all_quads.into_iter().enumerate() {
         if idx % 1000 == 0 && !progress_f(0.7 + 0.25 * (idx as f32 / total_quads as f32)) {
             return Err(CANCELLED_MSG.to_string());
         }
 
+        // When fill_to_base is requested (the Map tab), a terrain column fills
+        // from its height DOWN to the common base plane `min_height`, so the
+        // surface is solid and watertight — a cell 50 units above its neighbor is
+        // a 25-unit riser to the base, not a 2-unit tile floating with a
+        // fall-through gap underneath. The `*scale/2` matches the half-unit z
+        // step (emit_column_bricks does `z -= brick_height*2`); unlike the
+        // quadtree path (quad.rs into_bricks), which fills only to each tile's
+        // nearest-neighbor floor, this fills to the GLOBAL min for one watertight
+        // base. Off (Convert tab / CLI, or any img2brick build) keeps the legacy
+        // flat 2-unit block — those heights are un-normalized / unbounded, and
+        // img mode holds position Z constant so a tall fill would overlap.
+        let desired_height = if options.fill_to_base && !options.img {
+            (((h as i32 - min_height as i32).max(0)) * options.scale as i32 / 2).max(2)
+        } else {
+            (options.scale * 2) as i32
+        };
+
         emit_column_bricks(
             &mut all_bricks,
             options,
             BrickColumn {
                 z: (options.scale * h) as i32,
-                desired_height: (options.scale * 2) as i32,
+                desired_height,
                 size_x: quad.w as u16 * options.size,
                 size_y: quad.h as u16 * options.size,
                 pos_x: quad.x as i32 * options.size as i32 * 2
@@ -510,6 +595,7 @@ mod tests {
             nocollide: false,
             quadtree: false,
             greedy: true,
+            fill_to_base: false,
         }
     }
 
@@ -517,6 +603,121 @@ mod tests {
         match &brick.asset {
             BrickType::Procedural { size, .. } => size.z,
             other => panic!("expected procedural brick, got {other:?}"),
+        }
+    }
+
+    /// Procedural footprint+height of a brick, for position-independent equality
+    /// (`Brick` derives no `PartialEq`, so we compare the load-bearing fields the
+    /// offset/centering actually drive).
+    fn brick_geom(b: &Brick) -> (Position, BrickSize) {
+        match &b.asset {
+            BrickType::Procedural { size, .. } => (b.position, *size),
+            other => panic!("expected procedural brick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_box_offset_unchanged() {
+        // The `offset = None` default of quads_to_bricks must reproduce the
+        // centering the function used to compute internally
+        // (`-(width*size), -(height*size)`) byte-for-byte. A fixed quad set is
+        // meshed twice — once with None, once with the explicit centered offset —
+        // and the two outputs must be identical position-and-size. This locks the
+        // single-box identity guarantee against the grid-offset refactor.
+        let options = test_options(false);
+        let (width, height) = (8u32, 6u32);
+        let quads: Vec<TaggedQuad> = vec![
+            (GreedyQuad { x: 0, y: 0, w: 3, h: 2 }, 10, [1, 2, 3, 255]),
+            (GreedyQuad { x: 3, y: 0, w: 2, h: 4 }, 40, [4, 5, 6, 255]),
+            (GreedyQuad { x: 5, y: 2, w: 3, h: 3 }, 7, [7, 8, 9, 255]),
+        ];
+
+        let (from_none, _) =
+            quads_to_bricks(quads.clone(), &options, width, height, 0, None, &|_| true)
+                .expect("None offset must mesh");
+
+        let centered = (
+            -(width as i32 * options.size as i32),
+            -(height as i32 * options.size as i32),
+        );
+        let (from_explicit, _) = quads_to_bricks(
+            quads,
+            &options,
+            width,
+            height,
+            0,
+            Some(centered),
+            &|_| true,
+        )
+        .expect("explicit centered offset must mesh");
+
+        assert_eq!(
+            from_none.len(),
+            from_explicit.len(),
+            "None and explicit-centered offsets must emit the same brick count",
+        );
+        assert!(!from_none.is_empty(), "fixture must emit bricks");
+        let none_geom: Vec<_> = from_none.iter().map(brick_geom).collect();
+        let explicit_geom: Vec<_> = from_explicit.iter().map(brick_geom).collect();
+        assert_eq!(
+            none_geom, explicit_geom,
+            "offset=None must be byte-identical to the prior internal centering",
+        );
+
+        // Independently confirm the centering matches the documented formula on
+        // the first quad's first brick (guards against both paths sharing a bug).
+        // First quad is at (x=0, y=0, w=3, h=2): pos = quad*size*2 + dim*size +
+        // offset; the x*size*2 / y*size*2 terms are 0 here (quad origin).
+        let size = options.size as i32;
+        let first = &from_none[0];
+        assert_eq!(
+            first.position.x,
+            3 * size + centered.0,
+            "centered pos_x must follow the quad/offset formula",
+        );
+        assert_eq!(
+            first.position.y,
+            2 * size + centered.1,
+            "centered pos_y must follow the quad/offset formula",
+        );
+    }
+
+    #[test]
+    fn explicit_offset_translates_by_delta() {
+        // Grid mode passes a per-tile world offset; emitted positions must shift
+        // by exactly the difference between two offsets (pure translation), which
+        // is what makes tiles abut at integer pitch.
+        let options = test_options(false);
+        let (width, height) = (4u32, 4u32);
+        let quads: Vec<TaggedQuad> =
+            vec![(GreedyQuad { x: 1, y: 1, w: 2, h: 2 }, 12, [9, 9, 9, 255])];
+
+        let (base, _) = quads_to_bricks(
+            quads.clone(),
+            &options,
+            width,
+            height,
+            0,
+            Some((0, 0)),
+            &|_| true,
+        )
+        .expect("mesh at origin offset");
+        let (shifted, _) = quads_to_bricks(
+            quads,
+            &options,
+            width,
+            height,
+            0,
+            Some((1000, -2000)),
+            &|_| true,
+        )
+        .expect("mesh at shifted offset");
+
+        assert_eq!(base.len(), shifted.len());
+        for (b, s) in base.iter().zip(&shifted) {
+            assert_eq!(s.position.x, b.position.x + 1000);
+            assert_eq!(s.position.y, b.position.y - 2000);
+            assert_eq!(s.position.z, b.position.z, "offset must not touch Z");
         }
     }
 

@@ -111,6 +111,9 @@ fn options_from_matches(matches: &ArgMatches) -> GenOptions {
         nocollide: matches.get_flag("nocollide"),
         quadtree: true,
         greedy: matches.get_flag("greedy"),
+        // CLI keeps the legacy flat surface; base-fill is a Map-tab feature
+        // (its heights are normalized and brick-capped). Unchanged here.
+        fill_to_base: false,
     }
 }
 
@@ -145,7 +148,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let bricks = match gen_opt_heightmap(&*heightmap, &*colormap, options, |_| true) {
+    let bricks = match gen_opt_heightmap(&*heightmap, &*colormap, options, None, None, |_| true) {
         Ok(bricks) => bricks,
         Err(err) => {
             error!(
