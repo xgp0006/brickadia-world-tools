@@ -25,7 +25,7 @@ use crate::gui::build::{self, BuildError, BuildOutcome, BuildStage};
 use crate::gui::theme::{STATUS_ERROR_FG, STATUS_WARN_FG};
 
 use super::brush::{Brush, BrushShape, Falloff};
-use super::convert::{convert_heightfield, OutputOptions};
+use super::convert::{convert_heightfield, convert_heightfield_tiled, OutputOptions};
 use super::heightfield::{FieldMeta, HeightField, FLOOR_M};
 use super::tools::{Flatten, Lower, Raise, SetHeight, Smooth, Tool};
 
@@ -45,6 +45,124 @@ const BRUSH_ANIM_SPEED: f32 = 80.0;
 const DEFAULT_CANVAS_W: u32 = 256;
 const DEFAULT_CANVAS_H: u32 = 256;
 const DEFAULT_CELL_M: f64 = 4.0;
+
+/// Default scale knobs for a blank canvas / image / send-from-map seed when the
+/// source carries none — a faithful 1:1 map build at a walkable studs/m.
+const DEFAULT_STUDS_PER_METER: f32 = 4.0;
+const DEFAULT_VERTICAL_EXAGGERATION: f32 = 1.0;
+/// Default sub-field edge length (cells) for a manually-tiled export — the
+/// initial `tile_cells` until the user retunes it.
+const DEFAULT_TILE_CELLS: u32 = 256;
+
+/// Fine/coarse step multipliers for [`modifier_step`] (spec §2). Ctrl makes a
+/// DragValue ten-times finer, Alt ten-times coarser, none leaves the base.
+const MODIFIER_FINE: f64 = 0.1;
+const MODIFIER_COARSE: f64 = 10.0;
+
+/// Per-frame keyboard-modifier state read for the DragValue step scaling. A pure
+/// value so [`modifier_step`] is testable without an egui context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DragModifiers {
+    ctrl: bool,
+    alt: bool,
+}
+
+/// Choose the step multiplier for a hovered [`egui::DragValue`] from the held
+/// modifiers (spec §2). **Ctrl = fine (×0.1)**, **Alt = coarse (×10)**, none =
+/// base (×1.0). Precedence when BOTH are held: **Ctrl wins** (fine) — fine
+/// adjustment is the safer default when a user fumbles both, and it keeps the
+/// rule a simple "Ctrl ⇒ fine" the muscle memory can rely on. Pure so the
+/// selection logic is unit-tested directly.
+fn modifier_step(m: DragModifiers) -> f64 {
+    if m.ctrl {
+        MODIFIER_FINE
+    } else if m.alt {
+        MODIFIER_COARSE
+    } else {
+        1.0
+    }
+}
+
+/// Which level a sampled eyedropper height (meters) is routed into (spec §3).
+/// The active keyboard modifier at click time selects the destination: a plain
+/// click sets the Flatten/Set target, Alt the floor level, Ctrl the omit level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickTarget {
+    /// Plain click → the Flatten/Set `target_height`.
+    Target,
+    /// Alt-click → `floor_level_m` (the base plane).
+    Floor,
+    /// Ctrl-click → `omit_below_m` (the omit-water level).
+    Omit,
+}
+
+/// Route an eyedropper sample by the held modifiers (spec §3): **plain ⇒
+/// target**, **Alt ⇒ floor**, **Ctrl ⇒ omit**. Precedence when BOTH are held:
+/// **Ctrl wins** (omit) — mirroring [`modifier_step`]'s "Ctrl wins" rule so the
+/// whole UI shares one modifier precedence. Pure so the routing is unit-tested
+/// directly without an egui context.
+fn pick_target(m: DragModifiers) -> PickTarget {
+    if m.ctrl {
+        PickTarget::Omit
+    } else if m.alt {
+        PickTarget::Floor
+    } else {
+        PickTarget::Target
+    }
+}
+
+/// A [`egui::DragValue`] whose drag speed scales with the held keyboard
+/// modifiers while the widget is hovered (spec §2): Ctrl ⇒ fine (×0.1), Alt ⇒
+/// coarse (×10), none ⇒ `base_speed`. `range` clamps the value. Applied to every
+/// numeric DragValue in the Sculpt/Export UI so one rule governs all of them.
+///
+/// The step is read from the live `ui.input` modifiers every frame, but egui
+/// only applies a `DragValue`'s `speed` while that widget is being DRAGGED, so a
+/// widget that isn't actively dragged keeps its base behavior regardless.
+fn modifier_drag<N: egui::emath::Numeric>(
+    ui: &mut Ui,
+    value: &mut N,
+    base_speed: f64,
+    range: std::ops::RangeInclusive<N>,
+) -> egui::Response {
+    let mods = ui.input(|i| i.modifiers);
+    let step = modifier_step(DragModifiers { ctrl: mods.ctrl, alt: mods.alt });
+    ui.add(egui::DragValue::new(value).range(range).speed(base_speed * step))
+}
+
+/// Effective value-box drag speed for a [`modifier_slider`] given the held
+/// modifiers: `base_speed` scaled by [`modifier_step`] (Ctrl ⇒ ×0.1, Alt ⇒ ×10,
+/// none ⇒ ×1). Pure so the brush sliders' modifier scaling is unit-tested
+/// directly — the same selection rule `modifier_drag` applies to a DragValue.
+fn slider_drag_speed(base_speed: f64, m: DragModifiers) -> f64 {
+    base_speed * modifier_step(m)
+}
+
+/// An [`egui::Slider`] whose draggable value-box honors the F2 modifier scaling
+/// (spec §2 / DoD §8 "every numeric slider"): while a modifier is held, the
+/// value box's drag speed is `base_speed` scaled by [`modifier_step`] — Ctrl ⇒
+/// fine (×0.1), Alt ⇒ coarse (×10), none ⇒ base. The slider TRACK is kept (so
+/// the brush radius/strength stay one-drag controls), and dragging the value box
+/// to its right gives the modifier-aware fine/coarse adjustment that the
+/// DragValue controls already provide. `base_speed` is the per-point step the
+/// value box uses at ×1.
+fn modifier_slider<N: egui::emath::Numeric>(
+    ui: &mut Ui,
+    value: &mut N,
+    range: std::ops::RangeInclusive<N>,
+    base_speed: f64,
+    text: &str,
+    logarithmic: bool,
+) -> egui::Response {
+    let mods = ui.input(|i| i.modifiers);
+    let speed = slider_drag_speed(base_speed, DragModifiers { ctrl: mods.ctrl, alt: mods.alt });
+    ui.add(
+        egui::Slider::new(value, range)
+            .text(text)
+            .logarithmic(logarithmic)
+            .drag_value_speed(speed),
+    )
+}
 
 /// The five MVP height tools, as a UI-dispatchable enum. Each maps to a [`Tool`]
 /// impl in `tools.rs`; color/scatter tools (future MVPs) extend the same trait.
@@ -194,6 +312,54 @@ pub(crate) struct SculptState {
     new_cell_m: f64,
     output_name: String,
     out: OutputOptions,
+    /// Studs of brick width per real meter (the horizontal play-scale knob) the
+    /// Export panel drives into the convert's [`FieldMeta`]. A blank canvas /
+    /// image seeds it from here; a DEM/send-from-map seeds it from the source
+    /// (then the panel can retune). Replaces the old hardcoded `blank_meta` 4.0.
+    studs_per_meter: f32,
+    /// Vertical exaggeration multiplier (1.0 = faithful 1:1 relief) the Export
+    /// panel drives into the convert's [`FieldMeta`]. Replaces the old hardcoded
+    /// `blank_meta` 1.0.
+    vertical_exaggeration: f32,
+    /// Micro-brick mode (fine detail) the Export panel drives into the convert's
+    /// [`FieldMeta`]; mirrors `BlockType::Micro`. Replaces the hardcoded
+    /// `blank_meta` `false`.
+    micro: bool,
+    /// Manual grid-tiled export toggle (spec §5). Default off = single mesh.
+    /// On routes the convert through `convert_heightfield_tiled`, which
+    /// subdivides the field into shared-edge sub-fields stitched into one save.
+    tile_export: bool,
+    /// Sub-field edge length (cells) for a tiled export — drives the tile count
+    /// and per-tile budget of `convert_heightfield_tiled`.
+    tile_cells: u32,
+    /// Base plane (meters above the field floor) terrain fills DOWN to. Maps to
+    /// `convert_heightfield`'s `floor_level_m` → brick-Z `base_override`. Default
+    /// `0.0` keeps today's floor (base plane at brick-Z 0). The Export panel
+    /// binds a DragValue + eyedropper to this.
+    floor_level_m: f32,
+    /// Omit level (meters): a column whose source height (m) is at or below it
+    /// emits no bricks — native floor / "omit water". Maps to
+    /// `convert_heightfield`'s `omit_below_m`. Default `0.0` drops only true-floor
+    /// columns (byte-identical to the prior skip).
+    omit_below_m: f32,
+    /// Eyedropper height-picker mode (spec §3). When on, a primary click on the
+    /// canvas samples the hovered cell's height (meters) and routes it by the
+    /// held modifier (plain → target, Alt → floor, Ctrl → omit) instead of
+    /// laying a brush dab — pick mode SUPPRESSES brush painting so the two never
+    /// fire on the same click. Toggled from the Export panel; default off.
+    pick_mode: bool,
+    /// The last height sampled by the eyedropper (meters above floor), shown as a
+    /// small on-canvas readout. `None` until the first pick.
+    last_pick: Option<f32>,
+    /// Cached available-RAM bytes for the Export estimate's button gate + GiB
+    /// readout, refreshed on a coarse cadence (see [`refresh_available_ram`])
+    /// instead of every frame — a per-frame `/proc/meminfo` scan is wasted sync
+    /// file I/O when sub-second staleness can't change a gate the user only acts
+    /// on at click time.
+    available_ram: u64,
+    /// egui frame time (seconds since start) of the last `available_ram` refresh,
+    /// or `None` before the first one. Throttles the refresh to ~once a second.
+    ram_refreshed_at: Option<f64>,
 
     // Convert worker (same Promise pattern as the Map tab).
     convert_promise: Option<Promise<Result<BuildOutcome, BuildError>>>,
@@ -232,6 +398,19 @@ impl Default for SculptState {
             new_cell_m: DEFAULT_CELL_M,
             output_name: "sculpt".to_string(),
             out: OutputOptions::default(),
+            studs_per_meter: DEFAULT_STUDS_PER_METER,
+            vertical_exaggeration: DEFAULT_VERTICAL_EXAGGERATION,
+            micro: false,
+            tile_export: false,
+            tile_cells: DEFAULT_TILE_CELLS,
+            floor_level_m: 0.0,
+            omit_below_m: 0.0,
+            pick_mode: false,
+            last_pick: None,
+            // Seed generous so a pre-first-refresh gate never blocks; the first
+            // panel draw refreshes it from the live figure.
+            available_ram: u64::MAX,
+            ram_refreshed_at: None,
             convert_promise: None,
             convert_progress: Arc::new(Mutex::new((BuildStage::GeneratingBricks, 0.0))),
             convert_cancel: Arc::new(AtomicBool::new(false)),
@@ -248,7 +427,15 @@ impl SculptState {
 
     /// Load a field into the tab (from Send-to-Sculpt or a fresh canvas/image),
     /// resetting view + history. Marks dirty so the texture rebuilds.
+    ///
+    /// Seeds the Export-panel scale knobs from the incoming field's metadata so a
+    /// DEM / send-from-map field primes the panel with the source's studs/m ·
+    /// exaggeration · micro (the user can then retune); a blank canvas / image
+    /// carries the panel's own current values back in (round-trip stable).
     pub(crate) fn set_field(&mut self, field: HeightField) {
+        self.studs_per_meter = field.meta.studs_per_meter;
+        self.vertical_exaggeration = field.meta.vertical_exaggeration;
+        self.micro = field.meta.micro;
         self.field = Some(field);
         self.dirty = true;
         // A new field invalidates the cached extent and any partial dirty rect:
@@ -301,17 +488,32 @@ impl SculptState {
     pub(crate) fn cancel_convert(&self) {
         self.convert_cancel.store(true, Ordering::Relaxed);
     }
+
+    /// Store an eyedropper sample (meters) into the level its [`PickTarget`]
+    /// selects (spec §3): the Flatten/Set target, the floor level, or the omit
+    /// level. Also records it as the `last_pick` for the on-canvas readout. Pure
+    /// state mutation (no egui), so the routing is unit-testable directly.
+    fn apply_pick(&mut self, target: PickTarget, meters: f32) {
+        match target {
+            PickTarget::Target => self.target_height = meters,
+            PickTarget::Floor => self.floor_level_m = meters,
+            PickTarget::Omit => self.omit_below_m = meters,
+        }
+        self.last_pick = Some(meters);
+    }
 }
 
-/// Blank-canvas metadata: a sane default scale for an authored-from-scratch
-/// field. The pitch comes from the New-canvas control; the rest mirror a
-/// faithful 1:1 map build at a walkable scale.
-fn blank_meta(cell_m: f64) -> FieldMeta {
+/// Blank-canvas / image metadata seeded from the Export-panel scale state. The
+/// pitch comes from the New-canvas control; `studs_per_meter` /
+/// `vertical_exaggeration` / `micro` come from the panel (no longer hardcoded
+/// 4.0 / 1.0 / false) so a blank canvas reaches true 1:1 and any relief the user
+/// dials. `source_name` is overwritten at convert time from the output-name box.
+fn blank_meta(state: &SculptState, cell_m: f64) -> FieldMeta {
     FieldMeta {
         cell_m,
-        studs_per_meter: 4.0,
-        vertical_exaggeration: 1.0,
-        micro: false,
+        studs_per_meter: state.studs_per_meter,
+        vertical_exaggeration: state.vertical_exaggeration,
+        micro: state.micro,
         centroid_lat: 0.0,
         source_name: "sculpt".to_string(),
     }
@@ -354,9 +556,9 @@ fn draw_controls(state: &mut SculptState, ui: &mut Ui) {
     ui.add_space(8.0);
     draw_history_section(state, ui);
     ui.add_space(8.0);
-    draw_output_section(state, ui);
+    let estimate = draw_export_section(state, ui);
     ui.add_space(8.0);
-    draw_convert_section(state, ui);
+    draw_convert_section(state, ui, estimate);
     ui.add_space(6.0);
     draw_last_result(state, ui);
 }
@@ -365,38 +567,31 @@ fn draw_new_canvas_section(state: &mut SculptState, ui: &mut Ui) {
     ui.collapsing("New / load", |ui| {
         ui.horizontal(|ui| {
             ui.label("Width");
-            ui.add(egui::DragValue::new(&mut state.new_w).range(2..=4096).speed(1.0));
+            modifier_drag(ui, &mut state.new_w, 1.0, 2..=4096);
             ui.label("Height");
-            ui.add(egui::DragValue::new(&mut state.new_h).range(2..=4096).speed(1.0));
+            modifier_drag(ui, &mut state.new_h, 1.0, 2..=4096);
         });
         ui.horizontal(|ui| {
             ui.label("Cell size (m)");
-            ui.add(
-                egui::DragValue::new(&mut state.new_cell_m)
-                    .range(0.1..=1000.0)
-                    .speed(0.1),
-            );
+            modifier_drag(ui, &mut state.new_cell_m, 0.1, 0.1..=1000.0);
         });
-        // Guard the cell budget the converter enforces, so a too-big canvas is
-        // refused at creation rather than failing only at Convert.
-        let cells = u64::from(state.new_w) * u64::from(state.new_h);
-        let over = cells > crate::gui::tiles::MAX_DEM_CELLS;
-        if over {
-            ui.colored_label(
-                STATUS_WARN_FG,
-                format!(
-                    "{cells} cells exceeds the {} budget — shrink the canvas.",
-                    crate::gui::tiles::MAX_DEM_CELLS
-                ),
-            );
-        }
-        if ui.add_enabled(!over, egui::Button::new("New blank canvas")).clicked() {
-            let meta = blank_meta(state.new_cell_m);
+        // No creation-time cell cap: a blank canvas is meant to grow into a big
+        // detailed world, which the Export panel handles by tiling (the live
+        // estimate's MAX_BRICKS / MAX_GRID_BRICKS + RAM gate remedies an oversized
+        // export via "Tile this export"). The DragValue 2..=4096 range above is the
+        // only sane bound; the per-tile/per-mesh `enforce_cell_budget` still guards
+        // each tile at Convert.
+        if ui.button("New blank canvas").clicked() {
+            let meta = blank_meta(state, state.new_cell_m);
             state.set_field(HeightField::flat(state.new_w, state.new_h, meta));
         }
         if ui.button("Load heightmap image…").clicked() {
             load_heightmap_image(state);
         }
+        ui.small(
+            "Large canvases are intended to be tiled at export — see “Tile this \
+             export” in the Export panel.",
+        );
     });
 }
 
@@ -415,28 +610,24 @@ fn draw_tool_section(state: &mut SculptState, ui: &mut Ui) {
     if matches!(state.tool, SculptTool::Flatten | SculptTool::Set) {
         ui.horizontal(|ui| {
             ui.label("Target height (m)");
-            ui.add(
-                egui::DragValue::new(&mut state.target_height)
-                    .range(0.0..=100_000.0)
-                    .speed(0.5),
-            );
+            modifier_drag(ui, &mut state.target_height, 0.5, 0.0..=100_000.0);
         });
     }
 }
 
 fn draw_brush_section(state: &mut SculptState, ui: &mut Ui) {
     ui.label("Brush");
-    ui.add(
-        egui::Slider::new(&mut state.brush.radius_cells, 1.0..=200.0)
-            .text("radius (cells)")
-            .logarithmic(true),
-    );
+    // Radius/strength keep the slider track but route the value-box drag through
+    // the F2 modifier scaling (spec §2 / DoD §8): Ctrl ⇒ fine, Alt ⇒ coarse.
+    modifier_slider(ui, &mut state.brush.radius_cells, 1.0..=200.0, 0.2, "radius (cells)", true);
     let strength_range = if state.tool.strength_is_blend() {
         0.0..=1.0
     } else {
         0.0..=200.0
     };
-    ui.add(egui::Slider::new(&mut state.brush.strength, strength_range).text("strength"));
+    // Blend tools live in 0..=1 (fine base step); meter tools in 0..=200.
+    let strength_base = if state.tool.strength_is_blend() { 0.005 } else { 0.2 };
+    modifier_slider(ui, &mut state.brush.strength, strength_range, strength_base, "strength", false);
     ui.horizontal(|ui| {
         ui.label("Falloff");
         ui.selectable_value(&mut state.brush.falloff, Falloff::Smoothstep, "Smooth");
@@ -456,26 +647,287 @@ fn draw_history_section(state: &mut SculptState, ui: &mut Ui) {
     });
 }
 
-fn draw_output_section(state: &mut SculptState, ui: &mut Ui) {
-    ui.label("Output name");
-    ui.add(
-        TextEdit::singleline(&mut state.output_name)
-            .hint_text("sculpt")
-            .desired_width(260.0),
-    );
-    ui.checkbox(&mut state.out.brdb, "World (.brdb → Worlds/)");
-    ui.checkbox(&mut state.out.brz, "Prefab (.brz → Prefabs/)");
-    ui.checkbox(&mut state.out.install_to_brickadia, "Install into Brickadia");
-    ui.checkbox(&mut state.out.overwrite, "Overwrite existing");
-    ui.checkbox(&mut state.out.skip_floor, "Skip flat floor (reveal native ground)")
-        .on_hover_text(
-            "On (default for sculpt): flat (zero-height) areas emit no bricks, so the native \
-             Brickadia floor shows through. Off: a watertight base plate is built under \
-             everything (matches a direct Map build).",
-        );
+/// A cheap, PURE single-mesh export estimate (spec §1, "Live estimate"). The
+/// greedy mesher emits at most one brick per non-floor column, so `est_bricks`
+/// is the conservative cell-count ceiling; peak RAM reuses the grid pipeline's
+/// own calibration (`est_tile_mesh_bytes` + `BRICK_OWNED_BYTES` ×
+/// `WRITE_PEAK_FACTOR` for the single combined write). `fits_ram` holds the
+/// working set under `available - RAM_RESERVE_BYTES`; `over_brick_cap` flags a
+/// field whose ceiling exceeds the per-mesh [`build::MAX_BRICKS`]. This
+/// single-mesh figure is what the panel gates on when tiling is off;
+/// [`tiled_estimate`] (which subdivides the field) governs the tiled path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExportEstimate {
+    est_bricks: u64,
+    peak_bytes: u64,
+    over_brick_cap: bool,
+    fits_ram: bool,
+    /// Tiles the export will produce: `1` for a single mesh, or
+    /// `ceil(w/tile)·ceil(h/tile)` for the grid-tiled path. Surfaced in the
+    /// readout so the user sees the subdivision a tiled export will perform.
+    tile_count: u32,
 }
 
-fn draw_convert_section(state: &mut SculptState, ui: &mut Ui) {
+/// Compute the single-mesh estimate for a `cells`-cell field. `available_ram` is
+/// injected (the live `/proc/meminfo` read happens at the call site) so this stays
+/// a pure, testable function. Mirrors `estimate_grid`'s memory model for ONE tile:
+/// the mesh peak plus the write-peak brick vec, with no resident multi-tile
+/// raster set (a single mesh holds just its own raster, already counted in the
+/// mesh-bytes model).
+fn single_mesh_estimate(cells: u64, available_ram: u64) -> ExportEstimate {
+    use crate::gui::grid::{
+        BRICK_OWNED_BYTES, RAM_RESERVE_BYTES, WRITE_PEAK_FACTOR, est_tile_mesh_bytes,
+    };
+    let est_bricks = cells; // greedy mesh ceiling: ≤ 1 brick/non-floor column
+    let mesh_bytes = est_tile_mesh_bytes(cells, false); // sculpt uses a flat colormap
+    let write_vec_bytes = est_bricks
+        .saturating_mul(BRICK_OWNED_BYTES)
+        .saturating_mul(WRITE_PEAK_FACTOR);
+    let peak_bytes = mesh_bytes.saturating_add(write_vec_bytes);
+    let over_brick_cap = est_bricks > build::MAX_BRICKS as u64;
+    let budget = available_ram.saturating_sub(RAM_RESERVE_BYTES);
+    let fits_ram = peak_bytes <= budget && !over_brick_cap;
+    ExportEstimate { est_bricks, peak_bytes, over_brick_cap, fits_ram, tile_count: 1 }
+}
+
+/// Tiles along one axis for a `tile_cells`-cell grid-tiled export: shared-edge
+/// sub-fields step by `tile_cells` cells, so `ceil(extent / tile_cells)` tiles
+/// (always ≥ 1). Mirrors `convert::tile_bounds`'s count without allocating —
+/// the single source of truth for the readout's tile figure.
+fn tiles_on_axis(extent: u32, tile_cells: u32) -> u32 {
+    extent.max(1).div_ceil(tile_cells.max(1))
+}
+
+/// Compute the grid-tiled estimate (spec §1 + §5): a `w × h` field split into
+/// `ceil(w/tile)·ceil(h/tile)` shared-edge sub-fields stitched into ONE save.
+/// Reuses `estimate_grid`'s memory model — the peak working set is ONE tile's
+/// mesh (meshing is sequential) plus the stitched write-vec over the aggregate
+/// brick count — and the aggregate cap is `MAX_GRID_BRICKS` (NOT the per-mesh
+/// `MAX_BRICKS`, since exceeding it is the whole point of tiling). `available_ram`
+/// is injected so this stays pure and testable.
+fn tiled_estimate(width: u32, height: u32, tile_cells: u32, available_ram: u64) -> ExportEstimate {
+    use crate::gui::grid::{
+        BRICK_OWNED_BYTES, RAM_RESERVE_BYTES, WRITE_PEAK_FACTOR, est_tile_mesh_bytes,
+    };
+    let cols = tiles_on_axis(width, tile_cells);
+    let rows = tiles_on_axis(height, tile_cells);
+    let tile_count = cols.saturating_mul(rows);
+
+    // Aggregate brick ceiling: ≤ 1 brick / field cell (the shared edge cells add
+    // a thin duplicate seam, conservatively folded into the per-tile ceiling
+    // below). The field's own cell count bounds the union from below; the tiled
+    // sum (with shared edges) is the honest aggregate the stitch produces.
+    let body = u64::from(tile_cells.max(1)) + 1; // shared-edge tile width on an axis
+    let per_tile_cells = body.saturating_mul(body);
+    let est_bricks = per_tile_cells.saturating_mul(u64::from(tile_count));
+
+    // Peak RAM: one tile's mesh (sequential meshing) + the stitched write-vec
+    // over the aggregate brick count (bricks_to_save runs once at the end).
+    let mesh_bytes = est_tile_mesh_bytes(per_tile_cells, false);
+    let write_vec_bytes = est_bricks
+        .saturating_mul(BRICK_OWNED_BYTES)
+        .saturating_mul(WRITE_PEAK_FACTOR);
+    let peak_bytes = mesh_bytes.saturating_add(write_vec_bytes);
+
+    // Tiling's cap is the AGGREGATE MAX_GRID_BRICKS, not the per-mesh MAX_BRICKS.
+    let over_brick_cap = est_bricks > build::MAX_GRID_BRICKS as u64;
+    let budget = available_ram.saturating_sub(RAM_RESERVE_BYTES);
+    let fits_ram = peak_bytes <= budget && !over_brick_cap;
+    ExportEstimate { est_bricks, peak_bytes, over_brick_cap, fits_ram, tile_count }
+}
+
+/// Refresh `state.available_ram` from the live `/proc/meminfo` figure on a coarse
+/// cadence: on the first call (no prior refresh) and then throttled to at most
+/// once per second, using egui's frame clock (`ui.input(|i| i.time)`, no
+/// wall-clock `Date::now`). Sub-second staleness can't change the button gate the
+/// user only acts on at click time, so this replaces the per-frame sync file read.
+/// A read failure falls back to a generous figure so the gate never blocks on it.
+fn refresh_available_ram(state: &mut SculptState, ui: &Ui) {
+    const REFRESH_INTERVAL_S: f64 = 1.0;
+    let now = ui.input(|i| i.time);
+    let stale = state.ram_refreshed_at.is_none_or(|last| now - last >= REFRESH_INTERVAL_S);
+    if stale {
+        state.available_ram = crate::gui::grid::available_ram_bytes().unwrap_or(u64::MAX);
+        state.ram_refreshed_at = Some(now);
+    }
+}
+
+/// The collapsing "Export" section (spec §1): scale knobs that drive `FieldMeta`,
+/// a micro toggle, formats + install + overwrite, floor/omit levels, the manual
+/// tiling toggle + size, and a live brick/RAM estimate. Returns the estimate so
+/// the convert section can gate its button on it.
+fn draw_export_section(state: &mut SculptState, ui: &mut Ui) -> ExportEstimate {
+    let dims = state.field.as_ref().map_or((0, 0), |f| (f.width, f.height));
+    let cells = u64::from(dims.0) * u64::from(dims.1);
+    // RAM is read from a coarse-cadence cache (see refresh_available_ram), not the
+    // raw /proc/meminfo scan every frame — it only gates the button + a GiB
+    // readout, so sub-second staleness is fine.
+    refresh_available_ram(state, ui);
+    let available_ram = state.available_ram;
+    // The estimate (and the button gate) follows the SAME path the convert will
+    // take: the grid math when tiling (tile count + per-tile peak + aggregate
+    // cap), the cheap single-mesh figure otherwise.
+    let estimate = if state.tile_export {
+        tiled_estimate(dims.0, dims.1, state.tile_cells, available_ram)
+    } else {
+        single_mesh_estimate(cells, available_ram)
+    };
+
+    egui::CollapsingHeader::new("Export").default_open(true).show(ui, |ui| {
+        // ---- Scale (drives FieldMeta) ----
+        ui.label("Scale");
+        ui.horizontal(|ui| {
+            ui.label("Studs / meter");
+            modifier_drag(ui, &mut state.studs_per_meter, 0.1, 0.01..=64.0);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Vertical exaggeration");
+            modifier_drag(ui, &mut state.vertical_exaggeration, 0.1, 0.1..=64.0);
+        });
+        draw_scale_readout(state, ui);
+        ui.checkbox(&mut state.micro, "Micro bricks (fine detail)").on_hover_text(
+            "On: SmoothTile → Micro — ~5× finer cells at the same physical scale, for crisp \
+             relief detail. Off: standard SmoothTile bricks.",
+        );
+
+        ui.separator();
+        // ---- Output name + formats ----
+        ui.label("Output name");
+        ui.add(
+            TextEdit::singleline(&mut state.output_name)
+                .hint_text("sculpt")
+                .desired_width(260.0),
+        );
+        ui.checkbox(&mut state.out.brdb, "World (.brdb → Worlds/)");
+        ui.checkbox(&mut state.out.brz, "Prefab (.brz → Prefabs/)");
+        ui.checkbox(&mut state.out.install_to_brickadia, "Install into Brickadia");
+        ui.checkbox(&mut state.out.overwrite, "Overwrite existing");
+        ui.checkbox(&mut state.out.skip_floor, "Skip flat floor (reveal native ground)")
+            .on_hover_text(
+                "On (default for sculpt): flat (zero-height) areas emit no bricks, so the native \
+                 Brickadia floor shows through. Off: a watertight base plate is built under \
+                 everything (matches a direct Map build).",
+            );
+
+        ui.separator();
+        // ---- Floor / omit (meter-space, drive the convert) ----
+        ui.horizontal(|ui| {
+            ui.label("Floor level (m)");
+            modifier_drag(ui, &mut state.floor_level_m, 0.5, 0.0..=100_000.0);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Omit below (m)");
+            modifier_drag(ui, &mut state.omit_below_m, 0.5, 0.0..=100_000.0);
+        })
+        .response
+        .on_hover_text(
+            "Columns whose source height is at or below this level emit no bricks (native \
+             floor / 'omit water'). Default 0 drops only true-floor columns.",
+        );
+        // ---- Eyedropper height-picker (spec §3) ----
+        ui.checkbox(&mut state.pick_mode, "🔬 Pick height (eyedropper)").on_hover_text(
+            "On: click the canvas to sample the hovered cell's height (meters) instead of \
+             painting. The held modifier routes the sample — plain → Target height, Alt → \
+             Floor level, Ctrl → Omit below. The sampled value shows on the canvas.",
+        );
+        if let Some(m) = state.last_pick {
+            ui.small(format!("last sample: {m:.2} m"));
+        }
+
+        ui.separator();
+        // ---- Manual tiling (toggle + size) ----
+        ui.checkbox(&mut state.tile_export, "Tile this export").on_hover_text(
+            "Off: one single mesh. On: subdivide the field into grid-tiled sub-exports \
+             stitched into one save.",
+        );
+        if state.tile_export {
+            ui.horizontal(|ui| {
+                ui.label("Tile size (cells)");
+                modifier_drag(ui, &mut state.tile_cells, 8.0, 16..=4096);
+            });
+        }
+
+        ui.separator();
+        // ---- Live estimate ----
+        draw_estimate_readout(state, ui, estimate);
+    });
+
+    estimate
+}
+
+/// Live "≈ N studs/m · relief · ~M m/cell" readout (spec §1), mirroring the Map
+/// tab's `draw_output_estimate`. The achieved studs/m is the integer-`derive_scale`
+/// realized value (may differ slightly from the set target), so the user sees the
+/// true scale the convert will build at — including the cap when a coarse cell
+/// can't reach the requested studs/m.
+fn draw_scale_readout(state: &SculptState, ui: &mut Ui) {
+    let Some(field) = state.field.as_ref() else { return };
+    let cell_m = field.meta.cell_m;
+    if !cell_m.is_finite() || cell_m <= 0.0 {
+        return;
+    }
+    let (hscale, vertical) = build_derive_scale(
+        cell_m,
+        state.studs_per_meter,
+        state.vertical_exaggeration,
+        state.micro,
+    );
+    let upf = if state.micro { 1.0 } else { 5.0 };
+    // studs/m = 2*hscale*upf / cell_m / 5 (BrickSize half-extent → 2*size pitch).
+    let achieved = 2.0 * f64::from(hscale) * upf / cell_m / 5.0;
+    let relief = if (state.vertical_exaggeration - 1.0).abs() < 0.05 {
+        "1:1".to_owned()
+    } else {
+        format!("×{:.1}", state.vertical_exaggeration)
+    };
+    ui.small(format!(
+        "≈ {achieved:.1} studs/m · relief {relief} · ~{cell_m:.0} m/cell · vert {vertical:.1} u/m"
+    ));
+}
+
+/// `derive_scale` lives on the map tab; thin re-export shim so the scale readout
+/// reads the SAME integer-brick scale the convert derives (single source of truth).
+fn build_derive_scale(cell_m: f64, studs_per_meter: f32, exaggeration: f32, micro: bool) -> (u16, f32) {
+    crate::gui::map_tab::derive_scale(cell_m, studs_per_meter, exaggeration, micro)
+}
+
+/// Live brick / peak-RAM estimate readout + over-budget remedy (spec §1). Green
+/// when it fits; a warning + remedy when the single mesh would exceed the
+/// per-mesh brick cap or available RAM (the Export button is gated on the same
+/// `estimate.fits_ram`).
+fn draw_estimate_readout(state: &SculptState, ui: &mut Ui, est: ExportEstimate) {
+    if state.field.is_none() {
+        return;
+    }
+    let ram_gib = est.peak_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if state.tile_export {
+        ui.small(format!(
+            "≈ {} bricks · {} tiles · peak ~{ram_gib:.1} GiB (stitched)",
+            est.est_bricks, est.tile_count,
+        ));
+    } else {
+        ui.small(format!("≈ {} bricks · peak ~{ram_gib:.1} GiB", est.est_bricks));
+    }
+    if est.over_brick_cap {
+        // The cap differs by path: a single mesh trips MAX_BRICKS (the remedy is to
+        // tile); a tiled stitch trips the aggregate MAX_GRID_BRICKS (the remedy is
+        // a smaller canvas/scale — tiling can't grow past the stitch ceiling).
+        let (cap, remedy) = if state.tile_export {
+            (build::MAX_GRID_BRICKS, "shrink the canvas or lower the scale")
+        } else {
+            (build::MAX_BRICKS, "enable 'Tile this export' or shrink the canvas")
+        };
+        ui.colored_label(STATUS_WARN_FG, format!("Over the {cap}-brick cap — {remedy}."));
+    } else if !est.fits_ram {
+        ui.colored_label(
+            STATUS_WARN_FG,
+            "Estimated peak RAM exceeds what's free — shrink the canvas, lower the scale, or \
+             tile the export.",
+        );
+    }
+}
+
+fn draw_convert_section(state: &mut SculptState, ui: &mut Ui, estimate: ExportEstimate) {
     if state.is_converting() {
         let (stage, fraction) = match state.convert_progress.lock() {
             Ok(g) => *g,
@@ -490,7 +942,10 @@ fn draw_convert_section(state: &mut SculptState, ui: &mut Ui) {
     }
     let name_empty = state.output_name.trim().is_empty();
     let no_format = !state.out.brdb && !state.out.brz;
-    let enabled = !name_empty && !no_format;
+    // Gate the Export button on the live estimate too: a single mesh that blows
+    // the brick cap or the RAM budget must not be startable (spec §1).
+    let over_budget = !estimate.fits_ram;
+    let enabled = !name_empty && !no_format && !over_budget;
     let resp = ui.add_enabled(
         enabled,
         egui::Button::new("⬇  Convert to bricks").min_size(Vec2::new(260.0, 32.0)),
@@ -500,6 +955,9 @@ fn draw_convert_section(state: &mut SculptState, ui: &mut Ui) {
     }
     if no_format {
         ui.colored_label(STATUS_WARN_FG, "• Select at least one output format");
+    }
+    if over_budget {
+        ui.colored_label(STATUS_WARN_FG, "• Over the brick/RAM budget (see the Export estimate)");
     }
     if enabled && resp.clicked() {
         start_convert(state);
@@ -574,8 +1032,47 @@ fn draw_canvas(state: &mut SculptState, ctx: &egui::Context, ui: &mut Ui) {
 
     // Brush overlay + smooth radius animation. Animating every frame while the
     // pointer is over the canvas keeps the resize buttery regardless of grid
-    // size (it touches no texture).
-    paint_brush_overlay(state, ctx, ui, &response, rect);
+    // size (it touches no texture). Suppressed in eyedropper pick mode: a pick
+    // samples a SINGLE cell, so a radius ring would imply area painting that
+    // does not happen — the pick readout (`paint_pick_readout`) is the cursor UI
+    // then.
+    if !state.pick_mode {
+        paint_brush_overlay(state, ctx, ui, &response, rect);
+    }
+
+    // Eyedropper on-canvas readout: the last sampled height (spec §3), drawn in
+    // the corner so the pick value is visible without leaving the canvas.
+    paint_pick_readout(state, ui, &response, rect);
+}
+
+/// Draw the eyedropper's on-canvas readout (spec §3): while pick mode is active,
+/// a small label in the canvas's top-left shows the last sampled height (meters)
+/// and the live hovered cell's height, so the value is visible without looking
+/// at the side panel. No-op when pick mode is off.
+fn paint_pick_readout(state: &SculptState, ui: &Ui, response: &egui::Response, rect: Rect) {
+    if !state.pick_mode {
+        return;
+    }
+    let Some(field) = state.field.as_ref() else { return };
+    let mut text = match state.last_pick {
+        Some(m) => format!("eyedropper · last {m:.2} m"),
+        None => "eyedropper · click to sample".to_owned(),
+    };
+    if response.hovered()
+        && let Some(ptr) = response.hover_pos()
+    {
+        let (cx, cy) = screen_to_cell(state, ptr);
+        text = format!("{text}  ·  hover {:.2} m", field.sample_cell_meters(cx, cy));
+    }
+    let painter = ui.painter_at(rect);
+    let pos = rect.min + Vec2::new(8.0, 8.0);
+    painter.text(
+        pos,
+        egui::Align2::LEFT_TOP,
+        text,
+        egui::FontId::monospace(13.0),
+        Color32::from_rgb(0xFF, 0xE0, 0x60),
+    );
 }
 
 /// Center + fit the field in the viewport: zoom so the longer axis fills ~90% of
@@ -646,6 +1143,15 @@ fn paint_terrain(state: &SculptState, ui: &Ui, rect: Rect, fw: u32, fh: u32) {
 /// Snapshots the affected rect at stroke start (for undo) and commits it when the
 /// stroke ends.
 fn handle_sculpt_input(state: &mut SculptState, response: &egui::Response, fw: u32, fh: u32) {
+    // Eyedropper pick mode SUPPRESSES brush painting (spec §3): a primary click
+    // samples the hovered cell and routes it, then returns so no dab is laid —
+    // the two never fire on the same click. Reuses the SAME map `Response`
+    // hit-test (no second interact widget).
+    if state.pick_mode {
+        handle_pick_input(state, response);
+        return;
+    }
+
     // Sculpt only on the PRIMARY button; middle/secondary are pan.
     if response.drag_started_by(egui::PointerButton::Primary) {
         // Begin a stroke: capture a snapshot of the WHOLE field's potentially
@@ -668,6 +1174,25 @@ fn handle_sculpt_input(state: &mut SculptState, response: &egui::Response, fw: u
     if response.drag_stopped_by(egui::PointerButton::Primary) {
         commit_stroke(state);
     }
+}
+
+/// Eyedropper pick (spec §3): on a primary click, hit-test the pointer to a cell
+/// via the SAME view transform the brush uses (`screen_to_cell`), sample that
+/// cell's height in meters, and route it by the modifier held at click time
+/// (plain → target, Alt → floor, Ctrl → omit). Only `clicked_by(Primary)` fires
+/// — a middle/secondary drag still pans, and no brush dab is laid (the caller
+/// returned before the sculpt path).
+fn handle_pick_input(state: &mut SculptState, response: &egui::Response) {
+    if !response.clicked_by(egui::PointerButton::Primary) {
+        return;
+    }
+    let Some(ptr) = response.interact_pointer_pos() else { return };
+    let mods = response.ctx.input(|i| i.modifiers);
+    let target = pick_target(DragModifiers { ctrl: mods.ctrl, alt: mods.alt });
+    let (cx, cy) = screen_to_cell(state, ptr);
+    let Some(field) = state.field.as_ref() else { return };
+    let meters = field.sample_cell_meters(cx, cy);
+    state.apply_pick(target, meters);
 }
 
 /// Step from the last dab center to `(cx, cy)`, applying a dab at each step so a
@@ -1101,7 +1626,7 @@ fn load_heightmap_image(state: &mut SculptState) {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "sculpt".to_owned());
-    let mut meta = blank_meta(state.new_cell_m);
+    let mut meta = blank_meta(state, state.new_cell_m);
     meta.source_name = stem;
     state.set_field(HeightField::from_image(&img, meta));
     state.last_error = None;
@@ -1114,12 +1639,23 @@ fn start_convert(state: &mut SculptState) {
         state.last_error = Some("internal: Convert with no field".into());
         return;
     };
-    // Stamp the current output name into the field metadata so the written file
-    // is named from the UI, not the field's original source.
+    // Stamp the current output name + the Export-panel scale knobs into the
+    // field metadata so the written file is named from the UI and the convert
+    // honors the panel's studs/m · exaggeration · micro (not the field's
+    // original/blank-canvas seed). This is the single point where panel state
+    // becomes the FieldMeta the convert reads — blank canvas, loaded image, and
+    // send-from-map all flow through here.
     let mut field = field;
     field.meta.source_name = state.output_name.clone();
+    field.meta.studs_per_meter = state.studs_per_meter;
+    field.meta.vertical_exaggeration = state.vertical_exaggeration;
+    field.meta.micro = state.micro;
 
     let out = state.out;
+    let floor_level_m = state.floor_level_m;
+    let omit_below_m = state.omit_below_m;
+    let tile_export = state.tile_export;
+    let tile_cells = state.tile_cells;
     state.last_outcome = None;
     state.last_error = None;
     state.convert_cancel.store(false, Ordering::Relaxed);
@@ -1137,7 +1673,15 @@ fn start_convert(state: &mut SculptState) {
     match std::thread::Builder::new()
         .name("h2brz-sculpt-convert".into())
         .spawn(move || {
-            let result = convert_heightfield(&field, out, progress_fn, cancel_arc);
+            // "Tile this export" routes through the grid-tiled stitch path (one
+            // stitched save built from shared-edge sub-fields); off = single mesh.
+            let result = if tile_export {
+                convert_heightfield_tiled(
+                    &field, out, tile_cells, floor_level_m, omit_below_m, progress_fn, cancel_arc,
+                )
+            } else {
+                convert_heightfield(&field, out, floor_level_m, omit_below_m, progress_fn, cancel_arc)
+            };
             sender.send(result);
         }) {
         Ok(_handle) => state.convert_promise = Some(promise),
@@ -1361,6 +1905,231 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Modifier step-selection (spec §2): Ctrl ⇒ fine (×0.1), Alt ⇒ coarse
+    /// (×10), none ⇒ base (×1.0), and BOTH held ⇒ Ctrl wins (fine) — the
+    /// documented precedence.
+    #[test]
+    fn modifier_drag_step_selection() {
+        let none = modifier_step(DragModifiers { ctrl: false, alt: false });
+        let fine = modifier_step(DragModifiers { ctrl: true, alt: false });
+        let coarse = modifier_step(DragModifiers { ctrl: false, alt: true });
+        let both = modifier_step(DragModifiers { ctrl: true, alt: true });
+        assert_eq!(none, 1.0, "no modifier must leave the base speed (×1)");
+        assert_eq!(fine, MODIFIER_FINE, "Ctrl must select the fine (×0.1) step");
+        assert_eq!(coarse, MODIFIER_COARSE, "Alt must select the coarse (×10) step");
+        assert_eq!(both, MODIFIER_FINE, "Ctrl+Alt: Ctrl wins (fine) — documented precedence");
+    }
+
+    /// The brush radius/strength SLIDERS consume the same modifier scaling the
+    /// DragValues do (spec §2 / DoD §8 "every numeric slider"): their value-box
+    /// drag speed is `base_speed` scaled by Ctrl(×0.1)/Alt(×10)/none, via the
+    /// `slider_drag_speed` helper `modifier_slider` feeds into `drag_value_speed`.
+    /// This guards the gap the old `egui::Slider::new` brush controls left — they
+    /// ignored the modifiers entirely.
+    #[test]
+    fn brush_slider_applies_modifier_scaling() {
+        let base = 0.2_f64;
+        let none = slider_drag_speed(base, DragModifiers { ctrl: false, alt: false });
+        let fine = slider_drag_speed(base, DragModifiers { ctrl: true, alt: false });
+        let coarse = slider_drag_speed(base, DragModifiers { ctrl: false, alt: true });
+        let both = slider_drag_speed(base, DragModifiers { ctrl: true, alt: true });
+        assert_eq!(none, base, "no modifier must leave the slider's base drag speed");
+        assert_eq!(fine, base * MODIFIER_FINE, "Ctrl must make the brush slider ×0.1 finer");
+        assert_eq!(coarse, base * MODIFIER_COARSE, "Alt must make the brush slider ×10 coarser");
+        assert_eq!(both, base * MODIFIER_FINE, "Ctrl+Alt on the slider: Ctrl wins (fine)");
+        // A clearly different base scales independently — the helper is not pinned
+        // to one constant, it is the live brush-control base × the modifier step.
+        let strength_fine = slider_drag_speed(0.005, DragModifiers { ctrl: true, alt: false });
+        assert!(
+            (strength_fine - 0.005 * MODIFIER_FINE).abs() < f64::EPSILON,
+            "the blend-strength slider's finer base scales by the same rule",
+        );
+    }
+
+    /// The Export-panel scale knobs flow into the `FieldMeta` the convert reads
+    /// (spec §1/§3): a blank canvas reads studs_per_meter / vertical_exaggeration
+    /// / micro from the panel state, not the old hardcoded 4.0 / 1.0 / false. Drive
+    /// the panel to non-default values and assert `blank_meta` reflects them.
+    #[test]
+    fn field_meta_reflects_panel_scale() {
+        let mut state = SculptState::new();
+        state.studs_per_meter = 7.5;
+        state.vertical_exaggeration = 2.5;
+        state.micro = true;
+        let meta = blank_meta(&state, 12.0);
+        assert_eq!(meta.cell_m, 12.0, "cell pitch comes from the New-canvas control");
+        assert_eq!(meta.studs_per_meter, 7.5, "studs/m must come from the panel, not a constant");
+        assert_eq!(meta.vertical_exaggeration, 2.5, "exaggeration must come from the panel");
+        assert!(meta.micro, "micro must come from the panel toggle");
+    }
+
+    /// Loading a field seeds the panel scale from the SOURCE meta (send-from-map /
+    /// DEM primes the panel), then a convert restamps the field meta from the
+    /// (possibly retuned) panel — the round-trip that makes the panel the single
+    /// source of truth for the convert's scale.
+    #[test]
+    fn set_field_seeds_panel_then_panel_drives_convert() {
+        let mut state = SculptState::new();
+        // A source field carrying a distinct scale (as a DEM/send-from-map would).
+        let src_meta = FieldMeta {
+            cell_m: 30.0,
+            studs_per_meter: 1.25,
+            vertical_exaggeration: 3.0,
+            micro: true,
+            centroid_lat: 0.0,
+            source_name: "src".to_string(),
+        };
+        state.set_field(HeightField::flat(8, 8, src_meta));
+        assert_eq!(state.studs_per_meter, 1.25, "set_field must seed studs/m from the source");
+        assert_eq!(state.vertical_exaggeration, 3.0, "set_field must seed exaggeration");
+        assert!(state.micro, "set_field must seed micro from the source");
+
+        // The user retunes the panel; a convert must stamp the NEW values onto the
+        // field meta (the start_convert restamp). Reproduce that mapping here.
+        state.studs_per_meter = 4.0;
+        state.vertical_exaggeration = 1.0;
+        state.micro = false;
+        let mut field = state.field.clone().expect("field present");
+        field.meta.studs_per_meter = state.studs_per_meter;
+        field.meta.vertical_exaggeration = state.vertical_exaggeration;
+        field.meta.micro = state.micro;
+        assert_eq!(field.meta.studs_per_meter, 4.0, "convert reads the retuned panel studs/m");
+        assert_eq!(field.meta.vertical_exaggeration, 1.0, "convert reads the retuned exaggeration");
+        assert!(!field.meta.micro, "convert reads the retuned micro");
+    }
+
+    /// The export estimate gates over-budget fields (spec §1): a field whose
+    /// single-mesh brick ceiling exceeds [`build::MAX_BRICKS`] reports
+    /// `over_brick_cap` and `!fits_ram`; a tiny field with ample RAM fits. RAM is
+    /// injected so the test is deterministic.
+    #[test]
+    fn export_estimate_gates_over_budget() {
+        let ample_ram = 64u64 * 1024 * 1024 * 1024;
+        // A small field: well under the brick cap and the RAM budget → fits.
+        let small = single_mesh_estimate(64 * 64, ample_ram);
+        assert!(!small.over_brick_cap, "a 4 k-cell field is far under the brick cap");
+        assert!(small.fits_ram, "a tiny mesh must fit with 64 GiB free");
+        assert_eq!(small.est_bricks, 64 * 64, "est is the cell-count ceiling");
+
+        // A field whose cell count exceeds the per-mesh brick cap → over_brick_cap,
+        // and the button-gating predicate `!fits_ram` trips regardless of RAM.
+        let huge_cells = build::MAX_BRICKS as u64 + 1;
+        let huge = single_mesh_estimate(huge_cells, ample_ram);
+        assert!(huge.over_brick_cap, "exceeding MAX_BRICKS must flag over_brick_cap");
+        assert!(!huge.fits_ram, "over the brick cap must gate the Export button");
+
+        // Same modest field but with almost no RAM free → fails the RAM budget.
+        let starved = single_mesh_estimate(200_000, RAM_RESERVE_BYTES_LOCAL + 1);
+        assert!(!starved.fits_ram, "a peak over (available - reserve) must not fit");
+    }
+
+    /// The TILED estimate gates on the AGGREGATE cap (spec §1/§5): tile count is
+    /// `ceil(w/tile)·ceil(h/tile)`; a field whose stitched union exceeds
+    /// `MAX_GRID_BRICKS` (not the per-mesh `MAX_BRICKS`) flags `over_brick_cap` and
+    /// `!fits_ram`. A field that trips the single-mesh cap but stitches under the
+    /// grid cap FITS when tiled — the panel's "enable tiling" remedy is real.
+    #[test]
+    fn tiled_export_estimate_gates_over_budget() {
+        let ample_ram = 256u64 * 1024 * 1024 * 1024;
+
+        // Tile count math: a 1000×500 field at tile 256 → ceil(1000/256)=4 cols,
+        // ceil(500/256)=2 rows = 8 tiles.
+        assert_eq!(tiles_on_axis(1000, 256), 4, "ceil(1000/256) = 4 columns");
+        assert_eq!(tiles_on_axis(500, 256), 2, "ceil(500/256) = 2 rows");
+        let est = tiled_estimate(1000, 500, 256, ample_ram);
+        assert_eq!(est.tile_count, 8, "4×2 = 8 tiles");
+        assert!(!est.over_brick_cap, "a 0.5 M-cell field stitches well under MAX_GRID_BRICKS");
+        assert!(est.fits_ram, "8 modest tiles must fit with 256 GiB free");
+
+        // A field that exceeds the per-mesh MAX_BRICKS as a SINGLE mesh, but whose
+        // tiled stitch is still under MAX_GRID_BRICKS → tiling is the remedy: the
+        // single estimate gates, the tiled estimate fits.
+        let big_side = 2000u32; // 4 M cells > MAX_BRICKS(2 M)
+        let single = single_mesh_estimate(u64::from(big_side) * u64::from(big_side), ample_ram);
+        assert!(single.over_brick_cap, "4 M cells over the per-mesh cap as one mesh");
+        let tiled = tiled_estimate(big_side, big_side, 256, ample_ram);
+        assert!(
+            !tiled.over_brick_cap && tiled.fits_ram,
+            "the same field tiled stitches under MAX_GRID_BRICKS and fits — tiling is the remedy",
+        );
+
+        // A field whose tiled stitch itself blows MAX_GRID_BRICKS → over the
+        // aggregate cap, gated even when tiled. Per-tile body (256+1)² ≈ 66 k
+        // bricks; enough tiles to pass 50 M needs > ~760 tiles → a ~28 k-cell side.
+        let huge_side = 30_000u32;
+        let huge = tiled_estimate(huge_side, huge_side, 256, ample_ram);
+        assert!(huge.over_brick_cap, "a stitch past MAX_GRID_BRICKS must flag over_brick_cap");
+        assert!(!huge.fits_ram, "over the aggregate cap must gate the Export button even when tiled");
+    }
+
+    /// Mirror of the grid reserve so the RAM-budget test reads the same threshold
+    /// the estimate uses, without re-exporting a private constant into the test.
+    const RAM_RESERVE_BYTES_LOCAL: u64 = 12 * 1024 * 1024 * 1024;
+
+    /// Eyedropper modifier routing (spec §3): plain ⇒ target, Alt ⇒ floor,
+    /// Ctrl ⇒ omit, and BOTH held ⇒ Ctrl wins (omit) — the documented precedence
+    /// shared with `modifier_step`. Pure routing, no egui context.
+    #[test]
+    fn pick_target_modifier_routing() {
+        assert_eq!(
+            pick_target(DragModifiers { ctrl: false, alt: false }),
+            PickTarget::Target,
+            "plain click must route to the target height",
+        );
+        assert_eq!(
+            pick_target(DragModifiers { ctrl: false, alt: true }),
+            PickTarget::Floor,
+            "Alt must route to the floor level",
+        );
+        assert_eq!(
+            pick_target(DragModifiers { ctrl: true, alt: false }),
+            PickTarget::Omit,
+            "Ctrl must route to the omit level",
+        );
+        assert_eq!(
+            pick_target(DragModifiers { ctrl: true, alt: true }),
+            PickTarget::Omit,
+            "Ctrl+Alt: Ctrl wins (omit) — documented precedence",
+        );
+    }
+
+    /// Eyedropper end-to-end on real state (spec §3): a pick at a cell samples
+    /// that cell's height in meters and writes it into the level the modifier
+    /// routes to, recording it as `last_pick`. Drives `apply_pick` with the
+    /// sampler the canvas handler uses, so the click → sample → route path is
+    /// exercised without an egui pointer event.
+    #[test]
+    fn eyedropper_samples_cell_meters() {
+        let mut state = SculptState::new();
+        // A field with distinct, known cell heights (meters above floor).
+        let mut field = HeightField::flat(4, 4, meta());
+        field.set(2, 1, 42.5);
+        field.set(0, 3, 7.0);
+        state.set_field(field);
+
+        // The sampler the canvas handler calls returns the hovered cell's meters.
+        let f = state.field.as_ref().unwrap();
+        assert_eq!(f.sample_cell_meters(2.0, 1.0), 42.5);
+        // A fractional pointer inside the same cell floors to it (nearest-cell).
+        assert_eq!(f.sample_cell_meters(2.9, 1.1), 42.5);
+
+        // Plain click → target_height.
+        let m = state.field.as_ref().unwrap().sample_cell_meters(2.0, 1.0);
+        state.apply_pick(pick_target(DragModifiers { ctrl: false, alt: false }), m);
+        assert_eq!(state.target_height, 42.5, "plain pick must set the target height");
+        assert_eq!(state.last_pick, Some(42.5), "the sample must be recorded for the readout");
+
+        // Alt click → floor_level_m.
+        let m = state.field.as_ref().unwrap().sample_cell_meters(0.0, 3.0);
+        state.apply_pick(pick_target(DragModifiers { ctrl: false, alt: true }), m);
+        assert_eq!(state.floor_level_m, 7.0, "Alt pick must set the floor level");
+
+        // Ctrl click → omit_below_m.
+        let m = state.field.as_ref().unwrap().sample_cell_meters(2.0, 1.0);
+        state.apply_pick(pick_target(DragModifiers { ctrl: true, alt: false }), m);
+        assert_eq!(state.omit_below_m, 42.5, "Ctrl pick must set the omit-below level");
     }
 
     /// `mark_dirty_rect` unions sub-rects but a pending FULL rebuild (no rect)

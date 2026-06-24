@@ -911,15 +911,22 @@ pub(crate) fn generate_bricks(
     // `generate_bricks_skip_floor(true)` instead so a blank canvas reveals the
     // native Brickadia floor.
     generate_bricks_skip_floor(
-        heightmap, colormap, style, base_override, offset, false, progress, cancel,
+        heightmap, colormap, style, base_override, offset, false, 0, progress, cancel,
     )
 }
 
 /// As [`generate_bricks`], but with the additive `skip_floor` seam exposed: when
-/// `true`, a column whose normalized height bottoms out at the base plane emits
-/// no bricks (the native floor stands in). The sculpt/blank-canvas convert sets
-/// it `true`; every map-build caller goes through `generate_bricks` (`false`),
-/// so the map output is unaffected.
+/// `true`, a column whose brick-Z height is at or below `omit_below_h` emits no
+/// bricks (the native floor stands in). The sculpt/blank-canvas convert sets it
+/// `true`; every map-build caller goes through `generate_bricks` (`false`), so
+/// the map output is unaffected.
+///
+/// `omit_below_h` is the brick-Z omit threshold (the meter-space `omit_below_m`
+/// pre-converted to brick-Z by the caller as `round(omit_below_m *
+/// vertical_scale)`). With the sculpt default `0` and `base_override = Some(0)`
+/// (so the base plane is brick-Z 0), only true-floor (`h == 0`) columns drop —
+/// byte-identical to the prior `(h - min_height) == 0` skip. Has no effect when
+/// `skip_floor` is `false`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_bricks_skip_floor(
     heightmap: &DemHeightmap,
@@ -928,6 +935,7 @@ pub(crate) fn generate_bricks_skip_floor(
     base_override: Option<u32>,
     offset: (i32, i32),
     skip_floor: bool,
+    omit_below_h: u32,
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
 ) -> Result<Vec<brdb::Brick>, BuildError> {
@@ -964,6 +972,9 @@ pub(crate) fn generate_bricks_skip_floor(
         // reveals the native floor; default-off (every `generate_bricks` caller)
         // keeps single-box and grid output byte-identical.
         skip_floor,
+        // Brick-Z omit threshold, derived meter-space by the caller. Default `0`
+        // (the sculpt `omit_below_m = 0`) drops only true-floor columns.
+        omit_below_h,
     };
     let cancel_check = move |f: f32| -> bool {
         progress(BuildStage::GeneratingBricks, f);
@@ -1585,6 +1596,7 @@ mod tests {
             greedy: true,
             fill_to_base: false,
             skip_floor: false,
+            omit_below_h: 0,
         };
         let bricks =
             crate::opt::gen_opt_heightmap(&heightmap, &cm, options, None, None, |_| true).expect("gen");

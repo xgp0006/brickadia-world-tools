@@ -37,6 +37,16 @@ pub struct GenOptions {
     /// byte-identical (those paths never skip). Has no effect unless both
     /// `fill_to_base` is set and `img` is clear (mirrors the fill_to_base gate).
     pub skip_floor: bool,
+    /// Greedy + `skip_floor` terrain path only: the brick-Z height at or below
+    /// which a column is omitted (emits no bricks). Derived meter-space from the
+    /// sculpt convert's `omit_below_m` as `round(omit_below_m * vertical_scale)`,
+    /// so the omit decision is made against the SOURCE height in meters rather
+    /// than a scale-dependent quantization artifact. The skip predicate is
+    /// `skip_floor && h <= omit_below_h`. Default `0` with `base_override`'s
+    /// `min_height == 0` reproduces the old true-floor `(h - min_height) == 0`
+    /// skip exactly (only `h == 0` columns drop), so `skip_floor=false` stays a
+    /// no-op and the sculpt default (`omit_below_m = 0`) is byte-identical.
+    pub omit_below_h: u32,
 }
 
 impl GenOptions {

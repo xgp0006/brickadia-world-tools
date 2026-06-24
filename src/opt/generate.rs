@@ -294,6 +294,22 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     let min_height = base_height_override
         .unwrap_or_else(|| pairs_vec.iter().map(|(h, _)| *h).min().unwrap_or(0));
 
+    // Cross-file invariant lock (sculpt skip_floor): a `skip_floor=true` caller
+    // (convert_heightfield / _tiled) must pass an EXPLICIT base plane
+    // (`base_override = Some(_)`), never `None`. The omit decision is meter-space —
+    // `omit_below_h` is derived upstream against the same vertical_scale as the
+    // base — so the base plane it measures against must be the caller's chosen
+    // datum, not the per-tile data minimum `None` would compute. At the sculpt
+    // default (`base_override = Some(0)` → `min_height == 0`, `omit_below_h == 0`)
+    // only true-floor (`h == 0`) columns drop, byte-identical to the legacy
+    // `(h - min_height) == 0` skip; a raised floor (`Some(base_h > 0)`) shortens
+    // the fill while omit stays meter-space and independent. A `None` base under
+    // skip_floor would silently decouple the omit datum from the fill base.
+    debug_assert!(
+        !options.skip_floor || base_height_override.is_some(),
+        "skip_floor implies an explicit base_override so omit_below_h is derived against the chosen base (min_height={min_height})",
+    );
+
     let (planes_with_metadata, plane_build_duration) =
         build_planes(heightmap, colormap, options.cull, pairs_vec);
     progress!(0.4);
@@ -466,18 +482,28 @@ fn quads_to_bricks<F: Fn(f32) -> bool>(
         // base. Off (Convert tab / CLI, or any img2brick build) keeps the legacy
         // flat 2-unit block — those heights are un-normalized / unbounded, and
         // img mode holds position Z constant so a tall fill would overlap.
-        // Floor-skip (sculpt/blank-canvas convert only): when fill_to_base is on
-        // and this column's normalized height equals the common base plane
-        // (`h == min_height`, so the fill span is zero), the native Brickadia
-        // ground IS the floor here — emit nothing so flat areas reveal the world
-        // floor instead of a redundant plate. Gated on the SAME conditions as the
-        // fill_to_base branch below (`fill_to_base && !img`) so `skip_floor` can
-        // never alter the legacy flat-surface path. Default-off (skip_floor =
-        // false) leaves every existing single-box/grid output byte-identical.
+        // Floor/omit-skip (sculpt/blank-canvas convert only): when fill_to_base
+        // is on and this column's brick-Z height is at or below the omit
+        // threshold (`h <= omit_below_h`), emit nothing — the native Brickadia
+        // ground stands in. `omit_below_h` is derived meter-space upstream
+        // (`round(omit_below_m * vertical_scale)`) so the decision is made
+        // against the SOURCE height in meters, NOT a scale-dependent quantization
+        // artifact: at a proper scale a near-floor cell maps to `h >= 1` and
+        // survives (the gap fix), while at the default `omit_below_h == 0` with
+        // `base_override`'s `min_height == 0` only true-floor (`h == 0`) columns
+        // drop — exactly the old `(h - min_height) == 0` behavior. This requires
+        // every `skip_floor=true` caller to pass an EXPLICIT `base_override`
+        // (`Some(_)`, never `None`) so `omit_below_h`'s meter-space datum matches
+        // the chosen base plane; that cross-file invariant is locked by the
+        // `debug_assert!` in `gen_greedy_heightmap`. Gated on the
+        // SAME conditions as the fill_to_base branch below (`fill_to_base &&
+        // !img`) so `skip_floor` can never alter the legacy flat-surface path.
+        // Default-off (skip_floor = false) leaves every existing
+        // single-box/grid output byte-identical.
         if options.skip_floor
             && options.fill_to_base
             && !options.img
-            && (h as i32 - min_height as i32) == 0
+            && h <= options.omit_below_h
         {
             continue;
         }
@@ -613,6 +639,7 @@ mod tests {
             greedy: true,
             fill_to_base: false,
             skip_floor: false,
+            omit_below_h: 0,
         }
     }
 

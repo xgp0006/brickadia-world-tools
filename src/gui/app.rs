@@ -226,6 +226,8 @@ impl HeightmapApp {
             fill_to_base: false,
             // Convert tab never skips the floor — output stays byte-identical.
             skip_floor: false,
+            // Convert tab never omits columns (skip_floor is off); inert.
+            omit_below_h: 0,
         }
     }
 

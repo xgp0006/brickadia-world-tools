@@ -445,11 +445,42 @@ pub(crate) fn partition(
 /// shared lattice) — never recomputed, so there is no chance of float drift
 /// diverging from the realized crop (spec CROSS-CUTTING RISKS #1).
 pub(crate) fn world_offset(plan: &GridPlan, tile: &PlannedTile, size: u16) -> (i32, i32) {
+    tile_world_offset(
+        tile.off_cells_x,
+        tile.off_cells_y,
+        plan.global_cells_w,
+        plan.global_cells_h,
+        size,
+    )
+}
+
+/// The pure cumulative-cells + global-centering world-offset algebra, factored
+/// out of [`world_offset`] so the sculpt heightfield tiler can place its
+/// sub-fields with the SAME math without constructing a geographic `GridPlan`
+/// (spec §5). `off_cells_{x,y}` is the sub-tile's NW cell index (cumulative cells
+/// to the west/north); `global_cells_{w,h}` is the full mosaic extent in cells.
+///
+/// ```text
+/// world_off_x = off_cells_x * 2 * size
+/// center_x    = -(global_cells_w * size)
+/// offset_x    = world_off_x + center_x
+/// ```
+///
+/// A single-tile reduction (`off_cells = 0`, `global_cells = width`) yields
+/// `-(width * size)` — exactly the legacy single-box centering, so a 1×1 sculpt
+/// tiling stitches byte-identically to a single mesh (modulo the one spawn).
+pub(crate) fn tile_world_offset(
+    off_cells_x: u32,
+    off_cells_y: u32,
+    global_cells_w: u32,
+    global_cells_h: u32,
+    size: u16,
+) -> (i32, i32) {
     let size_i = i32::from(size);
-    let world_off_x = (tile.off_cells_x as i32).saturating_mul(2).saturating_mul(size_i);
-    let world_off_y = (tile.off_cells_y as i32).saturating_mul(2).saturating_mul(size_i);
-    let center_x = -((plan.global_cells_w as i32).saturating_mul(size_i));
-    let center_y = -((plan.global_cells_h as i32).saturating_mul(size_i));
+    let world_off_x = (off_cells_x as i32).saturating_mul(2).saturating_mul(size_i);
+    let world_off_y = (off_cells_y as i32).saturating_mul(2).saturating_mul(size_i);
+    let center_x = -((global_cells_w as i32).saturating_mul(size_i));
+    let center_y = -((global_cells_h as i32).saturating_mul(size_i));
     let off_x = world_off_x.saturating_add(center_x);
     let off_y = world_off_y.saturating_add(center_y);
 
@@ -461,12 +492,10 @@ pub(crate) fn world_offset(plan: &GridPlan, tile: &PlannedTile, size: u16) -> (i
     // guard against a pathological studs_per_meter/size that silently CLAMPS via
     // the saturating math above. Debug-only: zero release behavior change.
     debug_assert!(
-        offset_fits_chunk_index(off_x, plan.global_cells_w, size)
-            && offset_fits_chunk_index(off_y, plan.global_cells_h, size),
+        offset_fits_chunk_index(off_x, global_cells_w, size)
+            && offset_fits_chunk_index(off_y, global_cells_h, size),
         "grid mosaic exceeds the i16 ChunkIndex world extent (±{MAX_CHUNK_INDEX_UNITS} units/axis): \
-         off=({off_x},{off_y}), global_cells=({},{}), size={size}",
-        plan.global_cells_w,
-        plan.global_cells_h,
+         off=({off_x},{off_y}), global_cells=({global_cells_w},{global_cells_h}), size={size}",
     );
     (off_x, off_y)
 }
@@ -506,18 +535,18 @@ impl GridPlan {
 /// Owned bytes per `brdb::Brick` in the accumulator. Calibration target (spec
 /// MUST-ADD) — held at 144 (a `Brick` carries a `BString` asset + `Vec`
 /// components + scalars); the write-peak factor below covers the sort/blob copy.
-const BRICK_OWNED_BYTES: u64 = 144;
+pub(crate) const BRICK_OWNED_BYTES: u64 = 144;
 
 /// Stitched-write peak multiplier over the raw `Vec<Brick>` footprint: `to_unsaved`
 /// sorts ALL bricks (itertools `sorted_by`) and `to_pending` holds all blobs, so
 /// the single combined `.brdb` write transiently needs ~3× the accumulator
 /// (spec §6, the calibration band is 2–4×).
-const WRITE_PEAK_FACTOR: u64 = 3;
+pub(crate) const WRITE_PEAK_FACTOR: u64 = 3;
 
 /// RAM reserve held back from the fits-RAM gate: OS + egui + the growing
 /// accumulator + the write-time copy. The accumulator/write term is folded in
 /// via `est_brick_vec_bytes` at the call site; this is the fixed OS/UI floor.
-const RAM_RESERVE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+pub(crate) const RAM_RESERVE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 
 /// Per-tile mesh peak in bytes (spec §6). Imagery makes the mesh ~`cells^1.5`
 /// (per-pixel-unique color planes, tiles.rs model); a flat colormap collapses to

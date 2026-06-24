@@ -357,6 +357,7 @@ mod tests {
             greedy: false,
             fill_to_base: false,
             skip_floor: false,
+            omit_below_h: 0,
         }
     }
 

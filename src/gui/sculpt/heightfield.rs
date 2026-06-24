@@ -141,6 +141,24 @@ impl HeightField {
         top + (bottom - top) * ty
     }
 
+    /// Sample the cell height (meters above the native floor) under fractional
+    /// cell coordinates `(fx, fy)` — the canvas-pointer eyedropper sampler (spec
+    /// §3). Cells already ARE meters-above-floor, so this is a nearest-cell read
+    /// that floors `(fx, fy)` to an integer cell and clamps into
+    /// `[0, width-1] × [0, height-1]` so an off-grid or edge pointer saturates to
+    /// the nearest cell rather than reading out of bounds. Negative or NaN
+    /// coordinates clamp to cell `(0, 0)`. Returns the height in meters.
+    pub(crate) fn sample_cell_meters(&self, fx: f32, fy: f32) -> f32 {
+        debug_assert!(self.width > 0 && self.height > 0, "empty HeightField");
+        let max_x = self.width - 1;
+        let max_y = self.height - 1;
+        // floor() of a negative/NaN coordinate is handled by the clamp: NaN.max
+        // returns the bound, and a negative floor below 0 clamps up to 0.
+        let cx = fx.floor().clamp(0.0, max_x as f32) as u32;
+        let cy = fy.floor().clamp(0.0, max_y as f32) as u32;
+        self.at(cx, cy)
+    }
+
     /// Minimum and maximum cell heights. A non-empty field always has both
     /// (cells are constructed non-empty by every constructor); an empty field
     /// returns `(FLOOR_M, FLOOR_M)`.
@@ -177,6 +195,38 @@ impl HeightField {
             min_m: FLOOR_M,
             max_m: max,
         }
+    }
+
+    /// Extract a sub-grid by INTEGER cell ranges `[x0, x1) × [y0, y1)` (the
+    /// grid-tiled export seam, spec §5). Ranges are half-open in cells; an
+    /// adjacent sub-field whose `x0` equals this one's `x1` does NOT overlap,
+    /// while one whose `x0` equals this one's `x1 - 1` SHARES that exact edge
+    /// column. The tiler builds shared-edge ranges so seams are exact by integer
+    /// cell identity — there is no projection or zoom drift like the geographic
+    /// grid, the values are the same source cells.
+    ///
+    /// The carried [`FieldMeta`] is cloned verbatim (same pitch/scale/micro), so
+    /// every sub-field meshes at the identical scale — the seam abuts. Debug-checks
+    /// the ranges are in-bounds and non-empty (Rule 5/7).
+    pub(crate) fn sub_field(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> HeightField {
+        debug_assert!(
+            x0 < x1 && y0 < y1,
+            "sub_field range must be non-empty: x[{x0},{x1}) y[{y0},{y1})",
+        );
+        debug_assert!(
+            x1 <= self.width && y1 <= self.height,
+            "sub_field range out of bounds: x[{x0},{x1}) y[{y0},{y1}) vs {}x{}",
+            self.width,
+            self.height,
+        );
+        let sw = x1 - x0;
+        let sh = y1 - y0;
+        let mut cells = Vec::with_capacity((sw as usize) * (sh as usize));
+        for y in y0..y1 {
+            let row = (y * self.width + x0) as usize;
+            cells.extend_from_slice(&self.cells[row..row + sw as usize]);
+        }
+        HeightField { width: sw, height: sh, cells, meta: self.meta.clone() }
     }
 }
 
@@ -270,12 +320,84 @@ mod tests {
     }
 
     #[test]
+    fn sample_cell_meters_reads_nearest_cell() {
+        // A field whose cells ARE meters above floor: the eyedropper sampler must
+        // return the hovered cell's meters, flooring fractional pointer coords to
+        // the cell and clamping off-grid/edge reads to the nearest cell.
+        let mut f = HeightField::flat(3, 2, test_meta());
+        f.set(0, 0, 0.0);
+        f.set(1, 0, 10.0);
+        f.set(2, 0, 20.0);
+        f.set(0, 1, 30.0);
+        f.set(1, 1, 40.0);
+        f.set(2, 1, 50.0);
+
+        // Integer-cell hits read that cell's meters exactly.
+        assert_eq!(f.sample_cell_meters(0.0, 0.0), 0.0);
+        assert_eq!(f.sample_cell_meters(2.0, 1.0), 50.0);
+        // Fractional pointer inside a cell floors to that cell (nearest-cell).
+        assert_eq!(f.sample_cell_meters(1.7, 0.2), 10.0, "x=1.7 floors to cell 1");
+        assert_eq!(f.sample_cell_meters(1.9, 1.9), 40.0, "1.9,1.9 floors to cell (1,1)");
+        // Off-grid (negative / beyond the last cell) clamps to the nearest cell.
+        assert_eq!(f.sample_cell_meters(-5.0, -5.0), 0.0, "negative clamps to (0,0)");
+        assert_eq!(f.sample_cell_meters(99.0, 99.0), 50.0, "beyond-edge clamps to (2,1)");
+    }
+
+    #[test]
     fn set_clamps_to_floor() {
         let mut f = HeightField::flat(2, 2, test_meta());
         f.set(0, 0, -50.0);
         assert_eq!(f.at(0, 0), FLOOR_M, "set must clamp below-floor values up to FLOOR_M");
         f.set(1, 1, 12.5);
         assert_eq!(f.at(1, 1), 12.5, "in-range set must store the value verbatim");
+    }
+
+    /// `sub_field` extracts an integer cell range verbatim, and two adjacent
+    /// shared-edge sub-fields (the right one starting on the left one's last
+    /// column) carry the EXACT same values in their shared column — the seam is
+    /// exact by integer cell identity, no projection drift (spec §5).
+    #[test]
+    fn sub_field_shares_exact_edge_cells() {
+        // A 6×4 field with a unique value per cell so any mismatch is detectable.
+        let mut f = HeightField::flat(6, 4, test_meta());
+        for y in 0..4u32 {
+            for x in 0..6u32 {
+                f.set(x, y, (y * 6 + x) as f32);
+            }
+        }
+
+        // A sub-field is a verbatim copy of its cell window.
+        let sub = f.sub_field(1, 1, 4, 3); // x in [1,4), y in [1,3) → 3×2
+        assert_eq!((sub.width, sub.height), (3, 2), "sub-field dims = range size");
+        for y in 0..2u32 {
+            for x in 0..3u32 {
+                assert_eq!(
+                    sub.at(x, y),
+                    f.at(x + 1, y + 1),
+                    "sub_field cell ({x},{y}) must mirror source ({},{})",
+                    x + 1,
+                    y + 1,
+                );
+            }
+        }
+        // The carried meta is identical (uniform scale across tiles → abutting seams).
+        assert_eq!(sub.meta, f.meta, "sub_field must clone the field meta verbatim");
+
+        // Two horizontally adjacent SHARED-EDGE sub-fields: A = cols [0,4), B =
+        // cols [3,6) (B begins on A's last column, index 3). Their shared column
+        // (A's local x=3, B's local x=0) holds the SAME source cells for every row.
+        let a = f.sub_field(0, 0, 4, 4);
+        let b = f.sub_field(3, 0, 6, 4);
+        let a_edge = a.width - 1; // 3
+        for y in 0..4u32 {
+            assert_eq!(
+                a.at(a_edge, y),
+                b.at(0, y),
+                "shared edge column must be byte-identical from either neighbor (row {y})",
+            );
+            // …and it is the SAME source cell, column 3.
+            assert_eq!(a.at(a_edge, y), f.at(3, y), "shared edge is source column 3");
+        }
     }
 
     fn passthrough_request() -> BuildRequest {

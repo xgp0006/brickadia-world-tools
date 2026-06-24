@@ -116,6 +116,8 @@ fn options_from_matches(matches: &ArgMatches) -> GenOptions {
         fill_to_base: false,
         // CLI never skips the floor — its output stays byte-identical.
         skip_floor: false,
+        // CLI never omits columns (skip_floor is off); the threshold is inert.
+        omit_below_h: 0,
     }
 }
 
