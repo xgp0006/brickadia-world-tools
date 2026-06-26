@@ -24,4 +24,5 @@ mod preview_source;
 mod sculpt;
 mod theme;
 mod tiles;
+mod zones;
 pub use theme::install_theme;
