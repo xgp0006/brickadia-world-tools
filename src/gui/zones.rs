@@ -11,14 +11,12 @@
 //! !inside_any_omit`. Omit wins on overlap; an empty zone set keeps everything
 //! (the byte-identical default).
 
-// ponytail: the masking core lands before its callers (Steps 2/5 of the plan
-// wire it into the mesher and convert). Drop this allow once `rasterize` is
-// called from `sculpt::convert`.
-#![allow(dead_code)]
-
 /// Whether a zone cuts a hole (`Omit`) or restricts the export to its interior
 /// (`Include`). Serde derives are intentionally absent in Phase 1a — they arrive
 /// with the `.h2bproj` project file in Phase 1b.
+// ponytail: `Omit` is constructed by the Zone tool's mode toggle in step 4;
+// until that UI lands, only `Include` is built in non-test code (in `rasterize`).
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ZoneMode {
     Omit,

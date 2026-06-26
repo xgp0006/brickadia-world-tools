@@ -1792,6 +1792,10 @@ fn start_convert(state: &mut SculptState) {
     let omit_below_m = state.omit_below_m;
     let tile_export = state.tile_export;
     let tile_cells = state.tile_cells;
+    // Clone the zones into the worker alongside the field. Converting READS them
+    // (rasterized to a keep-mask) but never clears `state.zones` — they persist
+    // so the user can re-export, refine, or clear explicitly.
+    let zones = state.zones.clone();
     state.last_outcome = None;
     state.last_error = None;
     state.convert_cancel.store(false, Ordering::Relaxed);
@@ -1813,10 +1817,13 @@ fn start_convert(state: &mut SculptState) {
             // stitched save built from shared-edge sub-fields); off = single mesh.
             let result = if tile_export {
                 convert_heightfield_tiled(
-                    &field, out, tile_cells, floor_level_m, omit_below_m, progress_fn, cancel_arc,
+                    &field, out, tile_cells, floor_level_m, omit_below_m, &zones, progress_fn,
+                    cancel_arc,
                 )
             } else {
-                convert_heightfield(&field, out, floor_level_m, omit_below_m, progress_fn, cancel_arc)
+                convert_heightfield(
+                    &field, out, floor_level_m, omit_below_m, &zones, progress_fn, cancel_arc,
+                )
             };
             sender.send(result);
         }) {

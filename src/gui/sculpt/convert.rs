@@ -23,6 +23,7 @@ use crate::gui::build::{
 };
 use crate::gui::grid::tile_world_offset;
 use crate::gui::map_tab::derive_scale;
+use crate::gui::zones::{self, Zone};
 use crate::util::{bricks_to_save, write_save_world};
 
 use super::heightfield::HeightField;
@@ -86,6 +87,7 @@ pub(crate) fn convert_heightfield(
     out: OutputOptions,
     floor_level_m: f32,
     omit_below_m: f32,
+    zones: &[Zone],
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
 ) -> Result<BuildOutcome, BuildError> {
@@ -135,6 +137,10 @@ pub(crate) fn convert_heightfield(
 
     progress(BuildStage::GeneratingBricks, 0.0);
     let flat = build::FlatColormap::sculpt_default(dem_width, dem_height);
+    // Freedraw zones → an XY keep-mask at the mesher's grid dims. Empty zones →
+    // `None`, byte-identical to a no-zone convert (no allocation, no per-cell
+    // work). Zones are NOT consumed/cleared — the caller keeps them for re-export.
+    let keep_mask = (!zones.is_empty()).then(|| zones::rasterize(zones, dem_width, dem_height));
     let bricks = generate_bricks_skip_floor(
         &heightmap,
         &flat,
@@ -145,7 +151,7 @@ pub(crate) fn convert_heightfield(
         h_omit,
         Arc::clone(&progress),
         Arc::clone(&cancel),
-        None, // Step 5: rasterized zone keep-mask wires in here.
+        keep_mask.as_deref(),
     )?;
     let brick_count = bricks.len();
 
@@ -235,6 +241,7 @@ pub(crate) fn convert_heightfield_tiled(
     tile_cells: u32,
     floor_level_m: f32,
     omit_below_m: f32,
+    zones: &[Zone],
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
 ) -> Result<BuildOutcome, BuildError> {
@@ -272,6 +279,11 @@ pub(crate) fn convert_heightfield_tiled(
     let y_bounds = tile_bounds(dem_height, tile_cells);
     let tile_total = (x_bounds.len() * y_bounds.len()) as f32;
 
+    // Rasterize zones against the FULL field ONCE; each tile slices its window out
+    // of this mask so a zone spanning a seam stays consistent across tiles. Empty
+    // zones → `None` (every tile meshes unmasked, byte-identical to today).
+    let full_mask = (!zones.is_empty()).then(|| zones::rasterize(zones, dem_width, dem_height));
+
     let mut combined: Vec<brdb::Brick> = Vec::new();
     // Pre-reserve to the summed sub-field cell-count ceiling (greedy meshing only
     // reduces brick count, so cell count is a safe upper bound) so the per-tile
@@ -304,6 +316,17 @@ pub(crate) fn convert_heightfield_tiled(
 
             let sub = field.sub_field(x0, y0, x1, y1);
             let raster = sub.to_dem_raster();
+            // Slice this tile's window out of the full-field mask (row-major), so
+            // the per-cell keep decision is identical to the single-mesh path.
+            let tile_mask = full_mask.as_ref().map(|full| {
+                let mut m = Vec::with_capacity((sub.width * sub.height) as usize);
+                for ty in 0..sub.height {
+                    for tx in 0..sub.width {
+                        m.push(full[((y0 + ty) * dem_width + (x0 + tx)) as usize]);
+                    }
+                }
+                m
+            });
             // Per-tile world offset from cumulative cells (the tile's NW cell index
             // is its absolute start) + the global-centering term over the FULL
             // field extent — the same algebra grid.rs::world_offset uses.
@@ -326,7 +349,7 @@ pub(crate) fn convert_heightfield_tiled(
                 h_omit,
                 tile_progress,
                 Arc::clone(&cancel),
-                None, // Step 5: per-tile slice of the full-field zone keep-mask.
+                tile_mask.as_deref(),
             )?;
 
             // Aggregate cap BEFORE folding in (mirrors run_grid_build correction
@@ -457,6 +480,7 @@ fn write_and_install(
 mod tests {
     use super::*;
     use crate::gui::build::{BlockType, BrickStyle, BuildRequest, FlatColormap, generate_bricks};
+    use crate::gui::zones::ZoneMode;
     use crate::gui::dem_sources::DemSource;
     use crate::gui::imagery_sources::ImagerySource;
     use crate::gui::tiles::BBoxLatLon;
@@ -1191,6 +1215,7 @@ mod tests {
             8,
             0.0,
             0.0,
+            &[],
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
         )
@@ -1222,10 +1247,217 @@ mod tests {
             out,
             0.0,
             0.0,
+            &[],
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
         )
         .expect_err("no format selected must error");
         assert!(matches!(err, BuildError::BrdbWrite(_)), "expected BrdbWrite, got {err:?}");
+    }
+
+    // ---- Step 5: freedraw zones applied at convert -------------------------
+
+    fn rect_zone(mode: ZoneMode, x0: f32, y0: f32, x1: f32, y1: f32) -> Zone {
+        Zone {
+            mode,
+            polygon: vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
+        }
+    }
+
+    /// As `mesh_field`, but with a freedraw keep-mask — exactly what the single
+    /// convert path does (`rasterize` at the field's dims → mesh).
+    fn mesh_field_masked(field: &HeightField, skip_floor: bool, mask: &[bool]) -> Vec<brdb::Brick> {
+        let raster = field.to_dem_raster();
+        let (hscale, vscale) = derive_scale(
+            field.meta.cell_m,
+            field.meta.studs_per_meter,
+            field.meta.vertical_exaggeration,
+            field.meta.micro,
+        );
+        let block_type = if field.meta.micro { BlockType::Micro } else { BlockType::SmoothTile };
+        let style = BrickStyle::new(block_type, hscale, false, false);
+        let size = i32::from(crate::gui::build::cell_size_units(hscale, field.meta.micro));
+        let offset = (-(raster.width as i32 * size), -(raster.height as i32 * size));
+        let hm = build_heightmap(&raster, vscale, 0.0);
+        let flat = FlatColormap::for_test(raster.width, raster.height);
+        generate_bricks_skip_floor(
+            &hm, &flat, style, Some(0), offset, skip_floor, 0,
+            noop_progress(), Arc::new(AtomicBool::new(false)), Some(mask),
+        )
+        .expect("masked mesh must succeed")
+    }
+
+    /// Mesh one tile of `field` with the per-tile slice of a full-field mask —
+    /// the independent reference for the tiled convert's slicing.
+    fn mesh_sub_masked(
+        field: &HeightField,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+        skip_floor: bool,
+        full_mask: &[bool],
+    ) -> Vec<brdb::Brick> {
+        let (hscale, vscale) = derive_scale(
+            field.meta.cell_m,
+            field.meta.studs_per_meter,
+            field.meta.vertical_exaggeration,
+            field.meta.micro,
+        );
+        let block_type = if field.meta.micro { BlockType::Micro } else { BlockType::SmoothTile };
+        let style = BrickStyle::new(block_type, hscale, false, false);
+        let size = crate::gui::build::cell_size_units(hscale, field.meta.micro);
+        let sub = field.sub_field(x0, y0, x1, y1);
+        let mut tile_mask = Vec::with_capacity((sub.width * sub.height) as usize);
+        for ty in 0..sub.height {
+            for tx in 0..sub.width {
+                tile_mask.push(full_mask[((y0 + ty) * field.width + (x0 + tx)) as usize]);
+            }
+        }
+        let raster = sub.to_dem_raster();
+        let offset = tile_world_offset(x0, y0, field.width, field.height, size);
+        let hm = build_heightmap(&raster, vscale, 0.0);
+        let flat = FlatColormap::for_test(sub.width, sub.height);
+        generate_bricks_skip_floor(
+            &hm, &flat, style, Some(0), offset, skip_floor, 0,
+            noop_progress(), Arc::new(AtomicBool::new(false)), Some(&tile_mask),
+        )
+        .expect("masked sub-field mesh must succeed")
+    }
+
+    /// An omit zone over a raised region drops those bricks, and NO surviving
+    /// brick is centered inside the omit footprint. An include zone keeps ONLY
+    /// its interior. Spatial proof the convert's rasterize lands at the right
+    /// cells/orientation (a transposed or mis-dimensioned mask would fail here).
+    #[test]
+    fn single_convert_omit_clears_footprint_include_keeps_interior() {
+        let field = hill_field(24, 24);
+        let base = mesh_field(&field, true);
+        assert!(!base.is_empty(), "the hill must emit bricks");
+
+        // Omit the central [8,16) × [8,16) block (where the hill's bricks live).
+        let omit = rect_zone(ZoneMode::Omit, 8.0, 8.0, 16.0, 16.0);
+        let mask = zones::rasterize(std::slice::from_ref(&omit), 24, 24);
+        let masked = mesh_field_masked(&field, true, &mask);
+        assert!(masked.len() < base.len(), "omit over the hill removes bricks");
+
+        // World window of the omit block: cell c maps to offset + 2*size*c.
+        let size = i32::from(crate::gui::build::cell_size_units(
+            derive_scale(
+                field.meta.cell_m,
+                field.meta.studs_per_meter,
+                field.meta.vertical_exaggeration,
+                field.meta.micro,
+            )
+            .0,
+            field.meta.micro,
+        ));
+        let off = -(24 * size);
+        let lo = off + 2 * size * 8;
+        let hi = off + 2 * size * 16;
+        for b in &masked {
+            let inside = b.position.x >= lo && b.position.x < hi && b.position.y >= lo && b.position.y < hi;
+            assert!(!inside, "no surviving brick may be centered inside the omit footprint");
+        }
+
+        // Include the SAME central block → only the hill's interior survives, and
+        // it is non-empty (the hill peak is inside the block).
+        let inc = rect_zone(ZoneMode::Include, 8.0, 8.0, 16.0, 16.0);
+        let inc_mask = zones::rasterize(std::slice::from_ref(&inc), 24, 24);
+        let included = mesh_field_masked(&field, true, &inc_mask);
+        assert!(!included.is_empty(), "include over the hill keeps its bricks");
+        for b in &included {
+            let inside = b.position.x >= lo && b.position.x < hi && b.position.y >= lo && b.position.y < hi;
+            assert!(inside, "every included brick must sit inside the include footprint");
+        }
+    }
+
+    /// A zone spanning a tile seam: the tiled convert's per-tile slices must
+    /// reassemble to the full-field mask, so the stitched `brick_count` equals the
+    /// summed masked sub-fields (watertight + consistent across the seam). Routes
+    /// through the PUBLIC `convert_heightfield_tiled`.
+    #[test]
+    fn tiled_seam_spanning_zone_matches_summed_masked_subfields() {
+        let field = hill_field(18, 18); // tile 8 → 3×3 split
+        let x_bounds = tile_bounds(18, 8);
+        let y_bounds = tile_bounds(18, 8);
+        assert!(x_bounds.len() >= 2 && y_bounds.len() >= 2, "must subdivide");
+
+        // An omit block straddling the central seams (cells 5..13).
+        let zone = rect_zone(ZoneMode::Omit, 5.0, 5.0, 13.0, 13.0);
+        let full_mask = zones::rasterize(std::slice::from_ref(&zone), 18, 18);
+
+        let mut expected = 0usize;
+        let mut unmasked = 0usize;
+        for &(y0, y1) in &y_bounds {
+            for &(x0, x1) in &x_bounds {
+                expected += mesh_sub_masked(&field, x0, y0, x1, y1, true, &full_mask).len();
+                unmasked += mesh_sub(&field, x0, y0, x1, y1, true).len();
+            }
+        }
+        assert!(expected < unmasked, "the seam-spanning omit must actually drop bricks");
+
+        let out = OutputOptions {
+            brdb: false,
+            brz: true,
+            install_to_brickadia: false,
+            overwrite: true,
+            skip_floor: true,
+        };
+        let outcome = convert_heightfield_tiled(
+            &field,
+            out,
+            8,
+            0.0,
+            0.0,
+            std::slice::from_ref(&zone),
+            noop_progress(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("tiled zone convert must succeed");
+        assert_eq!(
+            outcome.brick_count, expected,
+            "tiled stitch with a seam-spanning zone == summed masked sub-fields",
+        );
+        if !outcome.brdb_path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&outcome.brdb_path);
+        }
+    }
+
+    /// Converting READS zones but never consumes them: a second convert with the
+    /// same borrowed slice yields the identical brick count (the `&[Zone]` borrow
+    /// makes mutation impossible — this guards the "masks survive generation"
+    /// contract at the convert boundary).
+    #[test]
+    fn convert_does_not_consume_zones() {
+        let field = hill_field(16, 16);
+        let zones = vec![rect_zone(ZoneMode::Omit, 4.0, 4.0, 12.0, 12.0)];
+        let out = OutputOptions {
+            brdb: false,
+            brz: true,
+            install_to_brickadia: false,
+            overwrite: true,
+            skip_floor: true,
+        };
+        let run = |z: &[Zone]| {
+            let o = convert_heightfield(
+                &field,
+                out,
+                0.0,
+                0.0,
+                z,
+                noop_progress(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("convert must succeed");
+            if !o.brdb_path.as_os_str().is_empty() {
+                let _ = std::fs::remove_file(&o.brdb_path);
+            }
+            o.brick_count
+        };
+        let first = run(&zones);
+        let second = run(&zones);
+        assert_eq!(first, second, "zones are non-consuming across converts");
+        assert_eq!(zones.len(), 1, "the caller's zones vec is untouched");
     }
 }
