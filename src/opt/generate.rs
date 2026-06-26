@@ -43,6 +43,9 @@ pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
 ) -> Result<Vec<Brick>, String> {
     // Use greedy mesh if requested
     if options.greedy {
+        // No keep-mask on this generic path: freedraw zones flow through
+        // `generate_bricks_skip_floor`, which calls `gen_greedy_heightmap`
+        // directly with the mask. Every `gen_opt_heightmap` caller is unmasked.
         return gen_greedy_heightmap(
             heightmap,
             colormap,
@@ -50,6 +53,7 @@ pub fn gen_opt_heightmap<F: Fn(f32) -> bool>(
             base_height_override,
             offset,
             progress_f,
+            None,
         );
     }
 
@@ -269,6 +273,7 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     base_height_override: Option<u32>,
     offset: Option<(i32, i32)>,
     progress_f: F,
+    keep_mask: Option<&[bool]>,
 ) -> Result<Vec<Brick>, String> {
     macro_rules! progress {
         ($e:expr) => {
@@ -284,6 +289,19 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
 
     if colormap.size() != heightmap.size() {
         return Err("Heightmap and colormap must have same dimensions".to_string());
+    }
+
+    // Freedraw keep-mask is row-major `width*height`. A mismatch is a checked
+    // error (defense-in-depth, like the heightmap/colormap dimension check) so a
+    // miscomputed mask can never silently shift which cells are dropped.
+    if let Some(mask) = keep_mask
+        && mask.len() != (width as usize) * (height as usize)
+    {
+        return Err(format!(
+            "keep_mask length {} != width*height {}",
+            mask.len(),
+            (width as usize) * (height as usize),
+        ));
     }
 
     let pairs_vec = collect_height_color_pairs(heightmap, colormap, options.cull);
@@ -313,7 +331,7 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     );
 
     let (planes_with_metadata, plane_build_duration) =
-        build_planes(heightmap, colormap, options.cull, pairs_vec);
+        build_planes(heightmap, colormap, options.cull, pairs_vec, keep_mask);
     progress!(0.4);
 
     // Per-quad cell cap: a merged brick's world footprint is `cells * size`, so
@@ -384,6 +402,7 @@ fn build_planes(
     colormap: &dyn Colormap,
     cull: bool,
     pairs_vec: Vec<(u32, [u8; 4])>,
+    keep_mask: Option<&[bool]>,
 ) -> (Vec<TaggedPlane>, Duration) {
     let start = Instant::now();
     let (width, height) = heightmap.size();
@@ -397,10 +416,17 @@ fn build_planes(
 
     for x in 0..width {
         for y in 0..height {
+            // Freedraw omit/include mask: a `false` cell is excluded from every
+            // occupancy plane — the same per-cell skip `cull` performs — so it
+            // emits no brick. `None` (and an all-`true` mask) leaves the planes
+            // byte-identical, guarded by `keep_mask_none_is_byte_identical`.
+            let kept = keep_mask.is_none_or(|m| m[(y * width + x) as usize]);
+
             let h = heightmap.at(x, y);
             let c = colormap.at(x, y);
 
-            if (!cull || (h > 0 && c[3] > 0))
+            if kept
+                && (!cull || (h > 0 && c[3] > 0))
                 && let Some(&plane_idx) = plane_map.get(&(h, c))
             {
                 all_planes[plane_idx][x as usize].set_bit(y);
@@ -997,7 +1023,7 @@ mod tests {
         options.size = 35; // horizontal scale 7 (× 5 units/stud)
         options.fill_to_base = true;
         let bricks =
-            gen_greedy_heightmap(&map, &map, options, Some(0), Some((0, 0)), |_| true)
+            gen_greedy_heightmap(&map, &map, options, Some(0), Some((0, 0)), |_| true, None)
                 .expect("greedy mesh must succeed");
         assert!(!bricks.is_empty(), "a uniform field must emit bricks");
         let mut max_axis = 0u16;
@@ -1031,7 +1057,7 @@ mod tests {
         options.size = 40; // micro at horizontal scale 40 (× 1 unit/stud)
         options.fill_to_base = true;
         let bricks =
-            gen_greedy_heightmap(&map, &map, options, Some(0), Some((0, 0)), |_| true)
+            gen_greedy_heightmap(&map, &map, options, Some(0), Some((0, 0)), |_| true, None)
                 .expect("greedy micro mesh must succeed");
         assert!(!bricks.is_empty(), "a uniform field must emit bricks");
         for b in &bricks {
@@ -1044,5 +1070,84 @@ mod tests {
                 crate::opt::MAX_BRICK_UNITS,
             );
         }
+    }
+
+    /// Fresh greedy options for the keep-mask tests: fill_to_base on (so every
+    /// kept cell emits a column) and a small fixed canvas.
+    fn mask_test_options() -> GenOptions {
+        let mut o = test_options(false);
+        o.fill_to_base = true;
+        o
+    }
+
+    fn geom_of(bricks: &[Brick]) -> Vec<(Position, BrickSize)> {
+        bricks.iter().map(brick_geom).collect()
+    }
+
+    #[test]
+    fn keep_mask_none_is_byte_identical() {
+        // The identity guard: an all-`true` mask must mesh byte-identically to
+        // `None`, so the masking machinery is provably inert by default.
+        let map = UniformMap { width: 8, height: 4 };
+        let none = gen_greedy_heightmap(
+            &map, &map, mask_test_options(), Some(0), Some((0, 0)), |_| true, None,
+        )
+        .expect("None mesh");
+        let all_true = vec![true; 8 * 4];
+        let masked = gen_greedy_heightmap(
+            &map, &map, mask_test_options(), Some(0), Some((0, 0)), |_| true, Some(&all_true),
+        )
+        .expect("all-true mesh");
+        assert!(!none.is_empty(), "fixture must emit bricks");
+        assert_eq!(geom_of(&none), geom_of(&masked), "all-true mask == None");
+    }
+
+    #[test]
+    fn keep_mask_all_false_emits_no_bricks() {
+        // Every cell masked out → no occupancy in any plane → zero bricks.
+        let map = UniformMap { width: 8, height: 4 };
+        let mask = vec![false; 8 * 4];
+        let bricks = gen_greedy_heightmap(
+            &map, &map, mask_test_options(), Some(0), Some((0, 0)), |_| true, Some(&mask),
+        )
+        .expect("all-false mesh");
+        assert!(bricks.is_empty(), "a fully-masked field emits nothing");
+    }
+
+    #[test]
+    fn keep_mask_partial_changes_geometry() {
+        // Keep only the left half (x < 4). The mesh must differ from the full
+        // field and still emit bricks — proof the mask drops real geometry.
+        let map = UniformMap { width: 8, height: 4 };
+        let mut mask = vec![false; 8 * 4];
+        for y in 0..4 {
+            for x in 0..4 {
+                mask[y * 8 + x] = true;
+            }
+        }
+        let full = gen_greedy_heightmap(
+            &map, &map, mask_test_options(), Some(0), Some((0, 0)), |_| true, None,
+        )
+        .expect("full mesh");
+        let masked = gen_greedy_heightmap(
+            &map, &map, mask_test_options(), Some(0), Some((0, 0)), |_| true, Some(&mask),
+        )
+        .expect("half-masked mesh");
+        assert!(!masked.is_empty(), "half a field still emits bricks");
+        assert_ne!(geom_of(&full), geom_of(&masked), "masking must change the mesh");
+    }
+
+    #[test]
+    fn keep_mask_wrong_length_is_a_checked_error() {
+        let map = UniformMap { width: 8, height: 4 };
+        let mask = vec![true; 8 * 4 - 1]; // one short
+        let result = gen_greedy_heightmap(
+            &map, &map, mask_test_options(), Some(0), Some((0, 0)), |_| true, Some(&mask),
+        );
+        // `.err()` (Option) sidesteps `expect_err`, which would need the Ok type
+        // `Vec<Brick>` to be Debug (brdb::Brick is not).
+        assert!(result.is_err(), "a mask length mismatch must error, not panic");
+        let err = result.err().expect("checked above");
+        assert!(err.contains("keep_mask length"), "informative error: {err}");
     }
 }

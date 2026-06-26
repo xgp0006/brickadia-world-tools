@@ -145,6 +145,7 @@ pub(crate) fn convert_heightfield(
         h_omit,
         Arc::clone(&progress),
         Arc::clone(&cancel),
+        None, // Step 5: rasterized zone keep-mask wires in here.
     )?;
     let brick_count = bricks.len();
 
@@ -325,6 +326,7 @@ pub(crate) fn convert_heightfield_tiled(
                 h_omit,
                 tile_progress,
                 Arc::clone(&cancel),
+                None, // Step 5: per-tile slice of the full-field zone keep-mask.
             )?;
 
             // Aggregate cap BEFORE folding in (mirrors run_grid_build correction
@@ -525,6 +527,7 @@ mod tests {
             h_omit,
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
+            None,
         )
         .expect("mesh must succeed")
     }
@@ -658,6 +661,7 @@ mod tests {
             0,
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
+            None,
         )
         .expect("sculpt passthrough must mesh");
 
@@ -1024,6 +1028,7 @@ mod tests {
             0,
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
+            None,
         )
         .expect("sub-field mesh must succeed")
     }

@@ -16,7 +16,7 @@ use image::RgbaImage;
 use log::info;
 
 use crate::map::{Colormap, Heightmap};
-use crate::opt::gen_opt_heightmap;
+use crate::opt::gen_greedy_heightmap;
 use crate::util::{GenOptions, bricks_to_save, to_linear_rgb};
 
 use super::dem_sources::{
@@ -453,7 +453,7 @@ pub(crate) fn build_one_tile(
     let bricks = match &imagery {
         Some(im) => generate_bricks_skip_floor(
             &heightmap, im, style, base, offset, skip_floor, omit_below_h,
-            Arc::clone(&progress), Arc::clone(&cancel),
+            Arc::clone(&progress), Arc::clone(&cancel), None,
         )?,
         None => {
             let flat = FlatColormap {
@@ -463,7 +463,7 @@ pub(crate) fn build_one_tile(
             };
             generate_bricks_skip_floor(
                 &heightmap, &flat, style, base, offset, skip_floor, omit_below_h,
-                Arc::clone(&progress), Arc::clone(&cancel),
+                Arc::clone(&progress), Arc::clone(&cancel), None,
             )?
         }
     };
@@ -932,7 +932,7 @@ pub(crate) fn generate_bricks(
     // `generate_bricks_skip_floor(true)` instead so a blank canvas reveals the
     // native Brickadia floor.
     generate_bricks_skip_floor(
-        heightmap, colormap, style, base_override, offset, false, 0, progress, cancel,
+        heightmap, colormap, style, base_override, offset, false, 0, progress, cancel, None,
     )
 }
 
@@ -959,6 +959,7 @@ pub(crate) fn generate_bricks_skip_floor(
     omit_below_h: u32,
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
+    keep_mask: Option<&[bool]>,
 ) -> Result<Vec<brdb::Brick>, BuildError> {
     let BrickStyle { block_type, horizontal_scale, glow, nocollide } = style;
     // `size` = stud→unit conversion (1 stud = 5 units; micro ×1) times the
@@ -1001,14 +1002,26 @@ pub(crate) fn generate_bricks_skip_floor(
         progress(BuildStage::GeneratingBricks, f);
         !cancel.load(std::sync::atomic::Ordering::Relaxed)
     };
-    gen_opt_heightmap(heightmap, colormap, options, base_override, Some(offset), cancel_check)
-        .map_err(|e| {
-            if e == crate::opt::CANCELLED_MSG {
-                BuildError::Cancelled
-            } else {
-                BuildError::BrickGen(e)
-            }
-        })
+    // `options.greedy` is hardcoded true here, so call the greedy mesher
+    // directly — it's the only path that takes a freedraw keep-mask, and going
+    // through `gen_opt_heightmap` (which would always dispatch to greedy anyway)
+    // would force every other `gen_opt_heightmap` caller to thread a `None`.
+    gen_greedy_heightmap(
+        heightmap,
+        colormap,
+        options,
+        base_override,
+        Some(offset),
+        cancel_check,
+        keep_mask,
+    )
+    .map_err(|e| {
+        if e == crate::opt::CANCELLED_MSG {
+            BuildError::Cancelled
+        } else {
+            BuildError::BrickGen(e)
+        }
+    })
 }
 
 fn write_brdb(name: &str, bricks: Vec<brdb::Brick>) -> Result<PathBuf, BuildError> {
