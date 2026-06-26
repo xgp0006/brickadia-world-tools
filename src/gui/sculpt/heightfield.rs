@@ -13,6 +13,12 @@ use crate::gui::build::DemRaster;
 /// up, nothing carves beneath the floor.
 pub(crate) const FLOOR_M: f32 = 0.0;
 
+/// Vertical scale baked into an exported heightmap PNG: meters × this = the
+/// integer height stored per pixel. Matches Stage 1's (`geotiff2heightmap`)
+/// default `-v 100` (1 unit ≈ 1 cm), so exports load through the same
+/// rgba-encoded `HeightmapPNG` decoder the CLI/map pipeline already uses.
+pub(crate) const HEIGHTMAP_PNG_SCALE: f32 = 100.0;
+
 /// Convert + scale metadata carried alongside the height grid. None of these
 /// affect the grid values themselves; they parameterize the eventual convert
 /// (pitch, exaggeration, brick style) and name the output.
@@ -195,6 +201,22 @@ impl HeightField {
             min_m: FLOOR_M,
             max_m: max,
         }
+    }
+
+    /// Encode the field as an rgba-encoded heightmap PNG — the same format Stage 1
+    /// (`geotiff2heightmap/map.py`) emits and `HeightmapPNG::new(.., rgba_encoded =
+    /// true)` decodes. Each cell's floor-relative height in meters is scaled by
+    /// [`HEIGHTMAP_PNG_SCALE`], rounded, and packed as a big-endian `u32` across the
+    /// RGBA channels, so a sculpted field round-trips losslessly through the
+    /// CLI/map pipeline (and is a faithful, shareable heightmap).
+    pub(crate) fn to_heightmap_png(&self) -> image::RgbaImage {
+        image::RgbaImage::from_fn(self.width, self.height, |x, y| {
+            let meters = self.at(x, y);
+            // clamp guards against absurd heights overflowing the u32 encoding;
+            // real terrain (≤ ~9 km × 100) is nowhere near the ceiling.
+            let scaled = (meters * HEIGHTMAP_PNG_SCALE).round().clamp(0.0, u32::MAX as f32) as u32;
+            image::Rgba(scaled.to_be_bytes())
+        })
     }
 
     /// Extract a sub-grid by INTEGER cell ranges `[x0, x1) × [y0, y1)` (the
@@ -416,6 +438,8 @@ mod tests {
             no_collision: false,
             install_to_brickadia: false,
             overwrite_world: false,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
         }
     }
 
@@ -498,5 +522,33 @@ mod tests {
             direct_geom, sculpt_geom,
             "HeightField passthrough must produce brick-identical output to a direct build",
         );
+    }
+
+    /// The PNG export encodes each cell as `round(meters * HEIGHTMAP_PNG_SCALE)`
+    /// in big-endian RGBA — the exact format Stage 1 (`geotiff2heightmap/map.py`)
+    /// emits and `HeightmapPNG::new(.., rgba_encoded = true)` decodes, so a
+    /// sculpted field round-trips losslessly through the CLI/map pipeline.
+    #[test]
+    fn to_heightmap_png_encodes_floor_relative_meters_as_big_endian_u32() {
+        use crate::map::HeightmapPNG;
+
+        let mut f = HeightField::flat(2, 1, test_meta());
+        f.set(0, 0, 1.0); // 1.0 m  -> 100  -> [0,0,0,100]
+        f.set(1, 0, 2.55); // 2.55 m -> 255  -> [0,0,0,255]
+        let img = f.to_heightmap_png();
+        assert_eq!(img.dimensions(), (2, 1), "image dims must match the field grid");
+        assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0, 100], "1.0 m * 100 = 100, big-endian");
+        assert_eq!(img.get_pixel(1, 0).0, [0, 0, 0, 255], "2.55 m * 100 = 255, big-endian");
+
+        // Round-trip through the real decoder: write the PNG, load it as an
+        // rgba-encoded heightmap, and confirm each cell decodes to its scaled
+        // integer height — proving the exported PNG is pipeline-compatible.
+        let path = std::env::temp_dir()
+            .join(format!("h2brz_export_test_{}.png", std::process::id()));
+        img.save(&path).expect("export PNG must be writable");
+        let decoded = HeightmapPNG::new(vec![&path], true).expect("exported PNG must load");
+        assert_eq!(decoded.at(0, 0), 100, "decoder must recover 1.0 m * 100");
+        assert_eq!(decoded.at(1, 0), 255, "decoder must recover 2.55 m * 100");
+        let _ = std::fs::remove_file(path);
     }
 }

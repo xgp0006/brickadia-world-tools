@@ -14,6 +14,7 @@
 //! on a worker thread (the same Promise pattern as the Map tab's build).
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -367,6 +368,9 @@ pub(crate) struct SculptState {
     convert_cancel: Arc<AtomicBool>,
     last_outcome: Option<BuildOutcome>,
     last_error: Option<String>,
+    /// Path of the most recently exported heightmap PNG, surfaced in the result
+    /// line. Independent of the brick convert outcome.
+    last_export: Option<PathBuf>,
 }
 
 impl Default for SculptState {
@@ -416,6 +420,7 @@ impl Default for SculptState {
             convert_cancel: Arc::new(AtomicBool::new(false)),
             last_outcome: None,
             last_error: None,
+            last_export: None,
         }
     }
 }
@@ -962,6 +967,16 @@ fn draw_convert_section(state: &mut SculptState, ui: &mut Ui, estimate: ExportEs
     if enabled && resp.clicked() {
         start_convert(state);
     }
+
+    // Export the editable terrain itself as a heightmap PNG — independent of the
+    // brick convert above (no output-format/budget gate; it writes one image).
+    // Round-trips through the CLI/map pipeline's rgba-encoded `HeightmapPNG`.
+    let export = ui.add(
+        egui::Button::new("🖼  Export heightmap PNG").min_size(Vec2::new(260.0, 28.0)),
+    );
+    if export.clicked() {
+        export_heightmap_png(state);
+    }
 }
 
 fn draw_last_result(state: &SculptState, ui: &mut Ui) {
@@ -985,6 +1000,10 @@ fn draw_last_result(state: &SculptState, ui: &mut Ui) {
         if let Some(warn) = &outcome.install_warning {
             ui.colored_label(STATUS_ERROR_FG, format!("⚠ {warn}"));
         }
+    }
+    if let Some(path) = &state.last_export {
+        ui.colored_label(STATUS_WARN_FG, "✔ Heightmap PNG exported");
+        ui.small(format!("wrote → {}", path.display()));
     }
     if let Some(err) = &state.last_error {
         ui.colored_label(STATUS_ERROR_FG, format!("✘ {err}"));
@@ -1589,6 +1608,41 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+// ----- Export heightmap PNG ------------------------------------------------
+
+/// Save the current sculpted field as an rgba-encoded heightmap PNG via the
+/// native save dialog. Encoding + write are synchronous (sculpt grids are small
+/// and this is a one-shot user action). The PNG round-trips through the CLI/map
+/// pipeline's `HeightmapPNG` decoder — see [`HeightField::to_heightmap_png`].
+fn export_heightmap_png(state: &mut SculptState) {
+    let Some(field) = state.field.as_ref() else {
+        state.last_error = Some("internal: export with no field".into());
+        return;
+    };
+    let trimmed = state.output_name.trim();
+    let stem = if trimmed.is_empty() { "heightmap" } else { trimmed };
+    let result = native_dialog::DialogBuilder::file()
+        .add_filter("PNG heightmap", ["png"])
+        .set_filename(format!("{stem}.png"))
+        .save_single_file()
+        .show();
+    let path = match result {
+        Ok(Some(p)) => p,
+        Ok(None) => return, // user cancelled
+        Err(e) => {
+            state.last_error = Some(format!("file dialog failed: {e}"));
+            return;
+        }
+    };
+    match field.to_heightmap_png().save(&path) {
+        Ok(()) => {
+            state.last_error = None;
+            state.last_export = Some(path);
+        }
+        Err(e) => state.last_error = Some(format!("could not write heightmap PNG: {e}")),
+    }
 }
 
 // ----- Load heightmap image ------------------------------------------------

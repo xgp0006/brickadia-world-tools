@@ -193,8 +193,10 @@ fn optimize_quadtree<F: Fn(f32) -> bool>(
     let mut scale = 0;
 
     // loop until the bricks would be too wide or we stop optimizing bricks
-    while 2_i32.pow(scale + 1) * (options.size as i32) < 500 {
-        if !progress_f(0.2 + 0.5 * (scale as f32 / (500.0 / (options.size as f32)).log2())) {
+    while 2_i32.pow(scale + 1) * (options.size as i32) < i32::from(super::MAX_BRICK_UNITS) {
+        if !progress_f(
+            0.2 + 0.5 * (scale as f32 / (f32::from(super::MAX_BRICK_UNITS) / (options.size as f32)).log2()),
+        ) {
             return Err(CANCELLED_MSG.to_string());
         }
         let count = quad.quad_optimize_level(scale);
@@ -314,8 +316,14 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
         build_planes(heightmap, colormap, options.cull, pairs_vec);
     progress!(0.4);
 
-    let brick_scale = if options.micro { 2 } else { 10 };
-    let max_quad_size = 1000 / brick_scale;
+    // Per-quad cell cap: a merged brick's world footprint is `cells * size`, so
+    // the cap must scale with `options.size` (= horizontal_scale * 5, or *1 for
+    // micro) to keep every brick within `MAX_BRICK_UNITS` (the same cap the
+    // quadtree path enforces in quad.rs `line_optimize`). The `.max(1)` keeps the
+    // cap positive when a single cell already exceeds it (unavoidable: one cell
+    // is the minimum brick). A larger `size` merges fewer cells per brick.
+    let max_quad_size =
+        (u32::from(super::MAX_BRICK_UNITS) / u32::from(options.size).max(1)).max(1);
     let (all_quads, greedy_mesh_duration) =
         mesh_planes(planes_with_metadata, width, height, max_quad_size);
     progress!(0.7);
@@ -952,5 +960,89 @@ mod tests {
             (bricks[0].color.r, bricks[0].color.g, bricks[0].color.b),
             (1, 2, 3)
         );
+    }
+
+    /// A uniform field merges maximally, so it stresses the per-quad cell cap.
+    struct UniformMap {
+        width: u32,
+        height: u32,
+    }
+    impl Heightmap for UniformMap {
+        fn at(&self, _x: u32, _y: u32) -> u32 {
+            20
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+    }
+    impl Colormap for UniformMap {
+        fn at(&self, _x: u32, _y: u32) -> [u8; 4] {
+            [128, 128, 128, 255]
+        }
+        fn size(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+    }
+
+    /// A merged brick's world footprint is `quad_cells * options.size`. The
+    /// per-quad cell cap must shrink as `size` (= horizontal_scale * 5) grows so
+    /// no brick exceeds `MAX_BRICK_UNITS` (the cap the quadtree path also
+    /// enforces, quad.rs `line_optimize`). At `size = 35` a wide flat band merges
+    /// up to `floor(MAX_BRICK_UNITS/35)` cells — well past the old 100-stud cap,
+    /// which is the point (fewer, larger bricks), but never over `MAX_BRICK_UNITS`.
+    #[test]
+    fn greedy_merges_never_exceed_the_brick_unit_cap() {
+        let map = UniformMap { width: 800, height: 4 };
+        let mut options = test_options(false);
+        options.size = 35; // horizontal scale 7 (× 5 units/stud)
+        options.fill_to_base = true;
+        let bricks =
+            gen_greedy_heightmap(&map, &map, options, Some(0), Some((0, 0)), |_| true)
+                .expect("greedy mesh must succeed");
+        assert!(!bricks.is_empty(), "a uniform field must emit bricks");
+        let mut max_axis = 0u16;
+        for b in &bricks {
+            let (_, size) = brick_geom(b);
+            assert!(
+                size.x <= crate::opt::MAX_BRICK_UNITS && size.y <= crate::opt::MAX_BRICK_UNITS,
+                "merged brick {}×{} units exceeds MAX_BRICK_UNITS ({})",
+                size.x,
+                size.y,
+                crate::opt::MAX_BRICK_UNITS,
+            );
+            max_axis = max_axis.max(size.x).max(size.y);
+        }
+        // The cap is actually exercised (the map is wider than the cap allows),
+        // and merging now exceeds the old conservative 500-unit limit.
+        assert!(
+            max_axis > 500,
+            "with the raised cap a wide flat band must merge past the old 500-unit limit, got {max_axis}",
+        );
+    }
+
+    /// The same cap holds for micro bricks at horizontal scale > 1 (`size > 1`):
+    /// micro's larger merge budget must still scale down with `size` so a merged
+    /// micro brick never exceeds `MAX_BRICK_UNITS` either.
+    #[test]
+    fn greedy_micro_merges_never_exceed_the_brick_unit_cap() {
+        let map = UniformMap { width: 800, height: 4 };
+        let mut options = test_options(false);
+        options.micro = true;
+        options.size = 40; // micro at horizontal scale 40 (× 1 unit/stud)
+        options.fill_to_base = true;
+        let bricks =
+            gen_greedy_heightmap(&map, &map, options, Some(0), Some((0, 0)), |_| true)
+                .expect("greedy micro mesh must succeed");
+        assert!(!bricks.is_empty(), "a uniform field must emit bricks");
+        for b in &bricks {
+            let (_, size) = brick_geom(b);
+            assert!(
+                size.x <= crate::opt::MAX_BRICK_UNITS && size.y <= crate::opt::MAX_BRICK_UNITS,
+                "merged micro brick {}×{} units exceeds MAX_BRICK_UNITS ({})",
+                size.x,
+                size.y,
+                crate::opt::MAX_BRICK_UNITS,
+            );
+        }
     }
 }

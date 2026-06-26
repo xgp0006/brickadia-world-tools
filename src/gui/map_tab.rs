@@ -43,13 +43,16 @@ const MIN_SPAN_DEG: f64 = 1e-4;
 const DEFAULT_STUDS_PER_METER: f32 = 4.0;
 const STUDS_PER_METER_MIN: f32 = 0.5;
 const STUDS_PER_METER_MAX: f32 = 32.0;
-/// Hard cap on the derived integer horizontal brick scale. The widest single
-/// brick is `max_quad * size = 500 * hscale` units in BOTH brick classes (normal:
-/// 100 * hscale*5; micro: 500 * hscale*1), which must stay under the u16
-/// `BrickSize` ceiling (65535) → hscale ≤ 131. 128 (= 64000, safe) lets MICRO —
-/// which needs ~5× the integer scale of normal bricks to hit the same physical
-/// scale — reach a fine, faithful 1:1 model instead of clamping early; normal
-/// bricks rarely want more than ~32 (above that each cell is a very wide plate).
+/// Hard cap on the derived integer horizontal brick scale. The greedy mesher's
+/// per-quad clamp (`gen_greedy_heightmap`) caps every merged brick at
+/// `opt::MAX_BRICK_UNITS` (the quadtree path also enforces it) — `max_quad =
+/// MAX_BRICK_UNITS/size`, so a merged brick is ≤ MAX_BRICK_UNITS regardless of
+/// `hscale`. The only thing `hscale` bounds here is a SINGLE unmerged cell
+/// (`1 * size = hscale * 5` units), which must stay under the u16 `BrickSize`
+/// ceiling (65535) → hscale ≤ 13107; 128 is a far more conservative usability
+/// cap. 128 lets MICRO — which needs ~5× the integer scale of normal bricks to
+/// hit the same physical scale — reach a fine, faithful 1:1 model; normal bricks
+/// rarely want more than ~32 (above that each cell is a very wide plate).
 const MAX_HORIZONTAL_SCALE: u16 = 128;
 
 #[derive(Debug, Clone, Copy)]
@@ -200,6 +203,13 @@ pub(crate) struct MapTabState {
     glow: bool,
     no_collision: bool,
     overwrite_world: bool,
+    /// Omit-below level (metres above the area's lowest point): columns at or
+    /// below it emit no bricks — the "don't import the water level" knob, parity
+    /// with the sculpt tab's omit. Default `0.0` imports everything.
+    omit_below_m: f32,
+    /// Floor level (metres above the lowest point) every column fills DOWN to —
+    /// a raised base shortens fills. Parity with the sculpt tab. Default `0.0`.
+    floor_level_m: f32,
     output_name: String,
     settings_open: bool,
     key_input_opentopo: String,
@@ -252,6 +262,8 @@ impl MapTabState {
             imagery_source: ImagerySource::EsriWorldImagery,
             block_type: BlockType::SmoothTile,
             density_factor: 1,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
             studs_per_meter: DEFAULT_STUDS_PER_METER,
             vertical_exaggeration: 1.0,
             glow: false,
@@ -734,6 +746,34 @@ fn draw_brick_options(state: &mut MapTabState, ui: &mut Ui) {
             "Terrain uses the emissive GLOW material instead of plastic, so it \
              self-illuminates in-game.",
         );
+
+    ui.add_space(4.0);
+    ui.label("Omit below (water level, m)");
+    ui.add(
+        egui::DragValue::new(&mut state.omit_below_m)
+            .range(0.0..=100_000.0)
+            .speed(0.5)
+            .suffix(" m"),
+    )
+    .on_hover_text(
+        "Don't import terrain at or below this many metres above the area's \
+         LOWEST point — drops oceans/lakes/water so the native Brickadia floor \
+         shows through. 0 = import everything. Parity with the Sculpt tab's omit.",
+    );
+
+    ui.add_space(4.0);
+    ui.label("Floor level (m)");
+    ui.add(
+        egui::DragValue::new(&mut state.floor_level_m)
+            .range(0.0..=100_000.0)
+            .speed(0.5)
+            .suffix(" m"),
+    )
+    .on_hover_text(
+        "Fill every column DOWN to this many metres above the lowest point \
+         instead of to bedrock — a raised floor shortens fills (fewer buried \
+         bricks). 0 = fill to the area minimum. Parity with the Sculpt tab.",
+    );
 }
 
 fn draw_output_section(state: &mut MapTabState, ui: &mut Ui) {
@@ -834,6 +874,8 @@ fn start_fetch(state: &mut MapTabState) {
         no_collision: state.no_collision,
         install_to_brickadia: true,
         overwrite_world: state.overwrite_world,
+        omit_below_m: state.omit_below_m,
+        floor_level_m: state.floor_level_m,
     };
     state.last_outcome = None;
     state.last_error = None;
@@ -938,6 +980,8 @@ fn start_send_to_sculpt(state: &mut MapTabState) {
         no_collision: state.no_collision,
         install_to_brickadia: false,
         overwrite_world: false,
+        omit_below_m: state.omit_below_m,
+        floor_level_m: state.floor_level_m,
     };
     let meta = sculpt::FieldMeta {
         cell_m: cell_m_eff,
@@ -1206,7 +1250,10 @@ fn draw_output_estimate(state: &MapTabState, b: BBox, ui: &mut Ui) {
     // loudly and point at the real fix (a smaller box → finer cells), since
     // raising Scale further does nothing here.
     let ideal_hscale = f64::from(state.studs_per_meter) * 5.0 * cell_m_eff / (2.0 * upf);
-    if ideal_hscale > f64::from(MAX_HORIZONTAL_SCALE) + 0.5 {
+    // Physical-span cap (mirrors derive_scale): micro's integer ceiling is 5×
+    // normal's, so the warning fires only when even that higher cap is exceeded.
+    let max_hscale = f64::from(MAX_HORIZONTAL_SCALE) * 5.0 / upf;
+    if ideal_hscale > max_hscale + 0.5 {
         ui.colored_label(
             STATUS_WARN_FG,
             format!(
@@ -1270,10 +1317,17 @@ pub(crate) fn derive_scale(
 ) -> (u16, f32) {
     debug_assert!(cell_m_eff > 0.0, "derive_scale: cell_m_eff must be positive, got {cell_m_eff}");
     let upf = if micro { 1.0 } else { 5.0 };
+    // Clamp the PHYSICAL cell span (`hscale * upf`), not the raw integer scale:
+    // micro (upf=1) needs 5× the integer scale of normal (upf=5) to reach the
+    // SAME physical world, so its ceiling is 5× higher. Clamping the raw integer
+    // at a shared 128 made micro saturate 5× too early and shrink 2–5×. The
+    // greedy per-quad clamp (500/size) bounds merged bricks, so the only u16
+    // `BrickSize` concern is a single cell (`size = hscale*upf ≤ 640 << 65535`).
+    let max_hscale = f64::from(MAX_HORIZONTAL_SCALE) * 5.0 / upf;
     // Solve `2*hscale*upf / cell_m_eff == studs_per_meter * 5` (5 units/stud).
     let hscale = ((f64::from(studs_per_meter) * 5.0 * cell_m_eff) / (2.0 * upf))
         .round()
-        .clamp(1.0, f64::from(MAX_HORIZONTAL_SCALE)) as u16;
+        .clamp(1.0, max_hscale) as u16;
     // 1:1 vertical (units/m) == achieved horizontal units/m, times exaggeration.
     let vertical = ((2.0 * f64::from(hscale) * upf / cell_m_eff) * f64::from(exaggeration)) as f32;
     (hscale, vertical)
@@ -1630,6 +1684,25 @@ mod tests {
     }
 
     #[test]
+    fn derive_scale_micro_matches_normal_physical_scale_at_coarse_cells() {
+        // Regression (the micro-shrink bug): at coarse cells the micro integer
+        // scale is 5× normal, so it used to clamp at MAX_HORIZONTAL_SCALE long
+        // before normal did — shrinking micro terrain 2–5× vs the equivalent
+        // normal build. The cap is on the PHYSICAL span, so micro must reach the
+        // same `hscale * upf` span as normal here (cell_m=58, spm=4: normal
+        // hscale≈116 span≈580; micro must reach hscale≈580 span≈580, not 128).
+        let cell_m = 58.0;
+        let (hs_n, _) = derive_scale(cell_m, 4.0, 1.0, false);
+        let (hs_m, _) = derive_scale(cell_m, 4.0, 1.0, true);
+        let span_n = f64::from(hs_n) * 5.0; // normal units per cell-half
+        let span_m = f64::from(hs_m) * 1.0; // micro units per cell-half
+        assert!(
+            (span_n - span_m).abs() / span_n < 0.05,
+            "micro physical span must match normal at coarse cells: normal {span_n} vs micro {span_m}",
+        );
+    }
+
+    #[test]
     fn derive_scale_bigger_studs_per_meter_means_bigger_world_clamped() {
         let (small, _) = derive_scale(3.63, 1.0, 1.0, false);
         let (big, _) = derive_scale(3.63, 8.0, 1.0, false);
@@ -1639,16 +1712,28 @@ mod tests {
     }
 
     #[test]
-    fn derive_scale_clamps_on_a_huge_coarse_box() {
-        // The user's report: a ~28 km box forces ~58 m cells (the DEM cell
-        // budget downsamples a big area), so studs_per_meter=4 wants hscale ~580
-        // and clamps to the u16 brick-size ceiling — yielding LARGE bricks (micro
-        // or not) at a much lower achieved scale than requested. Lock that case.
-        let cell_m = 58.0; // ~z11 over a 28 km box at mid latitude
-        let (hs, _) = derive_scale(cell_m, 4.0, 1.0, true);
-        assert_eq!(hs, MAX_HORIZONTAL_SCALE, "coarse cells + 4 studs/m must hit the brick-scale cap");
-        let achieved = 2.0 * f64::from(hs) * 1.0 / cell_m / 5.0; // studs/m
-        assert!(achieved < 1.5, "capped achieved studs/m ~{achieved} is well below the set 4");
+    fn derive_scale_clamps_micro_and_normal_to_the_same_physical_ceiling() {
+        // A huge, coarse box pushes the requested scale past the cap. The cap is
+        // on the PHYSICAL span, so both classes clamp to the SAME achieved
+        // studs/m — normal at MAX_HORIZONTAL_SCALE, micro at 5× that integer
+        // scale (its 1/5-size brick reaching the identical span). spm=8 over
+        // ~58 m cells over-requests scale: normal ideal≈232→128, micro≈1160→640.
+        let cell_m = 58.0;
+        let spm = 8.0;
+        let (hs_n, _) = derive_scale(cell_m, spm, 1.0, false);
+        let (hs_m, _) = derive_scale(cell_m, spm, 1.0, true);
+        assert_eq!(hs_n, MAX_HORIZONTAL_SCALE, "normal clamps at the integer cap");
+        assert_eq!(
+            hs_m,
+            MAX_HORIZONTAL_SCALE * 5,
+            "micro clamps at 5× the integer cap (same physical span as normal)",
+        );
+        let achieved_n = 2.0 * f64::from(hs_n) * 5.0 / cell_m / 5.0; // studs/m
+        let achieved_m = 2.0 * f64::from(hs_m) * 1.0 / cell_m / 5.0;
+        assert!(
+            (achieved_n - achieved_m).abs() < 1e-3,
+            "both classes must clamp to the same achieved studs/m: normal {achieved_n} vs micro {achieved_m}",
+        );
     }
 
     #[test]

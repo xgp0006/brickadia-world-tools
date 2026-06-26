@@ -11,6 +11,13 @@ use std::time::Duration;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TILES_PER_FETCH: usize = 64;
+/// Per-tile retry budget for transient transport failures (EAGAIN at TLS init,
+/// momentary connection blips). A single flaky tile must not discard an
+/// otherwise-complete multi-tile fetch.
+const MAX_TILE_RETRIES: u32 = 3;
+/// Base linear backoff between tile retries (`RETRY_BACKOFF * attempt`). Gives a
+/// momentarily resource-starved network stack time to recover.
+const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 pub(crate) const TILE_SIZE_PX: u32 = 256;
 /// Upper bound on cropped DEM cells (pixels) `pick_zoom` will select, with a
 /// backstop in build.rs. The greedy+imagery mesher allocates one `Vec<u128>`
@@ -251,7 +258,15 @@ pub(crate) fn fetch_bbox(
                 return Err(TileFetchError::Cancelled);
             }
             let coord = TileCoord { z: zoom, x: nw.x + gx, y: nw.y + gy };
-            let tile = fetch_one_tile(&agent, source, coord)?;
+            // Retry transient transport blips (EAGAIN at TLS init, dropped
+            // keep-alive) so one flaky tile out of dozens doesn't discard the
+            // whole fetch. HTTP status errors (4xx/5xx) are not retried — they
+            // are not transient in the same way.
+            let tile = with_retry(
+                RETRY_BACKOFF,
+                || fetch_one_tile(&agent, source, coord),
+                |e| matches!(e, TileFetchError::Network { .. }),
+            )?;
             paste_tile(&mut canvas, &tile, gx * TILE_SIZE_PX, gy * TILE_SIZE_PX);
             fetched += 1;
             progress(fetched as f32 / count as f32);
@@ -268,6 +283,30 @@ pub(crate) fn fetch_bbox(
         crop_x1: crop.2,
         crop_y1: crop.3,
     })
+}
+
+/// Run `op`, retrying up to [`MAX_TILE_RETRIES`] times on errors `should_retry`
+/// accepts (transient transport blips, not HTTP status codes). Sleeps
+/// `backoff * attempt` between tries (linear); `Duration::ZERO` skips the sleep
+/// so tests run instantly. Bounded by the retry budget — never loops forever.
+fn with_retry<T, E>(
+    backoff: Duration,
+    mut op: impl FnMut() -> Result<T, E>,
+    should_retry: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let mut attempt = 0u32;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(e) if attempt < MAX_TILE_RETRIES && should_retry(&e) => {
+                attempt += 1;
+                if !backoff.is_zero() {
+                    std::thread::sleep(backoff * attempt);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn fetch_one_tile(
@@ -421,9 +460,67 @@ use std::io::Read;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     fn horsetooth_bbox() -> BBoxLatLon {
         BBoxLatLon { north: 40.560, south: 40.523, east: -105.131, west: -105.183 }
+    }
+
+    /// A transient tile failure (EAGAIN at TLS init, a momentary blip) must NOT
+    /// discard the whole fetch: `with_retry` retries and recovers. (Duration ZERO
+    /// so the test never actually sleeps.)
+    #[test]
+    fn with_retry_recovers_from_transient_failures() {
+        let attempts = Cell::new(0u32);
+        let result: Result<u32, &str> = with_retry(
+            Duration::ZERO,
+            || {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n < 3 { Err("transient") } else { Ok(n) }
+            },
+            |_e| true,
+        );
+        assert_eq!(result, Ok(3), "must succeed once the transient failures clear");
+        assert_eq!(attempts.get(), 3, "two retries then success");
+    }
+
+    /// A non-retryable error (e.g. an HTTP 404) must fail immediately — retrying
+    /// a real status error just wastes time.
+    #[test]
+    fn with_retry_does_not_retry_non_retryable_errors() {
+        let attempts = Cell::new(0u32);
+        let result: Result<u32, &str> = with_retry(
+            Duration::ZERO,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err("fatal")
+            },
+            |_e| false,
+        );
+        assert_eq!(result, Err("fatal"));
+        assert_eq!(attempts.get(), 1, "a non-retryable error must not retry");
+    }
+
+    /// A persistently-failing tile gives up after the bounded retry budget rather
+    /// than looping forever.
+    #[test]
+    fn with_retry_gives_up_after_max_attempts() {
+        let attempts = Cell::new(0u32);
+        let result: Result<u32, &str> = with_retry(
+            Duration::ZERO,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err("always")
+            },
+            |_e| true,
+        );
+        assert_eq!(result, Err("always"));
+        assert_eq!(
+            attempts.get(),
+            MAX_TILE_RETRIES + 1,
+            "one initial try plus MAX_TILE_RETRIES retries",
+        );
     }
 
     #[test]

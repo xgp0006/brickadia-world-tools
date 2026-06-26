@@ -215,7 +215,7 @@ impl QuadTree {
                 while x + sx < self.width {
                     let i = self.index(x + sx, y);
                     let t = &self.tiles[i];
-                    if (sx + t.size.0) * tile_scale > 500 || !start.similar_line(t) {
+                    if (sx + t.size.0) * tile_scale > u32::from(super::MAX_BRICK_UNITS) || !start.similar_line(t) {
                         break;
                     }
                     horiz_tiles.push(i);
@@ -226,7 +226,7 @@ impl QuadTree {
                 while y + sy < self.height {
                     let i = self.index(x, y + sy);
                     let t = &self.tiles[i];
-                    if (sy + t.size.1) * tile_scale > 500 || !start.similar_line(t) {
+                    if (sy + t.size.1) * tile_scale > u32::from(super::MAX_BRICK_UNITS) || !start.similar_line(t) {
                         break;
                     }
                     vert_tiles.push(i);

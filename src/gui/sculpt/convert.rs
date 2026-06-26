@@ -619,6 +619,8 @@ mod tests {
             no_collision: false,
             install_to_brickadia: false,
             overwrite_world: false,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
         };
 
         // DIRECT map build: build_heightmap(global_min = raster.min_m),

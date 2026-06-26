@@ -135,6 +135,17 @@ pub(crate) struct BuildRequest {
     /// Lets a re-run of the same output name update the world already open
     /// in-game; default off preserves the never-clobber guarantee.
     pub(crate) overwrite_world: bool,
+    /// Omit-below level in METRES above the area's lowest point — a column whose
+    /// (min-relative) source height is at or below it emits no bricks, so the
+    /// native Brickadia floor shows through. The "don't import the water level"
+    /// knob; mirrors the sculpt convert's `omit_below_m`. Default `0.0` drops
+    /// only true-floor columns (byte-identical to the prior map build).
+    pub(crate) omit_below_m: f32,
+    /// Floor level in METRES above the lowest point that every emitted column
+    /// fills DOWN to (a raised base plane shortens fills). Mirrors the sculpt
+    /// convert's `floor_level_m`. Default `0.0` fills to the area minimum
+    /// (byte-identical to the prior map build).
+    pub(crate) floor_level_m: f32,
 }
 
 impl BuildRequest {
@@ -411,11 +422,8 @@ pub(crate) fn build_one_tile(
     // i32-overflow guard. The ceiling (MAX_VERTICAL_SCALE = 2000) sits ABOVE
     // derive_scale's structural max (1280), so a faithful 1:1 build and any
     // in-range exaggeration pass through UNCLAMPED (the old 64 silently broke 1:1).
-    let heightmap = build_heightmap(
-        &raster,
-        request.vertical_scale.clamp(0.01, MAX_VERTICAL_SCALE),
-        global_min_m,
-    );
+    let vscale = request.vertical_scale.clamp(0.01, MAX_VERTICAL_SCALE);
+    let heightmap = build_heightmap(&raster, vscale, global_min_m);
     let imagery = fetch_imagery_if_requested(
         request,
         (raster.width, raster.height),
@@ -423,16 +431,29 @@ pub(crate) fn build_one_tile(
         Arc::clone(&cancel),
     )?;
 
+    // Omit-water + floor-level parity with the sculpt convert: convert the
+    // metres-above-minimum knobs to brick-Z against the SAME vertical scale
+    // build_heightmap used, so the decisions are made in source-metre space.
+    // `omit_below_m > 0` turns on skip_floor (columns at/below the level drop,
+    // revealing the native floor); `omit_below_m == 0` keeps the prior build
+    // byte-identical (skip_floor off, omit threshold 0). skip_floor requires an
+    // explicit base plane — the single-box caller passes `None`, which maps to
+    // brick-Z 0 here since build_heightmap already floors at the area minimum.
+    let omit_below_h = (request.omit_below_m.max(0.0) * vscale).round() as u32;
+    let floor_h = (request.floor_level_m.max(0.0) * vscale).round() as u32;
+    let skip_floor = request.omit_below_m > 0.0;
+    let base = match base_override {
+        Some(b) => Some(b.saturating_add(floor_h)),
+        None if skip_floor || floor_h > 0 => Some(floor_h),
+        None => None,
+    };
+
     progress(BuildStage::GeneratingBricks, 0.0);
+    let style = BrickStyle::from_request(request);
     let bricks = match &imagery {
-        Some(im) => generate_bricks(
-            &heightmap,
-            im,
-            BrickStyle::from_request(request),
-            base_override,
-            offset,
-            Arc::clone(&progress),
-            Arc::clone(&cancel),
+        Some(im) => generate_bricks_skip_floor(
+            &heightmap, im, style, base, offset, skip_floor, omit_below_h,
+            Arc::clone(&progress), Arc::clone(&cancel),
         )?,
         None => {
             let flat = FlatColormap {
@@ -440,14 +461,9 @@ pub(crate) fn build_one_tile(
                 height: raster.height,
                 color: DEFAULT_BRICK_COLOR,
             };
-            generate_bricks(
-                &heightmap,
-                &flat,
-                BrickStyle::from_request(request),
-                base_override,
-                offset,
-                Arc::clone(&progress),
-                Arc::clone(&cancel),
+            generate_bricks_skip_floor(
+                &heightmap, &flat, style, base, offset, skip_floor, omit_below_h,
+                Arc::clone(&progress), Arc::clone(&cancel),
             )?
         }
     };
@@ -896,6 +912,11 @@ impl BrickStyle {
 /// per-tile present minimum (single-box behavior). `offset`: world placement in
 /// units — the single-box caller passes the centered `-(width*size),
 /// -(height*size)`; grid mode passes a per-tile world offset so tiles abut.
+///
+/// Test-only convenience wrapper (skip_floor = false): the map/grid build paths
+/// call [`generate_bricks_skip_floor`] directly so they can thread the
+/// omit-water / floor-level knobs, leaving this as the no-skip shorthand tests use.
+#[cfg(test)]
 pub(crate) fn generate_bricks(
     heightmap: &DemHeightmap,
     colormap: &dyn Colormap,
@@ -2013,6 +2034,74 @@ mod tests {
         );
     }
 
+    /// Offline omit-water parity (mirrors the sculpt convert's omit): a tile with
+    /// a low strip (at the area minimum) and a high strip must, with
+    /// `omit_below_m` raised above the low strip, emit NO bricks for the low
+    /// columns (the native floor shows through) while the high strip survives.
+    /// `omit_below_m = 0` stays byte-identical to the prior build. Uses
+    /// `build_one_tile` directly with a synthetic raster (no network).
+    #[test]
+    fn map_omit_below_drops_low_columns() {
+        use std::sync::atomic::AtomicBool;
+        // 4×2 grid: bottom row 0 m (the minimum → "water"), top row 100 m.
+        let raster = DemRaster {
+            width: 4,
+            height: 2,
+            heights_m: vec![0., 0., 0., 0., 100., 100., 100., 100.],
+            min_m: 0.0,
+            max_m: 100.0,
+        };
+        fn req(omit_below_m: f32) -> BuildRequest {
+            BuildRequest {
+                bbox: BBoxLatLon { south: 0.0, north: 1.0, west: 0.0, east: 1.0 },
+                name: "omit".to_owned(),
+                dem_source: DemSource::AwsTerrarium,
+                imagery_source: ImagerySource::None,
+                mapbox_token: None,
+                opentopo_key: None,
+                vertical_scale: 1.0,
+                density_factor: 1,
+                horizontal_scale: 1,
+                block_type: BlockType::SmoothTile,
+                glow: false,
+                no_collision: false,
+                install_to_brickadia: false,
+                overwrite_world: false,
+                omit_below_m,
+                floor_level_m: 0.0,
+            }
+        }
+        let noop: ProgressFn = Arc::new(|_, _| {});
+        let off = (0, 0);
+
+        // Baseline: import everything — both strips emit.
+        let base = build_one_tile(
+            &req(0.0), raster.clone(), 0.0, off, Some(0), Arc::clone(&noop),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("baseline build");
+        // Omit below 50 m (relative): the 0 m strip drops, the 100 m strip stays.
+        let omitted = build_one_tile(
+            &req(50.0), raster.clone(), 0.0, off, Some(0), Arc::clone(&noop),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("omit build");
+        assert!(!omitted.is_empty(), "high terrain must still emit");
+        assert!(
+            omitted.len() < base.len(),
+            "omitting the water strip must drop bricks: base={} omitted={}",
+            base.len(),
+            omitted.len(),
+        );
+        // Omit above the peak: all terrain drops.
+        let none = build_one_tile(
+            &req(200.0), raster, 0.0, off, Some(0), noop,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("omit-all build");
+        assert!(none.is_empty(), "omit above the peak drops all terrain, got {}", none.len());
+    }
+
     /// Live end-to-end test against AWS Terrarium for the Horsetooth bbox.
     /// Network-dependent; `#[ignore]` keeps it out of routine CI. Opt in with
     /// `cargo test -- --ignored b2_1_horsetooth_e2e`.
@@ -2046,6 +2135,8 @@ mod tests {
             no_collision: false,
             install_to_brickadia: false,
             overwrite_world: false,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
         };
         let progress: ProgressFn = Arc::new(|stage, f| {
             eprintln!("stage={stage:?} progress={f:.2}");
@@ -2126,6 +2217,8 @@ mod tests {
             no_collision: false,
             install_to_brickadia: false,
             overwrite_world: false,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
         };
         assert_eq!(req_mapbox.dem_token(), Some("pk.tok"));
         assert_eq!(req_mapbox.imagery_token(), Some("pk.tok"));
@@ -2145,6 +2238,8 @@ mod tests {
             no_collision: false,
             install_to_brickadia: false,
             overwrite_world: false,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
         };
         assert_eq!(req_no_keys.dem_token(), None);
         assert_eq!(req_no_keys.imagery_token(), None);
@@ -2185,6 +2280,8 @@ mod tests {
             no_collision: false,
             install_to_brickadia: false,
             overwrite_world: false,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
         };
         let progress: ProgressFn = Arc::new(|stage, f| {
             eprintln!("stage={stage:?} progress={f:.2}");
@@ -2239,6 +2336,8 @@ mod tests {
             no_collision: false,
             install_to_brickadia: false,
             overwrite_world: false,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
         };
         let progress: ProgressFn = Arc::new(|_, _| {});
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2308,6 +2407,8 @@ mod tests {
             no_collision: false,
             install_to_brickadia: false,
             overwrite_world: false,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
         };
         let progress: ProgressFn = Arc::new(|stage, f| {
             eprintln!("stage={stage:?} progress={f:.2}");
@@ -2358,6 +2459,8 @@ mod tests {
             no_collision: false,
             install_to_brickadia: false,
             overwrite_world: false,
+            omit_below_m: 0.0,
+            floor_level_m: 0.0,
         };
         let progress: ProgressFn = Arc::new(|_, _| {});
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
