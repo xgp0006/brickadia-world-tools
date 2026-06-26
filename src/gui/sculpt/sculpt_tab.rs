@@ -702,6 +702,12 @@ fn draw_tool_section(state: &mut SculptState, ui: &mut Ui) {
         .show_ui(ui, |ui| {
             for t in SculptTool::ALL {
                 if ui.selectable_label(state.tool == t, t.label()).clicked() {
+                    // Leaving the Zone tool discards any in-progress polygon draft
+                    // so it can't silently become the prefix of the next loop on
+                    // return (the draft is invisible + un-cancellable off-tool).
+                    if t != SculptTool::Zone {
+                        state.zone_draft.clear();
+                    }
                     state.tool = t;
                 }
             }
@@ -744,8 +750,14 @@ fn draw_zone_section(state: &mut SculptState, ui: &mut Ui) {
     });
     ui.horizontal(|ui| {
         ui.label("Style");
-        ui.selectable_value(&mut state.zone_style, ZoneStyle::Lasso, "Lasso");
-        ui.selectable_value(&mut state.zone_style, ZoneStyle::Polygon, "Polygon");
+        // Switching capture style mid-draw drops the in-progress draft so a
+        // half-placed polygon can't bleed into a lasso (or vice-versa).
+        if ui.selectable_value(&mut state.zone_style, ZoneStyle::Lasso, "Lasso").changed() {
+            state.zone_draft.clear();
+        }
+        if ui.selectable_value(&mut state.zone_style, ZoneStyle::Polygon, "Polygon").changed() {
+            state.zone_draft.clear();
+        }
     });
     ui.small(match state.zone_style {
         ZoneStyle::Lasso => "Drag a loop on the canvas; release to close it.",
@@ -1218,9 +1230,6 @@ fn draw_canvas(state: &mut SculptState, ctx: &egui::Context, ui: &mut Ui) {
 /// decimated drag; polygon collects clicked vertices. Esc cancels an in-progress
 /// polygon before it is committed (so it never enters undo history).
 fn handle_zone_input(state: &mut SculptState, response: &egui::Response, _rect: Rect) {
-    if response.ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        state.zone_draft.clear();
-    }
     match state.zone_style {
         ZoneStyle::Lasso => handle_zone_lasso(state, response),
         ZoneStyle::Polygon => handle_zone_polygon(state, response),
@@ -1258,6 +1267,12 @@ fn handle_zone_lasso(state: &mut SculptState, response: &egui::Response) {
 /// closes the loop. The double-click is handled before the append so the pairing
 /// click doesn't drop a stray vertex on the closing frame.
 fn handle_zone_polygon(state: &mut SculptState, response: &egui::Response) {
+    // Esc cancels an in-progress polygon before it commits (never enters undo).
+    // Scoped to Polygon: in Lasso the same-frame drag would immediately re-fill it.
+    if response.ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.zone_draft.clear();
+        return;
+    }
     if response.double_clicked_by(egui::PointerButton::Primary) {
         commit_zone_draft(state);
         return;
@@ -1311,6 +1326,33 @@ fn paint_closed_outline(painter: &egui::Painter, pts: &[Pos2], color: Color32) {
     }
 }
 
+/// True if the closed polygon is convex (all turns the same sign). egui's
+/// `convex_polygon` fan-fills concavities — which would tint a notch the OPPOSITE
+/// of what the PNPOLY mask actually keeps — so the fill is only safe to draw when
+/// this holds. A degenerate (<3) loop is treated as non-convex (no fill).
+fn is_convex(pts: &[Pos2]) -> bool {
+    let n = pts.len();
+    if n < 3 {
+        return false;
+    }
+    let mut sign = 0i32;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let c = pts[(i + 2) % n];
+        let cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+        if cross.abs() > f32::EPSILON {
+            let s = if cross > 0.0 { 1 } else { -1 };
+            if sign == 0 {
+                sign = s;
+            } else if s != sign {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Render committed zones (filled + outlined) and, while the Zone tool is active,
 /// the in-progress draft (placed vertices + rubber-band to the cursor).
 fn paint_zone_overlay(state: &SculptState, ui: &Ui, response: &egui::Response, rect: Rect) {
@@ -1322,9 +1364,12 @@ fn paint_zone_overlay(state: &SculptState, ui: &Ui, response: &egui::Response, r
         }
         let pts: Vec<Pos2> = z.polygon.iter().map(|&(cx, cy)| cell_to_screen(state, cx, cy)).collect();
         let (fill, line) = zone_colors(z.mode);
-        // Faint fill (a convex approximation — a hint, not authoritative) under
-        // the TRUE closed outline, which is exact for concave loops.
-        painter.add(egui::Shape::convex_polygon(pts.clone(), fill, Stroke::NONE));
+        // Fill only convex loops — egui's fan-fill would tint a concave notch the
+        // INVERSE of the real mask. The TRUE closed outline is always drawn and is
+        // exact for any loop, so concave zones are still clearly shown.
+        if is_convex(&pts) {
+            painter.add(egui::Shape::convex_polygon(pts.clone(), fill, Stroke::NONE));
+        }
         paint_closed_outline(&painter, &pts, line);
     }
 
@@ -2256,8 +2301,10 @@ mod tests {
         assert!(state.active_stroke.is_empty(), "off-grid dab captures no snapshot");
     }
 
-    /// Undo history is bounded: committing more than UNDO_CAP strokes drops the
-    /// oldest, never growing without limit.
+    /// Undo history is bounded: committing more than UNDO_CAP strokes saturates
+    /// the deque at EXACTLY UNDO_CAP (not fewer — an over-trim regression must
+    /// fail) and the retained entries still undo cleanly (the oldest kept stroke
+    /// is restorable, i.e. eviction dropped the front, not corrupted the rest).
     #[test]
     fn undo_history_is_bounded() {
         let mut state = SculptState::new();
@@ -2269,11 +2316,19 @@ mod tests {
             apply_one_dab(&mut state, c, 20, 20);
             commit_stroke(&mut state);
         }
-        assert!(
-            state.undo.len() <= UNDO_CAP,
-            "undo deque must stay within the cap, got {}",
+        // Saturated at the cap exactly — over-trim (e.g. to 0) would fail here.
+        assert_eq!(
             state.undo.len(),
+            UNDO_CAP,
+            "undo deque must saturate AT the cap after overflowing it",
         );
+        // Integrity: every retained entry undoes without panicking, draining the
+        // deque to empty (eviction removed the front, leaving a valid timeline).
+        for _ in 0..UNDO_CAP {
+            do_undo(&mut state);
+        }
+        assert!(state.undo.is_empty(), "all retained entries undo cleanly");
+        assert_eq!(state.redo.len(), UNDO_CAP, "each undo pushed a redo entry");
     }
 
     /// Finding-1 guard: a stroke whose dabs OVERLAP each other must still undo to

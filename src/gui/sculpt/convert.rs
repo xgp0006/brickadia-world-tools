@@ -98,11 +98,12 @@ pub(crate) fn convert_heightfield(
     }
 
     let raster: DemRaster = field.to_dem_raster();
-    // Report the field's true range (cells are floor-relative meters).
     let dem_width = raster.width;
     let dem_height = raster.height;
-    let elevation_min_m = raster.min_m;
-    let elevation_max_m = raster.max_m;
+    // Report the field's true cell range (floor-relative meters), via the SAME
+    // source the tiled path uses — `raster.min_m` is the post-normalization floor
+    // (≈0), which would make the reported minimum differ by export mode alone.
+    let (elevation_min_m, elevation_max_m) = field.min_max();
 
     // Derive the integer horizontal brick scale + 1:1-matched vertical scale from
     // the field's metadata, mirroring the Map tab's start_fetch path. cell_m is
@@ -1373,9 +1374,14 @@ mod tests {
     }
 
     /// A zone spanning a tile seam: the tiled convert's per-tile slices must
-    /// reassemble to the full-field mask, so the stitched `brick_count` equals the
-    /// summed masked sub-fields (watertight + consistent across the seam). Routes
-    /// through the PUBLIC `convert_heightfield_tiled`.
+    /// reassemble to the full-field mask. Two independent checks:
+    /// (a) SPATIAL — using an ASYMMETRIC omit block (so a transposed slice lands a
+    ///     visibly wrong hole), no surviving sub-field brick is centered inside the
+    ///     block's world window (the window is derived from the zone's cell bounds,
+    ///     NOT from the slice code, so it catches an orientation bug the count-only
+    ///     comparison on symmetric data could not);
+    /// (b) STITCH — the public `convert_heightfield_tiled` brick_count equals the
+    ///     summed masked sub-fields (watertight across seams).
     #[test]
     fn tiled_seam_spanning_zone_matches_summed_masked_subfields() {
         let field = hill_field(18, 18); // tile 8 → 3×3 split
@@ -1383,20 +1389,45 @@ mod tests {
         let y_bounds = tile_bounds(18, 8);
         assert!(x_bounds.len() >= 2 && y_bounds.len() >= 2, "must subdivide");
 
-        // An omit block straddling the central seams (cells 5..13).
-        let zone = rect_zone(ZoneMode::Omit, 5.0, 5.0, 13.0, 13.0);
+        // ASYMMETRIC omit block: cells x∈[2,8), y∈[9,15) — its transpose covers a
+        // different region, so a transposed slice would relocate the hole.
+        let (zx0, zy0, zx1, zy1) = (2u32, 9u32, 8u32, 15u32);
+        let zone = rect_zone(ZoneMode::Omit, zx0 as f32, zy0 as f32, zx1 as f32, zy1 as f32);
         let full_mask = zones::rasterize(std::slice::from_ref(&zone), 18, 18);
 
-        let mut expected = 0usize;
+        let mut ref_bricks: Vec<brdb::Brick> = Vec::new();
         let mut unmasked = 0usize;
         for &(y0, y1) in &y_bounds {
             for &(x0, x1) in &x_bounds {
-                expected += mesh_sub_masked(&field, x0, y0, x1, y1, true, &full_mask).len();
+                ref_bricks.extend(mesh_sub_masked(&field, x0, y0, x1, y1, true, &full_mask));
                 unmasked += mesh_sub(&field, x0, y0, x1, y1, true).len();
             }
         }
+        let expected = ref_bricks.len();
         assert!(expected < unmasked, "the seam-spanning omit must actually drop bricks");
 
+        // (a) Spatial: world window of the omit block. Absolute cell c maps to
+        // world `-(18*size) + 2*size*c` on each axis (the centering the tiled path
+        // and a single mesh share — see `tiled_export_world_offset_abutment`).
+        let size = i32::from(crate::gui::build::cell_size_units(
+            derive_scale(
+                field.meta.cell_m,
+                field.meta.studs_per_meter,
+                field.meta.vertical_exaggeration,
+                field.meta.micro,
+            )
+            .0,
+            field.meta.micro,
+        ));
+        let off = -(18 * size);
+        let world = |c: u32| off + 2 * size * c as i32;
+        let (wx0, wx1, wy0, wy1) = (world(zx0), world(zx1), world(zy0), world(zy1));
+        for b in &ref_bricks {
+            let in_hole = b.position.x >= wx0 && b.position.x < wx1 && b.position.y >= wy0 && b.position.y < wy1;
+            assert!(!in_hole, "no masked-tile brick may sit inside the omit window (orientation check)");
+        }
+
+        // (b) Stitch consistency through the public tiled convert.
         let out = OutputOptions {
             brdb: false,
             brz: true,
@@ -1424,12 +1455,13 @@ mod tests {
         }
     }
 
-    /// Converting READS zones but never consumes them: a second convert with the
-    /// same borrowed slice yields the identical brick count (the `&[Zone]` borrow
-    /// makes mutation impossible — this guards the "masks survive generation"
-    /// contract at the convert boundary).
+    /// Re-converting the SAME field+zones is deterministic AND the zone actually
+    /// shapes the output: a masked convert drops bricks versus no zones, and
+    /// repeating it reproduces the exact count. (Non-consumption itself is a
+    /// compile-time guarantee of the `&[Zone]` borrow, so it isn't re-asserted —
+    /// this exercises the observable behavior instead: stable, mask-affected output.)
     #[test]
-    fn convert_does_not_consume_zones() {
+    fn convert_with_zones_is_deterministic_and_mask_affects_output() {
         let field = hill_field(16, 16);
         let zones = vec![rect_zone(ZoneMode::Omit, 4.0, 4.0, 12.0, 12.0)];
         let out = OutputOptions {
@@ -1455,9 +1487,11 @@ mod tests {
             }
             o.brick_count
         };
-        let first = run(&zones);
-        let second = run(&zones);
-        assert_eq!(first, second, "zones are non-consuming across converts");
-        assert_eq!(zones.len(), 1, "the caller's zones vec is untouched");
+        let no_zone = run(&[]);
+        let masked_a = run(&zones);
+        let masked_b = run(&zones);
+        assert_eq!(masked_a, masked_b, "repeated masked convert is deterministic");
+        assert!(masked_a < no_zone, "the omit zone must actually drop bricks ({masked_a} < {no_zone})");
+        assert!(masked_a > 0, "the omit leaves the rest of the hill intact");
     }
 }
