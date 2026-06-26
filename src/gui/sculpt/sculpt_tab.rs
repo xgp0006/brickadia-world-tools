@@ -24,7 +24,7 @@ use poll_promise::Promise;
 
 use crate::gui::build::{self, BuildError, BuildOutcome, BuildStage};
 use crate::gui::theme::{STATUS_ERROR_FG, STATUS_WARN_FG};
-use crate::gui::zones::Zone;
+use crate::gui::zones::{Zone, ZoneMode};
 
 use super::brush::{Brush, BrushShape, Falloff};
 use super::convert::{convert_heightfield, convert_heightfield_tiled, OutputOptions};
@@ -38,6 +38,13 @@ const UNDO_CAP: usize = 32;
 const DAB_SPACING: f32 = 0.25;
 /// Minimum world-space cells between dabs, so a tiny radius still advances.
 const MIN_DAB_STEP_CELLS: f32 = 0.5;
+
+/// Lasso decimation: skip a sampled point closer than this (in cells) to the last
+/// kept one, so a freehand drag stores a sparse loop, not every pixel.
+const ZONE_LASSO_MIN_CELL_DIST: f32 = 0.75;
+/// Polygon close tolerance: a click within this many SCREEN pixels of the first
+/// vertex closes the loop.
+const ZONE_POLY_CLOSE_PX: f32 = 12.0;
 /// How fast the overlay brush radius eases toward its target, in cells/second of
 /// animation — large enough to feel instant, small enough to read as a smooth
 /// grow/shrink rather than a snap.
@@ -175,11 +182,22 @@ enum SculptTool {
     Smooth,
     Flatten,
     Set,
+    /// Freedraw omit/include zones — not a brush; it draws loops, not heights.
+    Zone,
+}
+
+/// How a zone loop is captured on the canvas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoneStyle {
+    /// Press-drag a freehand loop; auto-closed on release.
+    Lasso,
+    /// Click vertices; close on a click near the first vertex or a double-click.
+    Polygon,
 }
 
 impl SculptTool {
-    const ALL: [SculptTool; 5] =
-        [Self::Raise, Self::Lower, Self::Smooth, Self::Flatten, Self::Set];
+    const ALL: [SculptTool; 6] =
+        [Self::Raise, Self::Lower, Self::Smooth, Self::Flatten, Self::Set, Self::Zone];
 
     const fn label(self) -> &'static str {
         match self {
@@ -188,6 +206,7 @@ impl SculptTool {
             Self::Smooth => "Smooth",
             Self::Flatten => "Flatten",
             Self::Set => "Set height",
+            Self::Zone => "Zone (omit/include)",
         }
     }
 
@@ -207,6 +226,9 @@ impl SculptTool {
             Self::Smooth => Smooth.apply(field, brush, center),
             Self::Flatten => Flatten { target }.apply(field, brush, center),
             Self::Set => SetHeight { target }.apply(field, brush, center),
+            // Zone is not a brush; the canvas routes it to `handle_zone_input`
+            // before any dab dispatch, so this arm is never reached.
+            Self::Zone => {}
         }
     }
 }
@@ -322,6 +344,14 @@ pub(crate) struct SculptState {
     /// convert (see [`crate::gui::zones`]). In memory only in Phase 1a; cleared
     /// when a new field loads (cell coords don't survive a field swap).
     zones: Vec<Zone>,
+    /// Draw mode for new zones (Omit cuts a hole, Include keeps only its inside).
+    zone_mode: ZoneMode,
+    /// Capture style for new zones (freehand lasso vs click-polygon).
+    zone_style: ZoneStyle,
+    /// In-progress loop vertices (cell space): lasso accumulates along a drag;
+    /// polygon accumulates clicked vertices until closed or cancelled. Empty when
+    /// not mid-draw; never enters undo history until committed as a `Zone`.
+    zone_draft: Vec<(f32, f32)>,
 
     // Blank-canvas + output controls.
     new_w: u32,
@@ -414,6 +444,9 @@ impl Default for SculptState {
             active_stroke: Vec::new(),
             last_dab: None,
             zones: Vec::new(),
+            zone_mode: ZoneMode::Omit,
+            zone_style: ZoneStyle::Lasso,
+            zone_draft: Vec::new(),
             new_w: DEFAULT_CANVAS_W,
             new_h: DEFAULT_CANVAS_H,
             new_cell_m: DEFAULT_CELL_M,
@@ -472,16 +505,12 @@ impl SculptState {
         // Zones are cell-space; a new field of different dimensions would
         // misregister them, so a field load drops them (like undo history).
         self.zones.clear();
+        self.zone_draft.clear();
     }
-
-    // ponytail: these zone mutators are exercised by the step-3 undo tests and
-    // wired into the Zone tool panel in step 4 — drop the allows once the panel
-    // calls them.
 
     /// Snapshot the current zones onto the undo stack before a zone mutation,
     /// clearing redo (same discipline as a height stroke commit). Bounded by the
     /// shared `UNDO_CAP`.
-    #[allow(dead_code)]
     fn record_zone_edit(&mut self) {
         self.undo.push_back(UndoEntry::Zones(self.zones.clone()));
         while self.undo.len() > UNDO_CAP {
@@ -491,14 +520,12 @@ impl SculptState {
     }
 
     /// Append a freedraw zone (undoable).
-    #[allow(dead_code)]
     fn add_zone(&mut self, zone: Zone) {
         self.record_zone_edit();
         self.zones.push(zone);
     }
 
     /// Delete the zone at `idx` (undoable); no-op if out of range.
-    #[allow(dead_code)]
     fn delete_zone(&mut self, idx: usize) {
         if idx < self.zones.len() {
             self.record_zone_edit();
@@ -508,7 +535,6 @@ impl SculptState {
 
     /// Drop every zone (undoable); no-op if already empty (so it never pushes an
     /// empty no-op entry onto the history).
-    #[allow(dead_code)]
     fn clear_zones(&mut self) {
         if !self.zones.is_empty() {
             self.record_zone_edit();
@@ -619,7 +645,13 @@ fn draw_controls(state: &mut SculptState, ui: &mut Ui) {
 
     draw_tool_section(state, ui);
     ui.add_space(8.0);
-    draw_brush_section(state, ui);
+    // The Zone tool draws loops, not heights — show its mask controls instead of
+    // the brush radius/strength/falloff.
+    if state.tool == SculptTool::Zone {
+        draw_zone_section(state, ui);
+    } else {
+        draw_brush_section(state, ui);
+    }
     ui.add_space(8.0);
     draw_history_section(state, ui);
     ui.add_space(8.0);
@@ -701,6 +733,54 @@ fn draw_brush_section(state: &mut SculptState, ui: &mut Ui) {
         ui.selectable_value(&mut state.brush.falloff, Falloff::Linear, "Linear");
         ui.selectable_value(&mut state.brush.falloff, Falloff::Constant, "Hard");
     });
+}
+
+fn draw_zone_section(state: &mut SculptState, ui: &mut Ui) {
+    ui.label("Zone mask (XY cookie-cutter)");
+    ui.horizontal(|ui| {
+        ui.label("Mode");
+        ui.selectable_value(&mut state.zone_mode, ZoneMode::Omit, "🚫 Omit");
+        ui.selectable_value(&mut state.zone_mode, ZoneMode::Include, "✅ Include");
+    });
+    ui.horizontal(|ui| {
+        ui.label("Style");
+        ui.selectable_value(&mut state.zone_style, ZoneStyle::Lasso, "Lasso");
+        ui.selectable_value(&mut state.zone_style, ZoneStyle::Polygon, "Polygon");
+    });
+    ui.small(match state.zone_style {
+        ZoneStyle::Lasso => "Drag a loop on the canvas; release to close it.",
+        ZoneStyle::Polygon => {
+            "Click to place vertices; click the first dot (or double-click) to \
+             close. Esc cancels."
+        }
+    });
+
+    ui.add_space(4.0);
+    if state.zones.is_empty() {
+        ui.small("No zones yet — omit cuts holes, include keeps only its inside.");
+        return;
+    }
+
+    // Render the list, capturing a delete request to apply after the borrow ends.
+    let mut delete: Option<usize> = None;
+    for (i, z) in state.zones.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let (icon, name) = match z.mode {
+                ZoneMode::Omit => ("🚫", "Omit"),
+                ZoneMode::Include => ("✅", "Include"),
+            };
+            ui.label(format!("{icon} {name} · {} pts", z.polygon.len()));
+            if ui.small_button("✖").on_hover_text("Delete zone").clicked() {
+                delete = Some(i);
+            }
+        });
+    }
+    if let Some(i) = delete {
+        state.delete_zone(i);
+    }
+    if ui.button("Clear all zones").clicked() {
+        state.clear_zones();
+    }
 }
 
 fn draw_history_section(state: &mut SculptState, ui: &mut Ui) {
@@ -1108,22 +1188,161 @@ fn draw_canvas(state: &mut SculptState, ctx: &egui::Context, ui: &mut Ui) {
     // Paint the terrain texture at the current pan/zoom.
     paint_terrain(state, ui, rect, fw, fh);
 
-    // Apply sculpt dabs from a primary-button drag.
-    handle_sculpt_input(state, &response, fw, fh);
+    if state.tool == SculptTool::Zone {
+        // Zone tool: the primary button draws loops (no dabs, no brush ring).
+        handle_zone_input(state, &response, rect);
+    } else {
+        // Apply sculpt dabs from a primary-button drag.
+        handle_sculpt_input(state, &response, fw, fh);
 
-    // Brush overlay + smooth radius animation. Animating every frame while the
-    // pointer is over the canvas keeps the resize buttery regardless of grid
-    // size (it touches no texture). Suppressed in eyedropper pick mode: a pick
-    // samples a SINGLE cell, so a radius ring would imply area painting that
-    // does not happen — the pick readout (`paint_pick_readout`) is the cursor UI
-    // then.
-    if !state.pick_mode {
-        paint_brush_overlay(state, ctx, ui, &response, rect);
+        // Brush overlay + smooth radius animation. Animating every frame while the
+        // pointer is over the canvas keeps the resize buttery regardless of grid
+        // size (it touches no texture). Suppressed in eyedropper pick mode: a pick
+        // samples a SINGLE cell, so a radius ring would imply area painting that
+        // does not happen — the pick readout is the cursor UI then.
+        if !state.pick_mode {
+            paint_brush_overlay(state, ctx, ui, &response, rect);
+        }
     }
+
+    // Zone overlay: committed zones are always shown (so they're visible while
+    // sculpting too); the in-progress draft only while the Zone tool is active.
+    paint_zone_overlay(state, ui, &response, rect);
 
     // Eyedropper on-canvas readout: the last sampled height (spec §3), drawn in
     // the corner so the pick value is visible without leaving the canvas.
     paint_pick_readout(state, ui, &response, rect);
+}
+
+/// Capture freedraw zones on the canvas (spec §"Capture UX"). Lasso records a
+/// decimated drag; polygon collects clicked vertices. Esc cancels an in-progress
+/// polygon before it is committed (so it never enters undo history).
+fn handle_zone_input(state: &mut SculptState, response: &egui::Response, _rect: Rect) {
+    if response.ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.zone_draft.clear();
+    }
+    match state.zone_style {
+        ZoneStyle::Lasso => handle_zone_lasso(state, response),
+        ZoneStyle::Polygon => handle_zone_polygon(state, response),
+    }
+}
+
+/// Lasso: a primary press-drag records points, decimated to `>= ~0.75` cell
+/// spacing; release auto-closes into a `Zone` (discarded if < 3 points survive).
+fn handle_zone_lasso(state: &mut SculptState, response: &egui::Response) {
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        state.zone_draft.clear();
+        if let Some(ptr) = response.interact_pointer_pos() {
+            state.zone_draft.push(screen_to_cell(state, ptr));
+        }
+    } else if response.dragged_by(egui::PointerButton::Primary)
+        && let Some(ptr) = response.interact_pointer_pos()
+    {
+        let pt = screen_to_cell(state, ptr);
+        let far = state.zone_draft.last().is_none_or(|&(lx, ly)| {
+            let (dx, dy) = (pt.0 - lx, pt.1 - ly);
+            (dx * dx + dy * dy).sqrt() >= ZONE_LASSO_MIN_CELL_DIST
+        });
+        if far {
+            state.zone_draft.push(pt);
+        }
+    }
+
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
+        commit_zone_draft(state);
+    }
+}
+
+/// Polygon: each primary click appends a vertex; a click within
+/// `ZONE_POLY_CLOSE_PX` of the first vertex (with >= 3 placed) or a double-click
+/// closes the loop. The double-click is handled before the append so the pairing
+/// click doesn't drop a stray vertex on the closing frame.
+fn handle_zone_polygon(state: &mut SculptState, response: &egui::Response) {
+    if response.double_clicked_by(egui::PointerButton::Primary) {
+        commit_zone_draft(state);
+        return;
+    }
+    if response.clicked_by(egui::PointerButton::Primary)
+        && let Some(ptr) = response.interact_pointer_pos()
+    {
+        if state.zone_draft.len() >= 3 {
+            let (fx, fy) = state.zone_draft[0];
+            let first_screen = cell_to_screen(state, fx, fy);
+            if (ptr - first_screen).length() <= ZONE_POLY_CLOSE_PX {
+                commit_zone_draft(state);
+                return;
+            }
+        }
+        state.zone_draft.push(screen_to_cell(state, ptr));
+    }
+}
+
+/// Close the in-progress draft into a committed (undoable) zone, or discard it if
+/// it has fewer than 3 vertices (a degenerate loop encloses nothing).
+fn commit_zone_draft(state: &mut SculptState) {
+    let polygon = std::mem::take(&mut state.zone_draft);
+    if polygon.len() >= 3 {
+        let mode = state.zone_mode;
+        state.add_zone(Zone { mode, polygon });
+    }
+}
+
+/// Translucent fill + solid outline colors for a zone mode (omit red, include
+/// green).
+fn zone_colors(mode: ZoneMode) -> (Color32, Color32) {
+    match mode {
+        ZoneMode::Omit => (
+            Color32::from_rgba_unmultiplied(0xFF, 0x40, 0x40, 38),
+            Color32::from_rgb(0xFF, 0x50, 0x50),
+        ),
+        ZoneMode::Include => (
+            Color32::from_rgba_unmultiplied(0x40, 0xFF, 0x60, 38),
+            Color32::from_rgb(0x50, 0xFF, 0x70),
+        ),
+    }
+}
+
+/// Draw the closed outline of a screen-space polygon (last → first edge
+/// included), correct for concave loops (unlike a convex-hull stroke).
+fn paint_closed_outline(painter: &egui::Painter, pts: &[Pos2], color: Color32) {
+    let n = pts.len();
+    for i in 0..n {
+        painter.line_segment([pts[i], pts[(i + 1) % n]], Stroke::new(2.0, color));
+    }
+}
+
+/// Render committed zones (filled + outlined) and, while the Zone tool is active,
+/// the in-progress draft (placed vertices + rubber-band to the cursor).
+fn paint_zone_overlay(state: &SculptState, ui: &Ui, response: &egui::Response, rect: Rect) {
+    let painter = ui.painter_at(rect);
+
+    for z in &state.zones {
+        if z.polygon.len() < 3 {
+            continue;
+        }
+        let pts: Vec<Pos2> = z.polygon.iter().map(|&(cx, cy)| cell_to_screen(state, cx, cy)).collect();
+        let (fill, line) = zone_colors(z.mode);
+        // Faint fill (a convex approximation — a hint, not authoritative) under
+        // the TRUE closed outline, which is exact for concave loops.
+        painter.add(egui::Shape::convex_polygon(pts.clone(), fill, Stroke::NONE));
+        paint_closed_outline(&painter, &pts, line);
+    }
+
+    if state.tool == SculptTool::Zone && !state.zone_draft.is_empty() {
+        let (_, line) = zone_colors(state.zone_mode);
+        let pts: Vec<Pos2> =
+            state.zone_draft.iter().map(|&(cx, cy)| cell_to_screen(state, cx, cy)).collect();
+        for w in pts.windows(2) {
+            painter.line_segment([w[0], w[1]], Stroke::new(2.0, line));
+        }
+        for p in &pts {
+            painter.circle_filled(*p, 3.0, line);
+        }
+        // Rubber-band from the last placed vertex to the cursor.
+        if let (Some(&last), Some(ptr)) = (pts.last(), response.hover_pos()) {
+            painter.line_segment([last, ptr], Stroke::new(1.0, line));
+        }
+    }
 }
 
 /// Draw the eyedropper's on-canvas readout (spec §3): while pick mode is active,

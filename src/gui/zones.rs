@@ -14,9 +14,6 @@
 /// Whether a zone cuts a hole (`Omit`) or restricts the export to its interior
 /// (`Include`). Serde derives are intentionally absent in Phase 1a — they arrive
 /// with the `.h2bproj` project file in Phase 1b.
-// ponytail: `Omit` is constructed by the Zone tool's mode toggle in step 4;
-// until that UI lands, only `Include` is built in non-test code (in `rasterize`).
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ZoneMode {
     Omit,
