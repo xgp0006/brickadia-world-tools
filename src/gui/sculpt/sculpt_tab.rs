@@ -24,6 +24,7 @@ use poll_promise::Promise;
 
 use crate::gui::build::{self, BuildError, BuildOutcome, BuildStage};
 use crate::gui::theme::{STATUS_ERROR_FG, STATUS_WARN_FG};
+use crate::gui::zones::Zone;
 
 use super::brush::{Brush, BrushShape, Falloff};
 use super::convert::{convert_heightfield, convert_heightfield_tiled, OutputOptions};
@@ -257,6 +258,17 @@ impl RectSnapshot {
     }
 }
 
+/// One reversible edit on the unified undo/redo timeline. Height strokes and
+/// zone-mask edits interleave in a single history so undo walks back through
+/// whatever the user did last, in order.
+enum UndoEntry {
+    /// A per-stroke cell snapshot (the existing height-edit path).
+    Height(RectSnapshot),
+    /// The zones list *before* a zone add/delete/clear. Restoring swaps it back
+    /// in; touches no cells, so the terrain texture stays clean.
+    Zones(Vec<Zone>),
+}
+
 /// All sculpt-tab state: the editable field, the active tool + brush, the view
 /// transform, the cached terrain texture, undo/redo history, output options, and
 /// the convert worker handle.
@@ -293,10 +305,10 @@ pub(crate) struct SculptState {
     /// `brush.radius_cells` each frame for the 60fps resize feel.
     anim_radius: f32,
 
-    // Bounded per-stroke history. `undo` holds pre-stroke snapshots; `redo` holds
-    // the snapshots produced by undoing (i.e. the post-stroke state).
-    undo: VecDeque<RectSnapshot>,
-    redo: VecDeque<RectSnapshot>,
+    // Bounded edit history (height strokes + zone edits interleaved). `undo`
+    // holds pre-edit entries; `redo` holds the entries produced by undoing.
+    undo: VecDeque<UndoEntry>,
+    redo: VecDeque<UndoEntry>,
     /// Per-dab pre-edit snapshots of the in-progress stroke. Each entry captures
     /// only its own dab's rect (bounded `O(radius²)`) **before** that dab edits,
     /// so growth cost stays `O(new cells)` per dab instead of re-capturing the
@@ -306,6 +318,10 @@ pub(crate) struct SculptState {
     active_stroke: Vec<RectSnapshot>,
     /// Last dab center (cells) during a drag, to space dabs along the path.
     last_dab: Option<(f32, f32)>,
+    /// Freedraw omit/include zones in CELL space, applied as an XY keep-mask at
+    /// convert (see [`crate::gui::zones`]). In memory only in Phase 1a; cleared
+    /// when a new field loads (cell coords don't survive a field swap).
+    zones: Vec<Zone>,
 
     // Blank-canvas + output controls.
     new_w: u32,
@@ -397,6 +413,7 @@ impl Default for SculptState {
             redo: VecDeque::new(),
             active_stroke: Vec::new(),
             last_dab: None,
+            zones: Vec::new(),
             new_w: DEFAULT_CANVAS_W,
             new_h: DEFAULT_CANVAS_H,
             new_cell_m: DEFAULT_CELL_M,
@@ -452,6 +469,51 @@ impl SculptState {
         self.redo.clear();
         self.active_stroke.clear();
         self.last_dab = None;
+        // Zones are cell-space; a new field of different dimensions would
+        // misregister them, so a field load drops them (like undo history).
+        self.zones.clear();
+    }
+
+    // ponytail: these zone mutators are exercised by the step-3 undo tests and
+    // wired into the Zone tool panel in step 4 — drop the allows once the panel
+    // calls them.
+
+    /// Snapshot the current zones onto the undo stack before a zone mutation,
+    /// clearing redo (same discipline as a height stroke commit). Bounded by the
+    /// shared `UNDO_CAP`.
+    #[allow(dead_code)]
+    fn record_zone_edit(&mut self) {
+        self.undo.push_back(UndoEntry::Zones(self.zones.clone()));
+        while self.undo.len() > UNDO_CAP {
+            self.undo.pop_front();
+        }
+        self.redo.clear();
+    }
+
+    /// Append a freedraw zone (undoable).
+    #[allow(dead_code)]
+    fn add_zone(&mut self, zone: Zone) {
+        self.record_zone_edit();
+        self.zones.push(zone);
+    }
+
+    /// Delete the zone at `idx` (undoable); no-op if out of range.
+    #[allow(dead_code)]
+    fn delete_zone(&mut self, idx: usize) {
+        if idx < self.zones.len() {
+            self.record_zone_edit();
+            self.zones.remove(idx);
+        }
+    }
+
+    /// Drop every zone (undoable); no-op if already empty (so it never pushes an
+    /// empty no-op entry onto the history).
+    #[allow(dead_code)]
+    fn clear_zones(&mut self) {
+        if !self.zones.is_empty() {
+            self.record_zone_edit();
+            self.zones.clear();
+        }
     }
 
     /// Mark a cell rect (inclusive `x0,x1,y0,y1`) changed since the last render,
@@ -1305,7 +1367,7 @@ fn extend_stroke_snapshot(state: &mut SculptState, rect: (u32, u32, u32, u32)) {
 /// `O(stroke length × brush rect)` once at commit instead of per dab.
 fn commit_stroke(state: &mut SculptState) {
     if let Some(snap) = collapse_stroke_snapshots(state) {
-        state.undo.push_back(snap);
+        state.undo.push_back(UndoEntry::Height(snap));
         while state.undo.len() > UNDO_CAP {
             state.undo.pop_front();
         }
@@ -1355,28 +1417,48 @@ fn overlay_into(dst: &mut RectSnapshot, src: &RectSnapshot) {
 }
 
 fn do_undo(state: &mut SculptState) {
-    let Some(snap) = state.undo.pop_back() else { return };
-    let Some(field) = state.field.as_mut() else { return };
-    let redo_snap = snap.restore_into(field);
-    state.redo.push_back(redo_snap);
+    let Some(entry) = state.undo.pop_back() else { return };
+    let inverse = invert_entry(state, entry);
+    state.redo.push_back(inverse);
     while state.redo.len() > UNDO_CAP {
         state.redo.pop_front();
     }
-    // Undo can change the global extent (e.g. removing the tallest peak), which
-    // rescales the whole colormap — force a full re-render, not a partial.
-    state.mark_dirty_all();
 }
 
 fn do_redo(state: &mut SculptState) {
-    let Some(snap) = state.redo.pop_back() else { return };
-    let Some(field) = state.field.as_mut() else { return };
-    let undo_snap = snap.restore_into(field);
-    state.undo.push_back(undo_snap);
+    let Some(entry) = state.redo.pop_back() else { return };
+    let inverse = invert_entry(state, entry);
+    state.undo.push_back(inverse);
     while state.undo.len() > UNDO_CAP {
         state.undo.pop_front();
     }
-    // Redo likewise can change the global extent → full re-render.
-    state.mark_dirty_all();
+}
+
+/// Apply one history entry to `state` and return the inverse entry (to push onto
+/// the opposite deque). Shared by undo and redo — the operation is its own
+/// inverse, so the only difference between the two is which deque is the source.
+fn invert_entry(state: &mut SculptState, entry: UndoEntry) -> UndoEntry {
+    match entry {
+        UndoEntry::Height(snap) => {
+            let Some(field) = state.field.as_mut() else {
+                // No field to restore into (can't happen with height history) —
+                // hand the entry back unchanged rather than lose it.
+                return UndoEntry::Height(snap);
+            };
+            let inverse = snap.restore_into(field);
+            // A height change can move the global extent (e.g. removing the
+            // tallest peak), rescaling the colormap — force a full re-render.
+            state.mark_dirty_all();
+            UndoEntry::Height(inverse)
+        }
+        UndoEntry::Zones(prev) => {
+            // Swap the stored list in; the displaced current list becomes the
+            // inverse. Touches no cells, so the terrain texture stays clean —
+            // the zone overlay redraws every frame regardless.
+            let current = std::mem::replace(&mut state.zones, prev);
+            UndoEntry::Zones(current)
+        }
+    }
 }
 
 /// Draw the brush cursor — a circle following the pointer with a smoothly eased
@@ -1771,6 +1853,7 @@ fn poll_convert_promise(state: &mut SculptState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::zones::ZoneMode;
 
     fn meta() -> FieldMeta {
         FieldMeta {
@@ -1834,6 +1917,99 @@ mod tests {
         assert_eq!(
             redone.cells, after_edit.cells,
             "redo must reproduce the exact post-stroke state",
+        );
+    }
+
+    fn test_zone(mode: ZoneMode) -> Zone {
+        Zone {
+            mode,
+            polygon: vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)],
+        }
+    }
+
+    /// Adding a zone is undoable: undo restores the prior (empty) list, redo
+    /// re-adds it.
+    #[test]
+    fn zone_add_undo_redo() {
+        let mut state = SculptState::new();
+        state.add_zone(test_zone(ZoneMode::Omit));
+        assert_eq!(state.zones.len(), 1, "zone added");
+        assert_eq!(state.undo.len(), 1, "one zone edit → one undo entry");
+
+        do_undo(&mut state);
+        assert!(state.zones.is_empty(), "undo restores the empty zones list");
+        assert_eq!(state.redo.len(), 1, "undo pushes a redo entry");
+
+        do_redo(&mut state);
+        assert_eq!(state.zones.len(), 1, "redo re-adds the zone");
+    }
+
+    /// Delete and clear-all are undoable.
+    #[test]
+    fn zone_delete_and_clear_are_undoable() {
+        let mut state = SculptState::new();
+        state.add_zone(test_zone(ZoneMode::Omit));
+        state.add_zone(test_zone(ZoneMode::Include));
+        assert_eq!(state.zones.len(), 2);
+
+        state.delete_zone(0);
+        assert_eq!(state.zones.len(), 1, "one deleted");
+        assert_eq!(state.zones[0].mode, ZoneMode::Include, "the right one survived");
+        do_undo(&mut state);
+        assert_eq!(state.zones.len(), 2, "delete undone");
+
+        state.clear_zones();
+        assert!(state.zones.is_empty(), "cleared");
+        do_undo(&mut state);
+        assert_eq!(state.zones.len(), 2, "clear undone");
+    }
+
+    /// Clearing an already-empty zone list must not push a no-op undo entry.
+    #[test]
+    fn clear_empty_zones_records_no_history() {
+        let mut state = SculptState::new();
+        state.clear_zones();
+        assert!(state.undo.is_empty(), "clearing nothing records no edit");
+    }
+
+    /// A height stroke and a zone edit share one timeline: undo pops the most
+    /// recent first (zone), then the height stroke — strict LIFO across types.
+    #[test]
+    fn interleaved_height_and_zone_undo_is_lifo() {
+        let mut state = SculptState::new();
+        state.set_field(HeightField::flat(20, 20, meta()));
+        let original = state.field.as_ref().unwrap().cells.clone();
+        state.tool = SculptTool::Raise;
+        state.brush = Brush {
+            shape: BrushShape::Circle,
+            radius_cells: 3.0,
+            strength: 5.0,
+            falloff: Falloff::Smoothstep,
+        };
+
+        // 1) a height stroke, then 2) a zone add.
+        apply_one_dab(&mut state, (5.0, 5.0), 20, 20);
+        commit_stroke(&mut state);
+        let after_height = state.field.as_ref().unwrap().cells.clone();
+        assert_ne!(after_height, original, "stroke changed the field");
+        state.add_zone(test_zone(ZoneMode::Omit));
+        assert_eq!(state.undo.len(), 2, "height + zone on one timeline");
+
+        // Undo #1 pops the zone (last in), leaving the height edit applied.
+        do_undo(&mut state);
+        assert!(state.zones.is_empty(), "zone undone first (LIFO)");
+        assert_eq!(
+            state.field.as_ref().unwrap().cells,
+            after_height,
+            "the height edit is untouched by the zone undo",
+        );
+
+        // Undo #2 pops the height stroke, restoring the original field.
+        do_undo(&mut state);
+        assert_eq!(
+            state.field.as_ref().unwrap().cells,
+            original,
+            "height stroke undone second, field back to original",
         );
     }
 
