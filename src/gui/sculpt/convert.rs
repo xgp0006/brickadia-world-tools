@@ -24,9 +24,11 @@ use crate::gui::build::{
 use crate::gui::grid::tile_world_offset;
 use crate::gui::map_tab::derive_scale;
 use crate::gui::zones::{self, Zone};
+use crate::map::Colormap;
 use crate::util::{bricks_to_save, write_save_world};
 
-use super::heightfield::HeightField;
+use super::heightfield::{terrace_height, HeightField};
+use super::paint::{PaintColormap, PaintLayer};
 
 /// What the sculpt convert writes and where. Mirrors the single-box output
 /// model: `.brdb` → Brickadia Worlds/, `.brz` → Prefabs/. At least one format is
@@ -82,12 +84,16 @@ impl Default for OutputOptions {
 /// h_omit`). The decision is meter-space — made BEFORE quantization picks a
 /// scale — so a near-floor cell that maps to `h >= 1` at a proper scale
 /// survives (the gap fix). The default `0.0` drops only true-floor columns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_heightfield(
     field: &HeightField,
     out: OutputOptions,
     floor_level_m: f32,
     omit_below_m: f32,
     zones: &[Zone],
+    paint: Option<PaintLayer>,
+    terrace_step_m: Option<f32>,
+    max_brick_units: u16,
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
 ) -> Result<BuildOutcome, BuildError> {
@@ -97,7 +103,15 @@ pub(crate) fn convert_heightfield(
         ));
     }
 
-    let raster: DemRaster = field.to_dem_raster();
+    let mut raster: DemRaster = field.to_dem_raster();
+    // Terrace (stepped) export: snap every source height to a step multiple
+    // before quantization, so the build is discrete plateaus instead of smooth
+    // relief. None = smooth (untouched, byte-identical to before).
+    if let Some(step) = terrace_step_m {
+        for m in &mut raster.heights_m {
+            *m = terrace_height(*m, step);
+        }
+    }
     let dem_width = raster.width;
     let dem_height = raster.height;
     // Report the field's true cell range (floor-relative meters), via the SAME
@@ -138,18 +152,30 @@ pub(crate) fn convert_heightfield(
 
     progress(BuildStage::GeneratingBricks, 0.0);
     let flat = build::FlatColormap::sculpt_default(dem_width, dem_height);
+    // Painted cells color the bricks; an unpainted (blank) grid stays on the flat
+    // colormap so the output is byte-identical to a no-paint build (same discipline
+    // as the empty-zones keep-mask below).
+    let paint_cm;
+    let colormap: &dyn Colormap = match paint {
+        Some(p) if !p.grid.is_blank() => {
+            paint_cm = PaintColormap::new(&p.grid.cells, p.palette, dem_width, dem_height);
+            &paint_cm
+        }
+        _ => &flat,
+    };
     // Freedraw zones → an XY keep-mask at the mesher's grid dims. Empty zones →
     // `None`, byte-identical to a no-zone convert (no allocation, no per-cell
     // work). Zones are NOT consumed/cleared — the caller keeps them for re-export.
     let keep_mask = (!zones.is_empty()).then(|| zones::rasterize(zones, dem_width, dem_height));
     let bricks = generate_bricks_skip_floor(
         &heightmap,
-        &flat,
+        colormap,
         style,
         Some(base_h),
         offset,
         out.skip_floor,
         h_omit,
+        max_brick_units,
         Arc::clone(&progress),
         Arc::clone(&cancel),
         keep_mask.as_deref(),
@@ -243,6 +269,9 @@ pub(crate) fn convert_heightfield_tiled(
     floor_level_m: f32,
     omit_below_m: f32,
     zones: &[Zone],
+    paint: Option<PaintLayer>,
+    terrace_step_m: Option<f32>,
+    max_brick_units: u16,
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
 ) -> Result<BuildOutcome, BuildError> {
@@ -284,6 +313,10 @@ pub(crate) fn convert_heightfield_tiled(
     // of this mask so a zone spanning a seam stays consistent across tiles. Empty
     // zones → `None` (every tile meshes unmasked, byte-identical to today).
     let full_mask = (!zones.is_empty()).then(|| zones::rasterize(zones, dem_width, dem_height));
+    // Active paint layer (None if absent or unpainted → every tile stays on the
+    // flat colormap, byte-identical to today). Each tile slices its window out of
+    // the full grid, mirroring the zone keep-mask slicing.
+    let painting = paint.filter(|p| !p.grid.is_blank());
 
     let mut combined: Vec<brdb::Brick> = Vec::new();
     // Pre-reserve to the summed sub-field cell-count ceiling (greedy meshing only
@@ -316,7 +349,12 @@ pub(crate) fn convert_heightfield_tiled(
             enforce_cell_budget(x1 - x0, y1 - y0)?;
 
             let sub = field.sub_field(x0, y0, x1, y1);
-            let raster = sub.to_dem_raster();
+            let mut raster = sub.to_dem_raster();
+            if let Some(step) = terrace_step_m {
+                for m in &mut raster.heights_m {
+                    *m = terrace_height(*m, step);
+                }
+            }
             // Slice this tile's window out of the full-field mask (row-major), so
             // the per-cell keep decision is identical to the single-mesh path.
             let tile_mask = full_mask.as_ref().map(|full| {
@@ -333,21 +371,32 @@ pub(crate) fn convert_heightfield_tiled(
             // field extent — the same algebra grid.rs::world_offset uses.
             let offset = tile_world_offset(x0, y0, dem_width, dem_height, size);
             let heightmap = build_heightmap(&raster, vertical_scale, 0.0);
-            // The flat colormap must match THIS sub-field's dimensions (the mesher
+            // The colormap must match THIS sub-field's dimensions (the mesher
             // asserts heightmap and colormap share dims), not the full field's.
             let flat = build::FlatColormap::sculpt_default(sub.width, sub.height);
+            // Slice this tile's paint window (row-major) so a painted region
+            // spanning a seam stays consistent across tiles.
+            let tile_paint = painting.map(|p| p.grid.sub_window(x0, y0, x1, y1));
+            let paint_cm;
+            let colormap: &dyn Colormap = if let (Some(cells), Some(p)) = (&tile_paint, &painting) {
+                paint_cm = PaintColormap::new(cells, p.palette, sub.width, sub.height);
+                &paint_cm
+            } else {
+                &flat
+            };
 
             // A no-op per-tile progress sink: the aggregate bar advances per tile
             // below; a per-tile stage fraction would thrash the readout.
             let tile_progress: ProgressFn = Arc::new(|_, _| {});
             let bricks = generate_bricks_skip_floor(
                 &heightmap,
-                &flat,
+                colormap,
                 style,
                 Some(base_h),
                 offset,
                 out.skip_floor,
                 h_omit,
+                max_brick_units,
                 tile_progress,
                 Arc::clone(&cancel),
                 tile_mask.as_deref(),
@@ -486,7 +535,7 @@ mod tests {
     use crate::gui::imagery_sources::ImagerySource;
     use crate::gui::tiles::BBoxLatLon;
     use super::super::heightfield::{FieldMeta, HeightField};
-    use super::super::tools::{Raise, Tool};
+    use super::super::tools::{Raise, SetHeight, Tool};
     use super::super::brush::{Brush, BrushShape, Falloff};
 
     fn meta() -> FieldMeta {
@@ -550,6 +599,7 @@ mod tests {
             offset,
             skip_floor,
             h_omit,
+            crate::opt::MAX_BRICK_UNITS,
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
             None,
@@ -684,6 +734,7 @@ mod tests {
             offset,
             false,
             0,
+            crate::opt::MAX_BRICK_UNITS,
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
             None,
@@ -1051,6 +1102,7 @@ mod tests {
             offset,
             skip_floor,
             0,
+            crate::opt::MAX_BRICK_UNITS,
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
             None,
@@ -1217,6 +1269,9 @@ mod tests {
             0.0,
             0.0,
             &[],
+            None,
+            None,
+            crate::opt::MAX_BRICK_UNITS,
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
         )
@@ -1249,11 +1304,199 @@ mod tests {
             0.0,
             0.0,
             &[],
+            None,
+            None,
+            crate::opt::MAX_BRICK_UNITS,
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
         )
         .expect_err("no format selected must error");
         assert!(matches!(err, BuildError::BrdbWrite(_)), "expected BrdbWrite, got {err:?}");
+    }
+
+    /// Splat paint reaches the bricks: a cell painted with swatch 1 produces at
+    /// least one brick carrying that swatch's RGB, while an unpainted build colors
+    /// every brick with the default flat color (the byte-identity baseline).
+    #[test]
+    fn paint_colors_reach_bricks() {
+        use super::super::paint::{default_palette, PaintColormap, PaintGrid};
+
+        // A tall painted cell so it emits bricks. Proper scale lifts 5 m well off
+        // the floor.
+        let mut field = HeightField::flat(8, 8, meta_proper());
+        field.set(4, 4, 5.0);
+        let raster = field.to_dem_raster();
+        let (hscale, vscale) = derive_scale(30.0, 4.0, 1.0, false);
+        let style = BrickStyle::new(BlockType::SmoothTile, hscale, false, false);
+        let size = i32::from(crate::gui::build::cell_size_units(hscale, false));
+        let offset = (-(raster.width as i32 * size), -(raster.height as i32 * size));
+        let hm = build_heightmap(&raster, vscale, 0.0);
+
+        let pal = default_palette();
+        let mut grid = PaintGrid::blank(8, 8);
+        grid.set_block(4, 4, 1, 1); // paint the tall cell with swatch 1
+
+        let mesh = |cells: &[u8]| {
+            let cm = PaintColormap::new(cells, &pal, raster.width, raster.height);
+            generate_bricks_skip_floor(
+                &hm,
+                &cm,
+                style,
+                Some(0),
+                offset,
+                true,
+                0,
+                crate::opt::MAX_BRICK_UNITS,
+                noop_progress(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .expect("mesh must succeed")
+        };
+
+        let painted = mesh(&grid.cells);
+        assert!(!painted.is_empty(), "the tall painted cell must emit bricks");
+        let want = pal[1];
+        assert!(
+            painted.iter().any(|b| b.color.r == want[0] && b.color.g == want[1] && b.color.b == want[2]),
+            "a brick must carry the painted swatch color {want:?}",
+        );
+
+        // Unpainted (blank) grid → every brick is the default flat color, the
+        // byte-identity baseline the paint layer must not perturb when unused.
+        let blank = PaintGrid::blank(8, 8);
+        let unpainted = mesh(&blank.cells);
+        let def = crate::gui::build::DEFAULT_BRICK_COLOR;
+        assert!(
+            unpainted.iter().all(|b| b.color.r == def[0] && b.color.g == def[1] && b.color.b == def[2]),
+            "an unpainted grid must color every brick the default flat color",
+        );
+    }
+
+    /// REPRO (user bug: "flat areas at 192 m and 132 m loaded as ground level").
+    /// A mostly-floor field with two flat plateaus at 132 m and 192 m, meshed
+    /// through the sculpt path (skip_floor=true, default base/omit), must emit
+    /// bricks that REACH those heights — not drop them to native ground.
+    #[test]
+    fn flat_plateaus_at_height_are_not_flattened() {
+        let (_hs, vscale) = derive_scale(30.0, 4.0, 1.0, false);
+        assert!((vscale - 20.0).abs() < 1e-3, "fixture assumes vertical=20 u/m");
+
+        let mut field = HeightField::flat(12, 12, meta_proper());
+        // Two flat plateaus; the rest stays at floor (0).
+        for y in 2..5 {
+            for x in 2..5 {
+                field.set(x, y, 132.0);
+            }
+        }
+        for y in 7..10 {
+            for x in 7..10 {
+                field.set(x, y, 192.0);
+            }
+        }
+
+        let bricks = mesh_field(&field, true);
+        assert!(!bricks.is_empty(), "plateaus at height must emit bricks, not vanish to floor");
+
+        // The tallest brick must reach ~192 m worth of brick-Z (192*20=3840), and
+        // some must reach ~132 m (2640) — proving neither plateau flattened to 0.
+        let max_z = bricks.iter().map(|b| b.position.z).max().unwrap_or(0);
+        assert!(
+            max_z >= (192.0 * vscale * 0.9) as i32,
+            "tallest plateau (192 m) must reach its height; max brick z={max_z}",
+        );
+        assert!(
+            bricks.iter().any(|b| b.position.z >= (132.0 * vscale * 0.9) as i32),
+            "the 132 m plateau must emit bricks near its height",
+        );
+    }
+
+    /// End-to-end of the user's actual workflow: build a flat area with the
+    /// Set-height TOOL (target 192 m) then export. If the tool stores the target
+    /// and convert keeps it, this passes — isolating the bug away from the tool.
+    #[test]
+    fn set_height_tool_plateau_survives_export() {
+        let mut field = HeightField::flat(16, 16, meta_proper());
+        let brush = Brush { shape: BrushShape::Circle, radius_cells: 5.0, strength: 1.0, falloff: Falloff::Constant };
+        SetHeight { target: 192.0 }.apply(&mut field, &brush, (8.0, 8.0));
+        assert!((field.at(8, 8) - 192.0).abs() < 1e-3, "Set-height must store the typed target");
+
+        let bricks = mesh_field(&field, true);
+        assert!(!bricks.is_empty(), "a Set-height 192 m plateau must emit bricks");
+        let (_h, vscale) = derive_scale(30.0, 4.0, 1.0, false);
+        let max_z = bricks.iter().map(|b| b.position.z).max().unwrap_or(0);
+        assert!(max_z >= (192.0 * vscale * 0.9) as i32, "plateau must reach 192 m; max_z={max_z}");
+    }
+
+    /// Terrace export: snapping a smooth ramp to steps collapses it onto far
+    /// fewer distinct brick heights (the stepped/plateau look) while keeping the
+    /// peak altitude. Mirrors what convert does (terrace the heights pre-mesh).
+    #[test]
+    fn terraced_field_meshes_to_fewer_height_levels() {
+        use super::super::heightfield::terrace_height;
+        use std::collections::BTreeSet;
+
+        // A smooth diagonal ramp 0..~110 m over a 12×12 field.
+        let mut smooth = HeightField::flat(12, 12, meta_proper());
+        for y in 0..12 {
+            for x in 0..12 {
+                smooth.set(x, y, (x + y) as f32 * 5.0);
+            }
+        }
+        let distinct = |bricks: &[brdb::Brick]| -> usize {
+            bricks.iter().map(|b| b.position.z).collect::<BTreeSet<_>>().len()
+        };
+        let smooth_levels = distinct(&mesh_field(&smooth, true));
+
+        // Terrace to 25 m steps (what convert does to the raster before meshing).
+        let mut stepped = smooth.clone();
+        for c in stepped.cells.iter_mut() {
+            *c = terrace_height(*c, 25.0);
+        }
+        let stepped_bricks = mesh_field(&stepped, true);
+        let stepped_levels = distinct(&stepped_bricks);
+
+        assert!(
+            stepped_levels < smooth_levels,
+            "terracing must collapse heights: smooth={smooth_levels} stepped={stepped_levels}",
+        );
+        // Altitude preserved: the stepped peak is within a step of the smooth peak.
+        let (_h, vscale) = derive_scale(30.0, 4.0, 1.0, false);
+        let peak = stepped_bricks.iter().map(|b| b.position.z).max().unwrap_or(0);
+        assert!(peak as f32 >= (110.0 - 25.0) * vscale, "stepped peak keeps accurate altitude");
+    }
+
+    /// REPRO at the user's scale (cell_m≈4): a LARGE flat plateau at 132 m,
+    /// surrounded by floor, meshed through the sculpt path. The big flat region
+    /// merges into large greedy quads — assert those quads still emit bricks that
+    /// reach 132 m (not collapse to ground).
+    #[test]
+    fn large_flat_plateau_user_scale_emits() {
+        let meta = FieldMeta {
+            cell_m: 4.0,
+            studs_per_meter: 4.0,
+            vertical_exaggeration: 1.0,
+            micro: false,
+            centroid_lat: 0.0,
+            source_name: "user-scale".to_string(),
+        };
+        let (_hs, vscale) = derive_scale(4.0, 4.0, 1.0, false);
+
+        let mut field = HeightField::flat(96, 96, meta);
+        // A 40×40 flat plateau at 132 m in the middle; rest stays floor (0).
+        for y in 28..68 {
+            for x in 28..68 {
+                field.set(x, y, 132.0);
+            }
+        }
+
+        let bricks = mesh_field(&field, true);
+        assert!(!bricks.is_empty(), "the plateau must emit bricks");
+        let max_z = bricks.iter().map(|b| b.position.z).max().unwrap_or(0);
+        assert!(
+            max_z >= (132.0 * vscale * 0.9) as i32,
+            "large flat plateau must reach 132 m at user scale; vscale={vscale} max_z={max_z}",
+        );
     }
 
     // ---- Step 5: freedraw zones applied at convert -------------------------
@@ -1283,6 +1526,7 @@ mod tests {
         let flat = FlatColormap::for_test(raster.width, raster.height);
         generate_bricks_skip_floor(
             &hm, &flat, style, Some(0), offset, skip_floor, 0,
+            crate::opt::MAX_BRICK_UNITS,
             noop_progress(), Arc::new(AtomicBool::new(false)), Some(mask),
         )
         .expect("masked mesh must succeed")
@@ -1321,6 +1565,7 @@ mod tests {
         let flat = FlatColormap::for_test(sub.width, sub.height);
         generate_bricks_skip_floor(
             &hm, &flat, style, Some(0), offset, skip_floor, 0,
+            crate::opt::MAX_BRICK_UNITS,
             noop_progress(), Arc::new(AtomicBool::new(false)), Some(&tile_mask),
         )
         .expect("masked sub-field mesh must succeed")
@@ -1442,6 +1687,9 @@ mod tests {
             0.0,
             0.0,
             std::slice::from_ref(&zone),
+            None,
+            None,
+            crate::opt::MAX_BRICK_UNITS,
             noop_progress(),
             Arc::new(AtomicBool::new(false)),
         )
@@ -1478,6 +1726,9 @@ mod tests {
                 0.0,
                 0.0,
                 z,
+                None,
+                None,
+                crate::opt::MAX_BRICK_UNITS,
                 noop_progress(),
                 Arc::new(AtomicBool::new(false)),
             )

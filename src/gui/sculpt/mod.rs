@@ -11,6 +11,7 @@
 mod brush;
 mod convert;
 mod heightfield;
+mod paint;
 mod sculpt_tab;
 mod tools;
 

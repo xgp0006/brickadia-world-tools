@@ -10,7 +10,7 @@
 //! blends toward the *pre-dab* neighborhood mean — the edit is independent of
 //! row-major write order, which keeps it deterministic and order-free.
 
-use super::brush::{weight, Brush, BrushShape};
+use super::brush::{shape_distance, weight, Brush};
 use super::heightfield::HeightField;
 
 /// A single height operation applied as a dab. Implementors edit `f` in place
@@ -61,23 +61,16 @@ fn dab_rect(f: &HeightField, center: (f32, f32), r: f32) -> Option<(u32, u32, u3
 }
 
 /// Influence weight of a dab at cell `(x, y)`: the brush falloff evaluated on the
-/// Euclidean distance from `center`, normalized by the radius. Returns `0.0`
-/// for cells outside the circular footprint. Pure; no field mutation.
+/// shape's normalized distance from `center` (see [`shape_distance`]). Returns
+/// `0.0` for cells outside the brush footprint, whatever its shape. Pure; no
+/// field mutation.
 fn cell_weight(brush: &Brush, center: (f32, f32), x: u32, y: u32) -> f32 {
     let (cx, cy) = center;
     let dx = x as f32 - cx;
     let dy = y as f32 - cy;
-    match brush.shape {
-        BrushShape::Circle => {
-            let dist = (dx * dx + dy * dy).sqrt();
-            // Guard the divide; a non-positive radius produced no rect, but be
-            // explicit so the kernel is total (NaN-safe).
-            if brush.radius_cells <= 0.0 || brush.radius_cells.is_nan() {
-                return 0.0;
-            }
-            weight(brush.falloff, dist / brush.radius_cells)
-        }
-    }
+    // `shape_distance` returns +∞ for a non-positive/NaN radius; `weight` clamps
+    // that to a zero influence, so the kernel stays total without a guard here.
+    weight(brush.falloff, shape_distance(brush.shape, dx, dy, brush.radius_cells))
 }
 
 /// Raise: push cells **up** by `strength * weight` per dab.
@@ -246,10 +239,115 @@ impl Tool for SetHeight {
     }
 }
 
+/// A parametric terrain primitive: which silhouette the [`Stamp`] tool deposits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StampKind {
+    /// Peak at center, linear slope to zero at the footprint edge.
+    Cone,
+    /// Flat top out to `inner_ratio`, then eased shoulder down to the edge.
+    Mesa,
+    /// Sunken bowl with a raised rim near `inner_ratio`, fading out past it.
+    Crater,
+    /// Linear gradient (0 → 1) along `angle`, bounded by the footprint.
+    Ramp,
+}
+
+impl StampKind {
+    pub(crate) const ALL: [StampKind; 4] =
+        [StampKind::Cone, StampKind::Mesa, StampKind::Crater, StampKind::Ramp];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            StampKind::Cone => "Cone",
+            StampKind::Mesa => "Mesa",
+            StampKind::Crater => "Crater",
+            StampKind::Ramp => "Ramp",
+        }
+    }
+}
+
+/// Normalized height profile in roughly `[-1, 1]` for a stamp, evaluated at a
+/// footprint distance `d ∈ [0, 1]` (0 = center, 1 = edge). `ramp_proj` is the
+/// signed projection of the cell onto the ramp direction, normalized to
+/// `[-1, 1]` across the radius (only used by [`StampKind::Ramp`]). `inner_ratio`
+/// is clamped to a safe interior so divides never blow up.
+///
+/// Profiles vanish (→ 0) at `d = 1` for Cone/Mesa/Crater so the silhouette
+/// blends into existing terrain with no wall; Ramp keeps its edge (a ramp is a
+/// wall by nature).
+fn stamp_profile(kind: StampKind, d: f32, inner_ratio: f32, ramp_proj: f32) -> f32 {
+    let d = d.clamp(0.0, 1.0);
+    let inner = inner_ratio.clamp(0.05, 0.95);
+    match kind {
+        StampKind::Cone => 1.0 - d,
+        StampKind::Mesa => {
+            if d <= inner {
+                1.0
+            } else {
+                // Eased shoulder: 1 at the plateau rim → 0 at the footprint edge.
+                let u = (d - inner) / (1.0 - inner);
+                let t = 1.0 - u; // invert so smoothstep gives 1 at inner, 0 at edge
+                t * t * (3.0 - 2.0 * t)
+            }
+        }
+        StampKind::Crater => {
+            if d <= inner {
+                // Pit at center (-1) rising to the rim (+1) at `inner`.
+                -(std::f32::consts::PI * d / inner).cos()
+            } else {
+                // Rim (+1) fading to 0 at the edge.
+                (1.0 - d) / (1.0 - inner)
+            }
+        }
+        StampKind::Ramp => 0.5 + 0.5 * ramp_proj.clamp(-1.0, 1.0),
+    }
+}
+
+/// Stamp a terrain primitive: deposit `peak_m * profile(d)` onto every cell
+/// inside the brush footprint, where the profile is chosen by `kind` (see
+/// [`stamp_profile`]). Respects the brush's *shape* (a square mesa, hex cone…)
+/// via [`shape_distance`], and its `radius_cells` for the footprint extent.
+/// Additive on top of existing terrain; `set` clamps the result `>= FLOOR_M`,
+/// so a crater pit or negative `peak_m` can carve down to — never below — floor.
+pub(crate) struct Stamp {
+    pub kind: StampKind,
+    pub peak_m: f32,
+    pub inner_ratio: f32,
+    /// Ramp direction in radians; ignored by the radially-symmetric kinds.
+    pub angle: f32,
+}
+
+impl Tool for Stamp {
+    fn apply(&self, f: &mut HeightField, brush: &Brush, center: (f32, f32)) {
+        let r = brush.radius_cells;
+        let Some((x0, x1, y0, y1)) = dab_rect(f, center, r) else {
+            return;
+        };
+        let (cx, cy) = center;
+        let (dirx, diry) = (self.angle.cos(), self.angle.sin());
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                // Footprint membership uses the brush shape's metric; cells at or
+                // past the rim (d >= 1) get nothing.
+                let d = shape_distance(brush.shape, dx, dy, r);
+                if d >= 1.0 {
+                    continue;
+                }
+                let proj = if r > 0.0 { (dx * dirx + dy * diry) / r } else { 0.0 };
+                let profile = stamp_profile(self.kind, d, self.inner_ratio, proj);
+                let v = f.at(x, y) + self.peak_m * profile;
+                f.set(x, y, v); // clamps >= FLOOR_M
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::brush::Falloff;
+    use super::super::brush::{BrushShape, Falloff};
     use super::super::heightfield::{FieldMeta, FLOOR_M};
 
     fn test_meta() -> FieldMeta {
@@ -298,6 +396,33 @@ mod tests {
         }
         // The very center got the full strength (weight ~1).
         assert!((f.at(10, 10) - 5.0).abs() < 1e-4, "center should gain ~full strength");
+    }
+
+    /// Footprint shape selects which cells a dab touches: a Square raises the
+    /// box corner a Circle of the same radius leaves untouched, and a Diamond
+    /// excludes a diagonal cell the Square keeps.
+    #[test]
+    fn footprint_shape_selects_cells() {
+        let center = (10.0, 10.0);
+        let r = 5.0;
+        // Box corner of the ±r rect, just inside it.
+        let (cx, cy) = (14u32, 14u32); // dx=dy=4 < r=5 → inside the square, outside the circle
+        let brush = |shape| Brush { shape, radius_cells: r, strength: 5.0, falloff: Falloff::Constant };
+
+        let mut sq = HeightField::flat(21, 21, test_meta());
+        Raise.apply(&mut sq, &brush(BrushShape::Square), center);
+        assert!(sq.at(cx, cy) > 0.0, "square footprint must raise the box corner");
+
+        let mut ci = HeightField::flat(21, 21, test_meta());
+        Raise.apply(&mut ci, &brush(BrushShape::Circle), center);
+        assert_eq!(ci.at(cx, cy), 0.0, "circle of equal radius must not reach the box corner");
+
+        // Diamond excludes a diagonal cell (dx=dy=3 → manhattan 6 > r) the Square keeps.
+        let (dx, dy) = (13u32, 13u32);
+        let mut di = HeightField::flat(21, 21, test_meta());
+        Raise.apply(&mut di, &brush(BrushShape::Diamond), center);
+        assert_eq!(di.at(dx, dy), 0.0, "diamond must exclude the diagonal cell");
+        assert!(sq.at(dx, dy) > 0.0, "square must include the diagonal cell");
     }
 
     /// A dab leaves every cell outside its bounded rect untouched (bit-exact),
@@ -466,6 +591,52 @@ mod tests {
     fn assert_floor(f: &HeightField) {
         for (i, &c) in f.cells.iter().enumerate() {
             assert!(c >= FLOOR_M, "cell {i} fell below floor: {c}");
+        }
+    }
+
+    /// Stamp profiles: cone peaks at center and vanishes at the edge; mesa is
+    /// flat (==1) out to inner_ratio then vanishes; crater pits at center and
+    /// rises to a rim.
+    #[test]
+    fn stamp_profiles_shape() {
+        // Cone: 1 at center, ~0 at edge, monotonic down.
+        assert!((stamp_profile(StampKind::Cone, 0.0, 0.5, 0.0) - 1.0).abs() < 1e-6);
+        assert!(stamp_profile(StampKind::Cone, 1.0, 0.5, 0.0).abs() < 1e-6);
+        assert!(stamp_profile(StampKind::Cone, 0.3, 0.5, 0.0) > stamp_profile(StampKind::Cone, 0.7, 0.5, 0.0));
+
+        // Mesa: flat top within inner_ratio, zero at the edge.
+        let inner = 0.4;
+        assert!((stamp_profile(StampKind::Mesa, 0.0, inner, 0.0) - 1.0).abs() < 1e-6);
+        assert!((stamp_profile(StampKind::Mesa, inner * 0.5, inner, 0.0) - 1.0).abs() < 1e-6);
+        assert!(stamp_profile(StampKind::Mesa, 1.0, inner, 0.0).abs() < 1e-6);
+
+        // Crater: negative at center (pit), positive at the rim (== inner_ratio).
+        assert!(stamp_profile(StampKind::Crater, 0.0, 0.5, 0.0) < 0.0);
+        assert!((stamp_profile(StampKind::Crater, 0.5, 0.5, 0.0) - 1.0).abs() < 1e-5);
+
+        // Ramp: 0 at the low edge, 1 at the high edge.
+        assert!(stamp_profile(StampKind::Ramp, 0.5, 0.5, -1.0).abs() < 1e-6);
+        assert!((stamp_profile(StampKind::Ramp, 0.5, 0.5, 1.0) - 1.0).abs() < 1e-6);
+    }
+
+    /// A cone Stamp raises the center to ~peak, tapers outward, leaves cells past
+    /// the footprint untouched, and never drops a cell below the floor.
+    #[test]
+    fn stamp_cone_deposits_peak() {
+        let mut f = HeightField::flat(31, 31, test_meta());
+        let center = (15.0, 15.0);
+        let r = 8.0;
+        let brush = Brush { shape: BrushShape::Circle, radius_cells: r, strength: 0.0, falloff: Falloff::Constant };
+        Stamp { kind: StampKind::Cone, peak_m: 50.0, inner_ratio: 0.5, angle: 0.0 }.apply(&mut f, &brush, center);
+
+        assert!((f.at(15, 15) - 50.0).abs() < 1e-3, "cone center should reach peak");
+        // A mid-radius cell is raised but below the peak.
+        let mid = f.at(19, 15);
+        assert!(mid > 0.0 && mid < 50.0, "cone should taper: {mid}");
+        // Outside the footprint: untouched.
+        assert_eq!(f.at(0, 0), 0.0, "cell outside footprint must stay at floor");
+        for &c in f.cells.iter() {
+            assert!(c >= FLOOR_M, "stamp must not breach floor");
         }
     }
 

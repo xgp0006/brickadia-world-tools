@@ -19,17 +19,21 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use egui::{Color32, Pos2, Rect, Sense, Stroke, TextEdit, Ui, Vec2};
+use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2};
 use poll_promise::Promise;
 
 use crate::gui::build::{self, BuildError, BuildOutcome, BuildStage};
 use crate::gui::theme::{STATUS_ERROR_FG, STATUS_WARN_FG};
 use crate::gui::zones::{Zone, ZoneMode};
 
-use super::brush::{Brush, BrushShape, Falloff};
+use super::brush::{shape_distance, Brush, BrushShape, Falloff};
 use super::convert::{convert_heightfield, convert_heightfield_tiled, OutputOptions};
-use super::heightfield::{FieldMeta, HeightField, FLOOR_M};
-use super::tools::{Flatten, Lower, Raise, SetHeight, Smooth, Tool};
+use super::paint::{
+    default_palette, gradient_palette, splatmap_to_indices, PaintGrid, PaintLayer, GRADIENT_BANDS,
+    MAX_SWATCHES,
+};
+use super::heightfield::{terrace_height, FieldMeta, HeightField, FLOOR_M};
+use super::tools::{Flatten, Lower, Raise, SetHeight, Smooth, Stamp, StampKind, Tool};
 
 /// Cap on the undo/redo history depth (spec §6, "deque capped at ~32").
 const UNDO_CAP: usize = 32;
@@ -182,6 +186,11 @@ enum SculptTool {
     Smooth,
     Flatten,
     Set,
+    /// Stamp a parametric terrain primitive (cone/mesa/crater/ramp) on press —
+    /// a single dab, not a continuous stroke. Params live in `SculptState::stamp`.
+    Stamp,
+    /// Paint the active palette swatch into the splat grid (color, not height).
+    Paint,
     /// Freedraw omit/include zones — not a brush; it draws loops, not heights.
     Zone,
 }
@@ -195,9 +204,58 @@ enum ZoneStyle {
     Polygon,
 }
 
+/// Top-level workspace mode (the tab bar). Groups the tools so the panel shows
+/// only one mode's controls at a time instead of one long tool dropdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SculptMode {
+    /// Height brushes (Raise/Lower/Smooth/Flatten/Set).
+    Shape,
+    /// Parametric terrain primitives (cone/mesa/crater/ramp).
+    Stamp,
+    /// Splat color painting.
+    Paint,
+    /// Freedraw omit/include zones.
+    Zone,
+}
+
+/// The paint method inside Paint mode: freehand brush vs flood-fill bucket.
+/// (The third method — auto palette from the height gradient — is a one-shot
+/// button, not a click-mode.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintTool {
+    /// Freehand brush: drag to paint the active swatch.
+    Brush,
+    /// Paint bucket: click to flood-fill an elevation region/step.
+    Bucket,
+}
+
+impl SculptMode {
+    const ALL: [SculptMode; 4] = [Self::Shape, Self::Stamp, Self::Paint, Self::Zone];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shape => "Shape",
+            Self::Stamp => "Stamp",
+            Self::Paint => "Paint",
+            Self::Zone => "Zone",
+        }
+    }
+}
+
 impl SculptTool {
-    const ALL: [SculptTool; 6] =
-        [Self::Raise, Self::Lower, Self::Smooth, Self::Flatten, Self::Set, Self::Zone];
+    /// The five height brushes selectable inside Shape mode.
+    const SHAPE_TOOLS: [SculptTool; 5] =
+        [Self::Raise, Self::Lower, Self::Smooth, Self::Flatten, Self::Set];
+
+    /// Which workspace mode this tool lives under (drives the active tab).
+    fn mode(self) -> SculptMode {
+        match self {
+            Self::Raise | Self::Lower | Self::Smooth | Self::Flatten | Self::Set => SculptMode::Shape,
+            Self::Stamp => SculptMode::Stamp,
+            Self::Paint => SculptMode::Paint,
+            Self::Zone => SculptMode::Zone,
+        }
+    }
 
     const fn label(self) -> &'static str {
         match self {
@@ -206,6 +264,8 @@ impl SculptTool {
             Self::Smooth => "Smooth",
             Self::Flatten => "Flatten",
             Self::Set => "Set height",
+            Self::Stamp => "Stamp (primitive)",
+            Self::Paint => "Paint (color)",
             Self::Zone => "Zone (omit/include)",
         }
     }
@@ -218,18 +278,51 @@ impl SculptTool {
     }
 
     /// Apply one dab of this tool to `field` at `center`, shaped by `brush`,
-    /// using `target` for the value-driven tools. Dispatches to the trait impls.
-    fn apply_dab(self, field: &mut HeightField, brush: &Brush, center: (f32, f32), target: f32) {
+    /// using `target` for the value-driven tools and `stamp` for the Stamp tool.
+    /// Dispatches to the trait impls.
+    fn apply_dab(
+        self,
+        field: &mut HeightField,
+        brush: &Brush,
+        center: (f32, f32),
+        target: f32,
+        stamp: StampParams,
+    ) {
         match self {
             Self::Raise => Raise.apply(field, brush, center),
             Self::Lower => Lower.apply(field, brush, center),
             Self::Smooth => Smooth.apply(field, brush, center),
             Self::Flatten => Flatten { target }.apply(field, brush, center),
             Self::Set => SetHeight { target }.apply(field, brush, center),
-            // Zone is not a brush; the canvas routes it to `handle_zone_input`
-            // before any dab dispatch, so this arm is never reached.
-            Self::Zone => {}
+            Self::Stamp => Stamp {
+                kind: stamp.kind,
+                peak_m: stamp.peak_m,
+                inner_ratio: stamp.inner_ratio,
+                angle: stamp.angle_deg.to_radians(),
+            }
+            .apply(field, brush, center),
+            // Paint and Zone are not height brushes; the canvas routes them to
+            // `handle_paint_input` / `handle_zone_input` before any dab dispatch,
+            // so these arms are never reached.
+            Self::Paint | Self::Zone => {}
         }
+    }
+}
+
+/// Parameters for the [`SculptTool::Stamp`] primitive, held in sculpt state and
+/// edited in the tool panel. `angle_deg` is stored in degrees for a friendlier
+/// slider and converted to radians at dispatch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StampParams {
+    kind: StampKind,
+    peak_m: f32,
+    inner_ratio: f32,
+    angle_deg: f32,
+}
+
+impl Default for StampParams {
+    fn default() -> Self {
+        Self { kind: StampKind::Cone, peak_m: 40.0, inner_ratio: 0.4, angle_deg: 0.0 }
     }
 }
 
@@ -289,6 +382,13 @@ enum UndoEntry {
     /// The zones list *before* a zone add/delete/clear. Restoring swaps it back
     /// in; touches no cells, so the terrain texture stays clean.
     Zones(Vec<Zone>),
+    /// The whole paint grid *before* a paint stroke. Restoring swaps it back in
+    /// and forces a texture re-render (the overlay changed).
+    ///
+    // ponytail: whole-grid snapshot per stroke (mirrors the Zones whole-Vec
+    // clone). Ceiling: O(W·H) bytes/entry; if large-canvas paint undo gets heavy,
+    // switch to a rect-bounded PaintSnapshot like RectSnapshot.
+    Paint(PaintGrid),
 }
 
 /// All sculpt-tab state: the editable field, the active tool + brush, the view
@@ -297,9 +397,33 @@ enum UndoEntry {
 pub(crate) struct SculptState {
     field: Option<HeightField>,
     tool: SculptTool,
+    /// The last height brush picked in Shape mode, restored when the Shape tab is
+    /// re-entered after visiting Stamp/Paint/Zone.
+    shape_tool: SculptTool,
     brush: Brush,
     /// Target height (meters above floor) for Flatten/Set.
     target_height: f32,
+    /// Parameters for the Stamp primitive tool (cone/mesa/crater/ramp).
+    stamp: StampParams,
+    /// Per-cell splat-paint palette indices, parallel to the height field (same
+    /// dims; re-blanked on every field load). An unpainted grid colors bricks
+    /// exactly as today (byte-identical). See [`super::paint`].
+    paint: PaintGrid,
+    /// Editable color palette; slot 0 is the unpainted color.
+    palette: Vec<[u8; 4]>,
+    /// The palette index the Paint tool writes.
+    active_swatch: u8,
+    /// Splat resolution: brush/gradient writes snap to `splat_res × splat_res`
+    /// cell blocks (1 = per-cell, higher = coarser color = fewer brick splits).
+    splat_res: u32,
+    /// Paint method in Paint mode (freehand brush vs flood-fill bucket).
+    paint_tool: PaintTool,
+    /// Bucket flood-fill height tolerance (meters): cells within this of the
+    /// clicked cell's height fill. Pairs naturally with the terrace step.
+    bucket_tolerance_m: f32,
+    /// Bucket fills every matching cell globally instead of only the contiguous
+    /// region the click landed in.
+    bucket_global: bool,
 
     // View transform: `pan` is the screen-space top-left of cell (0,0); `zoom`
     // is screen pixels per cell. Both are user-driven (drag-pan with the middle
@@ -389,12 +513,29 @@ pub(crate) struct SculptState {
     /// `convert_heightfield`'s `omit_below_m`. Default `0.0` drops only true-floor
     /// columns (byte-identical to the prior skip).
     omit_below_m: f32,
+    /// Terrace (stepped) mode: when on, heights snap to `terrace_step_m` multiples
+    /// at render + export — discrete plateaus instead of smooth relief, accurate
+    /// altitude preserved. Non-destructive (the stored field stays smooth), so it
+    /// flips per project. Default off.
+    terrace: bool,
+    /// Vertical step size (meters) for terrace mode.
+    terrace_step_m: f32,
+    /// Max merged-brick footprint (world units) the greedy mesher may emit.
+    /// Brickadia silently drops procedural bricks above its render limit, leaving
+    /// holes — lower this until they vanish. Default 250 (50 studs).
+    max_brick_units: u16,
     /// Eyedropper height-picker mode (spec §3). When on, a primary click on the
     /// canvas samples the hovered cell's height (meters) and routes it by the
     /// held modifier (plain → target, Alt → floor, Ctrl → omit) instead of
     /// laying a brush dab — pick mode SUPPRESSES brush painting so the two never
     /// fire on the same click. Toggled from the Export panel; default off.
     pick_mode: bool,
+    /// Where a plain eyedropper click stores its sample (Target/Floor/Omit). Set
+    /// by a selector so the destination doesn't depend on holding Ctrl/Alt at
+    /// click time — that modifier gesture is unreliable on Wayland/Hyprland (the
+    /// compositor can grab modifier+click). Modifiers still override when they do
+    /// register.
+    pick_into: PickTarget,
     /// The last height sampled by the eyedropper (meters above floor), shown as a
     /// small on-canvas readout. `None` until the first pick.
     last_pick: Option<f32>,
@@ -424,6 +565,7 @@ impl Default for SculptState {
         Self {
             field: None,
             tool: SculptTool::Raise,
+            shape_tool: SculptTool::Raise,
             brush: Brush {
                 shape: BrushShape::Circle,
                 radius_cells: 12.0,
@@ -431,6 +573,15 @@ impl Default for SculptState {
                 falloff: Falloff::Smoothstep,
             },
             target_height: 20.0,
+            stamp: StampParams::default(),
+            // No field yet → a 0×0 grid; `set_field` re-blanks it to the field dims.
+            paint: PaintGrid::blank(0, 0),
+            palette: default_palette(),
+            active_swatch: 1,
+            splat_res: 1,
+            paint_tool: PaintTool::Brush,
+            bucket_tolerance_m: 5.0,
+            bucket_global: false,
             pan: Vec2::ZERO,
             zoom: 4.0,
             view_initialized: false,
@@ -459,6 +610,10 @@ impl Default for SculptState {
             tile_cells: DEFAULT_TILE_CELLS,
             floor_level_m: 0.0,
             omit_below_m: 0.0,
+            terrace: false,
+            terrace_step_m: 10.0,
+            max_brick_units: 250,
+            pick_into: PickTarget::Target,
             pick_mode: false,
             last_pick: None,
             // Seed generous so a pre-first-refresh gate never blocks; the first
@@ -491,6 +646,10 @@ impl SculptState {
         self.studs_per_meter = field.meta.studs_per_meter;
         self.vertical_exaggeration = field.meta.vertical_exaggeration;
         self.micro = field.meta.micro;
+        // The paint grid is cell-aligned to the field; a new field of different
+        // dims would misindex it, so re-blank to the incoming dims (like zones +
+        // undo, which also drop on a field swap).
+        self.paint = PaintGrid::blank(field.width, field.height);
         self.field = Some(field);
         self.dirty = true;
         // A new field invalidates the cached extent and any partial dirty rect:
@@ -513,6 +672,17 @@ impl SculptState {
     /// shared `UNDO_CAP`.
     fn record_zone_edit(&mut self) {
         self.undo.push_back(UndoEntry::Zones(self.zones.clone()));
+        while self.undo.len() > UNDO_CAP {
+            self.undo.pop_front();
+        }
+        self.redo.clear();
+    }
+
+    /// Snapshot the whole paint grid onto the undo stack before a paint stroke,
+    /// clearing redo (same discipline as a height/zone commit). Bounded by the
+    /// shared `UNDO_CAP`.
+    fn record_paint_edit(&mut self) {
+        self.undo.push_back(UndoEntry::Paint(self.paint.clone()));
         while self.undo.len() > UNDO_CAP {
             self.undo.pop_front();
         }
@@ -643,14 +813,25 @@ fn draw_controls(state: &mut SculptState, ui: &mut Ui) {
         return;
     }
 
-    draw_tool_section(state, ui);
+    draw_mode_bar(state, ui);
     ui.add_space(8.0);
-    // The Zone tool draws loops, not heights — show its mask controls instead of
-    // the brush radius/strength/falloff.
-    if state.tool == SculptTool::Zone {
-        draw_zone_section(state, ui);
-    } else {
-        draw_brush_section(state, ui);
+    // Each mode shows only its own controls (no catch-all dropdown).
+    match state.tool.mode() {
+        SculptMode::Shape => {
+            draw_shape_tools(state, ui);
+            draw_brush_section(state, ui);
+        }
+        SculptMode::Stamp => {
+            draw_brush_section(state, ui);
+            ui.add_space(6.0);
+            draw_stamp_section(state, ui);
+        }
+        SculptMode::Paint => {
+            draw_brush_section(state, ui);
+            ui.add_space(6.0);
+            draw_paint_section(state, ui);
+        }
+        SculptMode::Zone => draw_zone_section(state, ui),
     }
     ui.add_space(8.0);
     draw_history_section(state, ui);
@@ -694,24 +875,40 @@ fn draw_new_canvas_section(state: &mut SculptState, ui: &mut Ui) {
     });
 }
 
-fn draw_tool_section(state: &mut SculptState, ui: &mut Ui) {
-    ui.label("Tool");
-    egui::ComboBox::from_id_salt("sculpt_tool_combo")
-        .selected_text(state.tool.label())
-        .width(260.0)
-        .show_ui(ui, |ui| {
-            for t in SculptTool::ALL {
-                if ui.selectable_label(state.tool == t, t.label()).clicked() {
-                    // Leaving the Zone tool discards any in-progress polygon draft
-                    // so it can't silently become the prefix of the next loop on
-                    // return (the draft is invisible + un-cancellable off-tool).
-                    if t != SculptTool::Zone {
-                        state.zone_draft.clear();
-                    }
-                    state.tool = t;
+/// The top mode tab bar: Shape / Stamp / Paint / Zone. Switching modes sets the
+/// active tool to that mode's tool (Shape restores the last height brush) and
+/// drops any in-progress zone draft when leaving Zone.
+fn draw_mode_bar(state: &mut SculptState, ui: &mut Ui) {
+    let current = state.tool.mode();
+    ui.horizontal(|ui| {
+        for m in SculptMode::ALL {
+            if ui.selectable_label(current == m, m.label()).clicked() && current != m {
+                if m != SculptMode::Zone {
+                    state.zone_draft.clear();
                 }
+                state.tool = match m {
+                    SculptMode::Shape => state.shape_tool,
+                    SculptMode::Stamp => SculptTool::Stamp,
+                    SculptMode::Paint => SculptTool::Paint,
+                    SculptMode::Zone => SculptTool::Zone,
+                };
             }
-        });
+        }
+    });
+}
+
+/// Shape mode's height-brush sub-selector (Raise/Lower/Smooth/Flatten/Set) plus
+/// the target-height field the value-driven brushes use.
+fn draw_shape_tools(state: &mut SculptState, ui: &mut Ui) {
+    ui.label("Brush tool");
+    ui.horizontal_wrapped(|ui| {
+        for t in SculptTool::SHAPE_TOOLS {
+            if ui.selectable_label(state.tool == t, t.label()).clicked() {
+                state.tool = t;
+                state.shape_tool = t; // remember for the next Shape-tab entry
+            }
+        }
+    });
     if matches!(state.tool, SculptTool::Flatten | SculptTool::Set) {
         ui.horizontal(|ui| {
             ui.label("Target height (m)");
@@ -725,20 +922,212 @@ fn draw_brush_section(state: &mut SculptState, ui: &mut Ui) {
     // Radius/strength keep the slider track but route the value-box drag through
     // the F2 modifier scaling (spec §2 / DoD §8): Ctrl ⇒ fine, Alt ⇒ coarse.
     modifier_slider(ui, &mut state.brush.radius_cells, 1.0..=200.0, 0.2, "radius (cells)", true);
-    let strength_range = if state.tool.strength_is_blend() {
-        0.0..=1.0
-    } else {
-        0.0..=200.0
-    };
-    // Blend tools live in 0..=1 (fine base step); meter tools in 0..=200.
-    let strength_base = if state.tool.strength_is_blend() { 0.005 } else { 0.2 };
-    modifier_slider(ui, &mut state.brush.strength, strength_range, strength_base, "strength", false);
+    // Stamp drives height via its own `peak_m`; Paint hard-writes an index with no
+    // falloff — neither uses the brush strength, so hide it for both.
+    if !matches!(state.tool, SculptTool::Stamp | SculptTool::Paint) {
+        let strength_range = if state.tool.strength_is_blend() {
+            0.0..=1.0
+        } else {
+            0.0..=200.0
+        };
+        // Blend tools live in 0..=1 (fine base step); meter tools in 0..=200.
+        let strength_base = if state.tool.strength_is_blend() { 0.005 } else { 0.2 };
+        modifier_slider(ui, &mut state.brush.strength, strength_range, strength_base, "strength", false);
+    }
     ui.horizontal(|ui| {
         ui.label("Falloff");
         ui.selectable_value(&mut state.brush.falloff, Falloff::Smoothstep, "Smooth");
         ui.selectable_value(&mut state.brush.falloff, Falloff::Linear, "Linear");
         ui.selectable_value(&mut state.brush.falloff, Falloff::Constant, "Hard");
     });
+    ui.horizontal(|ui| {
+        ui.label("Shape");
+        for s in BrushShape::ALL {
+            ui.selectable_value(&mut state.brush.shape, s, s.label());
+        }
+    });
+}
+
+fn draw_stamp_section(state: &mut SculptState, ui: &mut Ui) {
+    ui.label("Primitive (stamps once per click)");
+    ui.horizontal(|ui| {
+        ui.label("Shape");
+        for k in StampKind::ALL {
+            ui.selectable_value(&mut state.stamp.kind, k, k.label());
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Peak (m)");
+        // Signed: a negative peak digs (crater pit / inverted cone), clamped to
+        // floor at apply time.
+        modifier_drag(ui, &mut state.stamp.peak_m, 0.5, -10_000.0..=100_000.0);
+    });
+    // Mesa plateau width and crater rim position both ride `inner_ratio`; Cone is
+    // radially uniform and Ramp is directional, so the knob only matters for the
+    // first two — show it for all but label its role.
+    if matches!(state.stamp.kind, StampKind::Mesa | StampKind::Crater) {
+        modifier_slider(ui, &mut state.stamp.inner_ratio, 0.05..=0.95, 0.01, "inner ratio", false);
+    }
+    if state.stamp.kind == StampKind::Ramp {
+        modifier_slider(ui, &mut state.stamp.angle_deg, 0.0..=360.0, 1.0, "angle (°)", false);
+    }
+}
+
+fn draw_paint_section(state: &mut SculptState, ui: &mut Ui) {
+    // Paint method: freehand brush, flood-fill bucket, or auto palette (the
+    // gradient button below). Brush/Bucket pick how a click behaves on the canvas.
+    ui.horizontal(|ui| {
+        ui.label("Method");
+        ui.selectable_value(&mut state.paint_tool, PaintTool::Brush, "🖌 Brush");
+        ui.selectable_value(&mut state.paint_tool, PaintTool::Bucket, "🪣 Bucket");
+    });
+    if state.paint_tool == PaintTool::Bucket {
+        ui.horizontal(|ui| {
+            ui.label("Tolerance (m)");
+            modifier_drag(ui, &mut state.bucket_tolerance_m, 0.5, 0.0..=100_000.0);
+        })
+        .response
+        .on_hover_text(
+            "Click a cell: fills cells within this height of it. Match the terrace \
+             step to flood a whole plateau.",
+        );
+        ui.checkbox(&mut state.bucket_global, "Global (all matching cells)")
+            .on_hover_text("Off: only the contiguous region you click. On: every matching cell.");
+    }
+    ui.separator();
+
+    ui.label("Palette (paint → brick color)");
+    // Swatch grid: click to select the active swatch the brush writes.
+    ui.horizontal_wrapped(|ui| {
+        for i in 0..state.palette.len() {
+            let col = state.palette[i];
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+            ui.painter().rect_filled(
+                rect,
+                3.0,
+                Color32::from_rgba_unmultiplied(col[0], col[1], col[2], col[3]),
+            );
+            if i == state.active_swatch as usize {
+                ui.painter().rect_stroke(
+                    rect,
+                    3.0,
+                    Stroke::new(2.0, Color32::from_rgb(0xFF, 0xE0, 0x60)),
+                    StrokeKind::Inside,
+                );
+            }
+            if resp.clicked() {
+                state.active_swatch = i as u8;
+            }
+            let hint = if i == 0 { "unpainted (default brick color)".into() } else { format!("swatch {i}") };
+            resp.on_hover_text(hint);
+        }
+    });
+    // Edit the active swatch's color; recoloring updates the overlay.
+    let i = state.active_swatch as usize;
+    if i < state.palette.len()
+        && ui.horizontal(|ui| {
+            ui.label(format!("Edit swatch {i}"));
+            ui.color_edit_button_srgba_unmultiplied(&mut state.palette[i]).changed()
+        }).inner
+    {
+        state.mark_dirty_all();
+    }
+    ui.horizontal(|ui| {
+        if state.palette.len() < MAX_SWATCHES && ui.button("+ swatch").clicked() {
+            state.palette.push([0xC0, 0xC0, 0xC0, 0xFF]);
+            state.active_swatch = (state.palette.len() - 1) as u8;
+        }
+        if ui.button("Load splatmap…").clicked() {
+            load_splatmap(state);
+        }
+    });
+    ui.label("Splatmap: RGBA channels → layers 1–4 (dominant channel per pixel).");
+
+    ui.separator();
+    draw_gradient_section(state, ui);
+    ui.separator();
+    draw_splat_resolution_section(state, ui);
+}
+
+/// Height-gradient splat: preview the hypsometric ramp and one-click fill the
+/// whole splat grid from the terrain's heatmap (so the painted colors match the
+/// canvas). Sets the palette to the gradient bands and fills every cell by band.
+fn draw_gradient_section(state: &mut SculptState, ui: &mut Ui) {
+    ui.label("Height gradient");
+    // Preview the ramp as a continuous strip (the same hypsometric the canvas uses).
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(240.0), 16.0), Sense::hover());
+    let n = 64u32;
+    let seg = rect.width() / n as f32;
+    for i in 0..n {
+        let t = i as f32 / (n - 1) as f32;
+        let c = hypsometric(t);
+        let x = rect.left() + i as f32 * seg;
+        let band = Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(seg + 1.0, rect.height()));
+        ui.painter().rect_filled(band, 0.0, Color32::from_rgb(c[0], c[1], c[2]));
+    }
+    if ui
+        .button("Fill splat from height gradient")
+        .on_hover_text("Color every cell by its elevation using the heatmap ramp (8 bands)")
+        .clicked()
+    {
+        fill_splat_from_gradient(state);
+    }
+}
+
+/// Splat resolution selector with a live grid preview: writes snap to
+/// `res × res` cell blocks, so a coarser splat means blockier color and far
+/// fewer brick color-splits. The preview draws the resulting splat-cell grid.
+fn draw_splat_resolution_section(state: &mut SculptState, ui: &mut Ui) {
+    ui.label("Splat resolution");
+    ui.horizontal(|ui| {
+        for r in [1u32, 2, 4, 8] {
+            let label = if r == 1 { "1× (per cell)".to_string() } else { format!("1∕{r}") };
+            ui.selectable_value(&mut state.splat_res, r, label);
+        }
+    });
+    let r = state.splat_res.max(1);
+    if let Some(field) = state.field.as_ref() {
+        let (cols, rows) = (field.width.div_ceil(r), field.height.div_ceil(r));
+        ui.small(format!("≈ {cols} × {rows} splat cells ({r} terrain-cell block)"));
+        draw_splat_grid_preview(ui, cols, rows);
+    }
+}
+
+/// A small grid icon showing the splat-cell layout: line spacing reflects the
+/// chosen resolution, so a coarse splat draws few big cells and a fine one draws
+/// many. Division count is capped so a huge field stays legible.
+fn draw_splat_grid_preview(ui: &mut Ui, cols: u32, rows: u32) {
+    let side = 72.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
+    let stroke = Stroke::new(1.0, Color32::from_gray(110));
+    ui.painter().rect_filled(rect, 2.0, Color32::from_gray(30));
+    ui.painter().rect_stroke(rect, 2.0, stroke, StrokeKind::Inside);
+    // Cap drawn divisions so the preview is readable regardless of field size.
+    let cx = cols.clamp(1, 16);
+    let cy = rows.clamp(1, 16);
+    for i in 1..cx {
+        let x = rect.left() + rect.width() * i as f32 / cx as f32;
+        ui.painter().line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
+    }
+    for j in 1..cy {
+        let y = rect.top() + rect.height() * j as f32 / cy as f32;
+        ui.painter().line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
+    }
+}
+
+/// Set the palette to the hypsometric gradient bands and fill every cell by its
+/// elevation band (snapped to the splat resolution). Undoable; re-renders.
+fn fill_splat_from_gradient(state: &mut SculptState) {
+    let Some(field) = state.field.as_ref() else { return };
+    let (min, max) = field.min_max();
+    state.record_paint_edit();
+    state.palette = gradient_palette(hypsometric);
+    state.active_swatch = state.active_swatch.min(GRADIENT_BANDS as u8);
+    let r = state.splat_res.max(1);
+    // Borrow the field immutably to read heights while filling the grid.
+    let field = state.field.as_ref().expect("field present");
+    state.paint.fill_from_gradient(r, min, max, |x, y| field.at(x, y));
+    state.mark_dirty_all();
 }
 
 fn draw_zone_section(state: &mut SculptState, ui: &mut Ui) {
@@ -961,50 +1350,102 @@ fn draw_export_section(state: &mut SculptState, ui: &mut Ui) -> ExportEstimate {
         ui.checkbox(&mut state.out.brz, "Prefab (.brz → Prefabs/)");
         ui.checkbox(&mut state.out.install_to_brickadia, "Install into Brickadia");
         ui.checkbox(&mut state.out.overwrite, "Overwrite existing");
-        ui.checkbox(&mut state.out.skip_floor, "Skip flat floor (reveal native ground)")
-            .on_hover_text(
-                "On (default for sculpt): flat (zero-height) areas emit no bricks, so the native \
-                 Brickadia floor shows through. Off: a watertight base plate is built under \
-                 everything (matches a direct Map build).",
-            );
 
         ui.separator();
-        // ---- Floor / omit (meter-space, drive the convert) ----
-        ui.horizontal(|ui| {
-            ui.label("Floor level (m)");
-            modifier_drag(ui, &mut state.floor_level_m, 0.5, 0.0..=100_000.0);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Omit below (m)");
-            modifier_drag(ui, &mut state.omit_below_m, 0.5, 0.0..=100_000.0);
-        })
-        .response
-        .on_hover_text(
-            "Columns whose source height is at or below this level emit no bricks (native \
-             floor / 'omit water'). Default 0 drops only true-floor columns.",
-        );
-        // ---- Eyedropper height-picker (spec §3) ----
-        ui.checkbox(&mut state.pick_mode, "🔬 Pick height (eyedropper)").on_hover_text(
-            "On: click the canvas to sample the hovered cell's height (meters) instead of \
-             painting. The held modifier routes the sample — plain → Target height, Alt → \
-             Floor level, Ctrl → Omit below. The sampled value shows on the canvas.",
-        );
-        if let Some(m) = state.last_pick {
-            ui.small(format!("last sample: {m:.2} m"));
-        }
+        // Advanced knobs grouped into collapsibles so the panel stays scannable
+        // instead of one flat wall of unrelated controls.
 
-        ui.separator();
-        // ---- Manual tiling (toggle + size) ----
-        ui.checkbox(&mut state.tile_export, "Tile this export").on_hover_text(
-            "Off: one single mesh. On: subdivide the field into grid-tiled sub-exports \
-             stitched into one save.",
-        );
-        if state.tile_export {
+        // ---- Terrain shaping: what gets built and how ----
+        ui.collapsing("Terrain shaping", |ui| {
+            ui.checkbox(&mut state.out.skip_floor, "Skip flat floor (reveal native ground)")
+                .on_hover_text(
+                    "On (default for sculpt): flat (zero-height) areas emit no bricks, so the \
+                     native Brickadia floor shows through. Off: a watertight base plate is built \
+                     under everything (matches a direct Map build).",
+                );
             ui.horizontal(|ui| {
-                ui.label("Tile size (cells)");
-                modifier_drag(ui, &mut state.tile_cells, 8.0, 16..=4096);
+                ui.label("Floor level (m)");
+                modifier_drag(ui, &mut state.floor_level_m, 0.5, 0.0..=100_000.0);
             });
-        }
+            ui.horizontal(|ui| {
+                ui.label("Omit below (m)");
+                modifier_drag(ui, &mut state.omit_below_m, 0.5, 0.0..=100_000.0);
+            })
+            .response
+            .on_hover_text(
+                "Columns whose source height is at or below this level emit no bricks (native \
+                 floor / 'omit water'). Default 0 drops only true-floor columns.",
+            );
+            let terr_toggle = ui
+                .checkbox(&mut state.terrace, "▤ Terrace (stepped relief)")
+                .on_hover_text(
+                    "Snap heights to discrete plateaus (accurate altitude, stepped look) at both \
+                     the live preview and export. Off = smooth. The stored field is untouched, so \
+                     you can flip per project.",
+                )
+                .changed();
+            let mut step_changed = false;
+            if state.terrace {
+                ui.horizontal(|ui| {
+                    ui.label("Step height (m)");
+                    step_changed =
+                        modifier_drag(ui, &mut state.terrace_step_m, 0.5, 0.1..=10_000.0).changed();
+                });
+            }
+            // Terracing changes what the canvas shows, so force a re-render.
+            if terr_toggle || step_changed {
+                state.mark_dirty_all();
+            }
+        });
+
+        // ---- Bricks: the in-game render-limit knob (fixes holes) ----
+        ui.collapsing("Bricks (fix holes)", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Max brick size (units)");
+                ui.add(egui::DragValue::new(&mut state.max_brick_units).range(40..=12_000).speed(5.0));
+            })
+            .response
+            .on_hover_text(
+                "Largest merged brick the export emits. Brickadia silently drops procedural \
+                 bricks bigger than its render limit, leaving HOLES in big flat areas. Lower this \
+                 until holes vanish (250 = 50 studs is a safe start); raise it for fewer, larger \
+                 bricks once you know what your game renders.",
+            );
+        });
+
+        // ---- Eyedropper: sample a height into a chosen destination ----
+        ui.collapsing("Eyedropper (sample height)", |ui| {
+            ui.checkbox(&mut state.pick_mode, "🔬 Pick height on click").on_hover_text(
+                "On: click the canvas to sample the hovered cell's height (meters) into the \
+                 destination chosen below. (Ctrl/Alt+click also route to Omit/Floor where the \
+                 compositor allows it.)",
+            );
+            if state.pick_mode {
+                ui.horizontal(|ui| {
+                    ui.label("Pick into");
+                    ui.selectable_value(&mut state.pick_into, PickTarget::Target, "Target");
+                    ui.selectable_value(&mut state.pick_into, PickTarget::Floor, "Floor");
+                    ui.selectable_value(&mut state.pick_into, PickTarget::Omit, "Omit");
+                });
+            }
+            if let Some(m) = state.last_pick {
+                ui.small(format!("last sample: {m:.2} m"));
+            }
+        });
+
+        // ---- Tiling: split a big world into stitched sub-exports ----
+        ui.collapsing("Tiling (big worlds)", |ui| {
+            ui.checkbox(&mut state.tile_export, "Tile this export").on_hover_text(
+                "Off: one single mesh. On: subdivide the field into grid-tiled sub-exports \
+                 stitched into one save.",
+            );
+            if state.tile_export {
+                ui.horizontal(|ui| {
+                    ui.label("Tile size (cells)");
+                    modifier_drag(ui, &mut state.tile_cells, 8.0, 16..=4096);
+                });
+            }
+        });
 
         ui.separator();
         // ---- Live estimate ----
@@ -1497,6 +1938,20 @@ fn handle_sculpt_input(state: &mut SculptState, response: &egui::Response, fw: u
         return;
     }
 
+    // The Stamp primitive places a single dab on press, not a continuous stroke —
+    // overlapping cone/ramp dabs along a drag would compound incoherently.
+    if state.tool == SculptTool::Stamp {
+        handle_stamp_input(state, response, fw, fh);
+        return;
+    }
+
+    // Paint writes palette indices into the grid (color), not heights — its own
+    // stroke + undo path, parallel to the height tools.
+    if state.tool == SculptTool::Paint {
+        handle_paint_input(state, response, fw, fh);
+        return;
+    }
+
     // Sculpt only on the PRIMARY button; middle/secondary are pan.
     if response.drag_started_by(egui::PointerButton::Primary) {
         // Begin a stroke: capture a snapshot of the WHOLE field's potentially
@@ -1533,11 +1988,139 @@ fn handle_pick_input(state: &mut SculptState, response: &egui::Response) {
     }
     let Some(ptr) = response.interact_pointer_pos() else { return };
     let mods = response.ctx.input(|i| i.modifiers);
-    let target = pick_target(DragModifiers { ctrl: mods.ctrl, alt: mods.alt });
+    // A held modifier overrides the selector (Ctrl → omit, Alt → floor) when it
+    // registers; otherwise a plain click samples into the chosen `pick_into`
+    // destination. The selector is the reliable path — modifier+click is grabbed
+    // by the compositor on some Wayland setups.
+    let target = if mods.ctrl || mods.alt {
+        pick_target(DragModifiers { ctrl: mods.ctrl, alt: mods.alt })
+    } else {
+        state.pick_into
+    };
     let (cx, cy) = screen_to_cell(state, ptr);
     let Some(field) = state.field.as_ref() else { return };
     let meters = field.sample_cell_meters(cx, cy);
     state.apply_pick(target, meters);
+}
+
+/// Place a single Stamp primitive at the pressed cell. Fires once per press —
+/// `drag_started` (press began) or `clicked` (press+release, no drag) — so a
+/// drag can't smear multiple overlapping stamps. Wraps the one dab in its own
+/// stroke snapshot + commit so it lands as a single undoable edit.
+fn handle_stamp_input(state: &mut SculptState, response: &egui::Response, fw: u32, fh: u32) {
+    let fired = response.drag_started_by(egui::PointerButton::Primary)
+        || response.clicked_by(egui::PointerButton::Primary);
+    if !fired {
+        return;
+    }
+    let Some(ptr) = response.interact_pointer_pos() else { return };
+    let center = screen_to_cell(state, ptr);
+    state.active_stroke.clear();
+    state.last_dab = None;
+    apply_one_dab(state, center, fw, fh);
+    commit_stroke(state);
+}
+
+/// Paint the active palette swatch along a primary-button drag, hard-writing the
+/// index into every grid cell the brush footprint covers. One undo entry per
+/// stroke: the whole grid is snapshotted at press (mirrors the zone-edit undo).
+fn handle_paint_input(state: &mut SculptState, response: &egui::Response, fw: u32, fh: u32) {
+    // Bucket is a click-to-fill, not a drag stroke — route it separately.
+    if state.paint_tool == PaintTool::Bucket {
+        handle_bucket_input(state, response, fw, fh);
+        return;
+    }
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        // Snapshot the pre-stroke grid once, so the entire stroke undoes as a unit.
+        state.record_paint_edit();
+        state.last_dab = None;
+    }
+    let primary_down = response.dragged_by(egui::PointerButton::Primary)
+        || response.drag_started_by(egui::PointerButton::Primary);
+    if primary_down
+        && let Some(ptr) = response.interact_pointer_pos()
+    {
+        let (cx, cy) = screen_to_cell(state, ptr);
+        paint_dabs_along(state, (cx, cy), fw, fh);
+    }
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
+        state.last_dab = None;
+    }
+}
+
+/// Paint-bucket: on a click, flood-fill from the hovered cell by height tolerance
+/// (contiguous region, or global). One undoable edit per click.
+fn handle_bucket_input(state: &mut SculptState, response: &egui::Response, fw: u32, fh: u32) {
+    let fired = response.drag_started_by(egui::PointerButton::Primary)
+        || response.clicked_by(egui::PointerButton::Primary);
+    if !fired {
+        return;
+    }
+    let Some(ptr) = response.interact_pointer_pos() else { return };
+    let (cx, cy) = screen_to_cell(state, ptr);
+    if cx < 0.0 || cy < 0.0 {
+        return;
+    }
+    let (x, y) = (cx.floor() as u32, cy.floor() as u32);
+    if x >= fw || y >= fh {
+        return;
+    }
+    state.record_paint_edit();
+    let idx = state.active_swatch;
+    let tol = state.bucket_tolerance_m;
+    let contiguous = !state.bucket_global;
+    let r = state.splat_res.max(1);
+    let field = state.field.as_ref().expect("field present during bucket fill");
+    state.paint.flood_fill(x, y, idx, tol, contiguous, r, |x, y| field.at(x, y));
+    state.mark_dirty_all();
+}
+
+/// Step from the last paint dab to `(cx, cy)`, painting a dab at each step so a
+/// fast drag still lays a continuous band. Mirrors `apply_dabs_along`.
+fn paint_dabs_along(state: &mut SculptState, to: (f32, f32), fw: u32, fh: u32) {
+    let step = (state.brush.radius_cells * DAB_SPACING).max(MIN_DAB_STEP_CELLS);
+    let from = state.last_dab.unwrap_or(to);
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let n = (dist / step).floor() as u32;
+    let n = n.min(4096); // bounded (Rule 2): cap dabs per teleporting frame
+    for i in 1..=n {
+        let t = (i as f32) * step / dist.max(f32::EPSILON);
+        paint_one_dab(state, (from.0 + dx * t, from.1 + dy * t), fw, fh);
+    }
+    paint_one_dab(state, to, fw, fh);
+    state.last_dab = Some(to);
+}
+
+/// Hard-write the active swatch into every grid cell inside the brush footprint
+/// at `center`. Index assignment isn't blendable, so there is no falloff — the
+/// footprint shape (circle/square/diamond/hex) is the edge. Marks the painted
+/// rect dirty so the overlay re-renders just that sub-rect.
+fn paint_one_dab(state: &mut SculptState, center: (f32, f32), fw: u32, fh: u32) {
+    let Some((rx, ry, rw, rh)) = stroke_rect(center, state.brush.radius_cells, fw, fh) else {
+        return; // entirely off-grid
+    };
+    let brush = state.brush;
+    let idx = state.active_swatch;
+    let r = state.splat_res.max(1);
+    for y in ry..ry + rh {
+        for x in rx..rx + rw {
+            let dx = x as f32 - center.0;
+            let dy = y as f32 - center.1;
+            if shape_distance(brush.shape, dx, dy, brush.radius_cells) < 1.0 {
+                // Snap to the splat-resolution block (r=1 → per-cell).
+                state.paint.set_block(x, y, r, idx);
+            }
+        }
+    }
+    // Block writes can spill up to r-1 cells past the footprint; expand the dirty
+    // rect to block boundaries so the overlay re-render covers them.
+    let x0 = (rx / r) * r;
+    let y0 = (ry / r) * r;
+    let x1 = ((rx + rw - 1) / r * r + r - 1).min(fw - 1);
+    let y1 = ((ry + rh - 1) / r * r + r - 1).min(fh - 1);
+    state.mark_dirty_rect((x0, x1, y0, y1));
 }
 
 /// Step from the last dab center to `(cx, cy)`, applying a dab at each step so a
@@ -1574,7 +2157,8 @@ fn apply_one_dab(state: &mut SculptState, center: (f32, f32), fw: u32, fh: u32) 
     let tool = state.tool;
     let brush = state.brush;
     let target = state.target_height;
-    tool.apply_dab(field, &brush, center, target);
+    let stamp = state.stamp;
+    tool.apply_dab(field, &brush, center, target, stamp);
     // Mark exactly this dab's footprint dirty so the texture regen uploads only
     // the brush rect (converted to the inclusive `x0,x1,y0,y1` the renderer
     // wants), keeping per-dragged-frame texture cost O(brush rect), not O(canvas).
@@ -1722,6 +2306,13 @@ fn invert_entry(state: &mut SculptState, entry: UndoEntry) -> UndoEntry {
             let current = std::mem::replace(&mut state.zones, prev);
             UndoEntry::Zones(current)
         }
+        UndoEntry::Paint(prev) => {
+            // Swap the stored grid in; the displaced grid becomes the inverse. The
+            // paint overlay is baked into the terrain texture, so force a rebuild.
+            let current = std::mem::replace(&mut state.paint, prev);
+            state.mark_dirty_all();
+            UndoEntry::Paint(current)
+        }
     }
 }
 
@@ -1815,7 +2406,8 @@ fn regen_texture(state: &mut SculptState, ctx: &egui::Context) {
         // cells (which reads their now-changed neighbours) is recomputed too.
         let halo = expand_rect(rect, 1, fw, fh);
         let (hx0, _, hy0, _) = halo;
-        let sub = render_field_rect(field, halo, extent.0, extent.1);
+        let terr = state.terrace.then_some(state.terrace_step_m);
+        let sub = render_field_rect(field, &state.paint, &state.palette, halo, extent.0, extent.1, terr);
         let tex = state.texture.as_mut().expect("partial path has a texture");
         tex.set_partial([hx0 as usize, hy0 as usize], sub, opts);
         return;
@@ -1823,7 +2415,8 @@ fn regen_texture(state: &mut SculptState, ctx: &egui::Context) {
 
     // Full render: recompute the true global extent and cache it.
     let extent = field.min_max();
-    let image = render_field_rect(field, (0, fw - 1, 0, fh - 1), extent.0, extent.1);
+    let terr = state.terrace.then_some(state.terrace_step_m);
+    let image = render_field_rect(field, &state.paint, &state.palette, (0, fw - 1, 0, fh - 1), extent.0, extent.1, terr);
     match state.texture.as_mut() {
         Some(tex) => tex.set(image, opts),
         None => state.texture = Some(ctx.load_texture("sculpt_terrain", image, opts)),
@@ -1873,9 +2466,12 @@ fn expand_rect(rect: (u32, u32, u32, u32), pad: u32, fw: u32, fh: u32) -> (u32, 
 /// rebuild for the cells it covers.
 fn render_field_rect(
     field: &HeightField,
+    paint: &PaintGrid,
+    palette: &[[u8; 4]],
     rect: (u32, u32, u32, u32),
     min: f32,
     max: f32,
+    terrace_step: Option<f32>,
 ) -> egui::ColorImage {
     let (x0, x1, y0, y1) = rect;
     let rw = (x1 - x0 + 1) as usize;
@@ -1885,21 +2481,27 @@ fn render_field_rect(
     let last_y = field.height - 1;
     // Light direction (top-left, slightly elevated) for the hillshade.
     let light = normalize3([-0.5, -0.5, 0.7]);
+    // Terrace preview: snap sampled heights to steps so the canvas shows the same
+    // stepped plateaus the export will build (sharp risers light up in hillshade).
+    let sample = |x: u32, y: u32| match terrace_step {
+        Some(step) => terrace_height(field.at(x, y), step),
+        None => field.at(x, y),
+    };
 
     let mut rgba = vec![0u8; rw * rh * 4];
     for (ry, y) in (y0..=y1).enumerate() {
         for (rx, x) in (x0..=x1).enumerate() {
-            let height = field.at(x, y);
+            let height = sample(x, y);
             let t = ((height - min) / span).clamp(0.0, 1.0);
             let base = hypsometric(t);
 
             // Surface normal from central differences (cells are heights in
             // meters; the cell pitch cancels into a constant slope scale).
             let slope = 1.0_f32; // relative; visual only
-            let xl = field.at(x.saturating_sub(1), y);
-            let xr = field.at((x + 1).min(last_x), y);
-            let yu = field.at(x, y.saturating_sub(1));
-            let yd = field.at(x, (y + 1).min(last_y));
+            let xl = sample(x.saturating_sub(1), y);
+            let xr = sample((x + 1).min(last_x), y);
+            let yu = sample(x, y.saturating_sub(1));
+            let yd = sample(x, (y + 1).min(last_y));
             let nx = (xl - xr) * slope;
             let ny = (yu - yd) * slope;
             let normal = normalize3([nx, ny, 2.0]);
@@ -1907,10 +2509,24 @@ fn render_field_rect(
             // Blend the flat base toward shaded so even flat ground keeps color.
             let shade = 0.55 + 0.45 * lambert;
 
+            let mut col = [base[0] as f32 * shade, base[1] as f32 * shade, base[2] as f32 * shade];
+            // Splat overlay: tint painted cells toward their swatch (still shaded,
+            // so relief reads through). Unpainted (index 0) cells are unchanged,
+            // keeping the no-paint view identical to before.
+            let pidx = paint.at(x, y) as usize;
+            if pidx != 0
+                && let Some(pc) = palette.get(pidx)
+            {
+                const A: f32 = 0.6;
+                for c in 0..3 {
+                    col[c] = col[c] * (1.0 - A) + (pc[c] as f32 * shade) * A;
+                }
+            }
+
             let idx = (ry * rw + rx) * 4;
-            rgba[idx] = (base[0] as f32 * shade) as u8;
-            rgba[idx + 1] = (base[1] as f32 * shade) as u8;
-            rgba[idx + 2] = (base[2] as f32 * shade) as u8;
+            rgba[idx] = col[0] as u8;
+            rgba[idx + 1] = col[1] as u8;
+            rgba[idx + 2] = col[2] as u8;
             rgba[idx + 3] = 0xFF;
         }
     }
@@ -2009,16 +2625,16 @@ fn load_heightmap_image(state: &mut SculptState) {
             return;
         }
     };
-    let img = match image::ImageReader::open(&path)
+    let dynimg = match image::ImageReader::open(&path)
         .and_then(|r| r.decode().map_err(std::io::Error::other))
     {
-        Ok(im) => im.to_luma8(),
+        Ok(im) => im,
         Err(e) => {
             state.last_error = Some(format!("could not read image: {e}"));
             return;
         }
     };
-    if img.width() == 0 || img.height() == 0 {
+    if dynimg.width() == 0 || dynimg.height() == 0 {
         state.last_error = Some("image has zero dimensions".to_owned());
         return;
     }
@@ -2028,7 +2644,58 @@ fn load_heightmap_image(state: &mut SculptState) {
         .unwrap_or_else(|| "sculpt".to_owned());
     let mut meta = blank_meta(state, state.new_cell_m);
     meta.source_name = stem;
-    state.set_field(HeightField::from_image(&img, meta));
+    // Our own "Export heightmap PNG" writes a 4-channel RGBA image that packs
+    // `round(meters*100)` as a big-endian u32 — decoding THAT as 8-bit luminance
+    // crushes every height ~0.045× (the round-trip bug). Branch on the channel
+    // layout: a 4-channel image is treated as our packed heightmap and decoded
+    // losslessly; a grayscale image is an external heightmap (luminance = meters).
+    let field = if matches!(dynimg.color(), image::ColorType::Rgba8 | image::ColorType::Rgba16) {
+        HeightField::from_heightmap_png(&dynimg.to_rgba8(), meta)
+    } else {
+        HeightField::from_image(&dynimg.to_luma8(), meta)
+    };
+    state.set_field(field);
+    state.last_error = None;
+}
+
+/// Load an RGBA splatmap and decode it into the paint grid: each pixel's dominant
+/// channel selects a palette layer (1–4), nearest-resampled to the field dims.
+/// Undoable (snapshots the prior grid). No-op with no field loaded.
+fn load_splatmap(state: &mut SculptState) {
+    let (fw, fh) = match state.field.as_ref() {
+        Some(f) => (f.width, f.height),
+        None => return,
+    };
+    let result = native_dialog::DialogBuilder::file()
+        .add_filter("Splatmap (PNG)", ["png"])
+        .open_single_file()
+        .show();
+    let path = match result {
+        Ok(Some(p)) => p,
+        Ok(None) => return, // cancelled
+        Err(e) => {
+            state.last_error = Some(format!("file dialog failed: {e}"));
+            return;
+        }
+    };
+    let img = match image::ImageReader::open(&path)
+        .and_then(|r| r.decode().map_err(std::io::Error::other))
+    {
+        Ok(im) => im.to_rgba8(),
+        Err(e) => {
+            state.last_error = Some(format!("could not read splatmap: {e}"));
+            return;
+        }
+    };
+    if img.width() == 0 || img.height() == 0 {
+        state.last_error = Some("splatmap has zero dimensions".to_owned());
+        return;
+    }
+    // Snapshot for undo, then replace the grid with the decoded indices.
+    state.record_paint_edit();
+    let cells = splatmap_to_indices(&img, fw, fh);
+    state.paint = PaintGrid { width: fw, height: fh, cells };
+    state.mark_dirty_all();
     state.last_error = None;
 }
 
@@ -2056,10 +2723,18 @@ fn start_convert(state: &mut SculptState) {
     let omit_below_m = state.omit_below_m;
     let tile_export = state.tile_export;
     let tile_cells = state.tile_cells;
+    // Stepped/terraced export: snap heights to the step size, or None for smooth.
+    let terrace_step_m = state.terrace.then_some(state.terrace_step_m);
+    let max_brick_units = state.max_brick_units;
     // Clone the zones into the worker alongside the field. Converting READS them
     // (rasterized to a keep-mask) but never clears `state.zones` — they persist
     // so the user can re-export, refine, or clear explicitly.
     let zones = state.zones.clone();
+    // Clone the paint grid + palette into the worker (owned, so the borrowed
+    // PaintLayer can be built inside the thread). An unpainted grid keeps the
+    // build byte-identical to today.
+    let paint_grid = state.paint.clone();
+    let palette = state.palette.clone();
     state.last_outcome = None;
     state.last_error = None;
     state.convert_cancel.store(false, Ordering::Relaxed);
@@ -2079,14 +2754,16 @@ fn start_convert(state: &mut SculptState) {
         .spawn(move || {
             // "Tile this export" routes through the grid-tiled stitch path (one
             // stitched save built from shared-edge sub-fields); off = single mesh.
+            let paint_layer = Some(PaintLayer { grid: &paint_grid, palette: &palette });
             let result = if tile_export {
                 convert_heightfield_tiled(
-                    &field, out, tile_cells, floor_level_m, omit_below_m, &zones, progress_fn,
-                    cancel_arc,
+                    &field, out, tile_cells, floor_level_m, omit_below_m, &zones, paint_layer,
+                    terrace_step_m, max_brick_units, progress_fn, cancel_arc,
                 )
             } else {
                 convert_heightfield(
-                    &field, out, floor_level_m, omit_below_m, &zones, progress_fn, cancel_arc,
+                    &field, out, floor_level_m, omit_below_m, &zones, paint_layer, terrace_step_m,
+                    max_brick_units, progress_fn, cancel_arc,
                 )
             };
             sender.send(result);
@@ -2381,6 +3058,32 @@ mod tests {
         );
     }
 
+    /// Paint stroke undo/redo: a recorded paint edit restores the prior grid on
+    /// undo and re-applies the painted indices on redo, on the shared timeline.
+    #[test]
+    fn paint_stroke_undo_redo() {
+        let mut state = SculptState::new();
+        state.set_field(HeightField::flat(8, 8, meta()));
+        assert!(state.paint.is_blank(), "a fresh field starts unpainted");
+
+        // Record (as the stroke press would) then paint two cells with swatch 2.
+        state.record_paint_edit();
+        state.paint.set_block(3, 3, 1, 2);
+        state.paint.set_block(4, 3, 1, 2);
+        assert_eq!(state.undo.len(), 1, "one paint stroke = one undo entry");
+
+        do_undo(&mut state);
+        assert!(state.paint.is_blank(), "undo restores the unpainted grid");
+        do_redo(&mut state);
+        assert_eq!(state.paint.at(3, 3), 2, "redo re-applies the painted swatch");
+        assert_eq!(state.paint.at(4, 3), 2);
+
+        // A field swap re-blanks the grid to the new dims (cell-aligned invariant).
+        state.set_field(HeightField::flat(5, 5, meta()));
+        assert_eq!((state.paint.width, state.paint.height), (5, 5), "grid tracks field dims");
+        assert!(state.paint.is_blank(), "a new field clears paint");
+    }
+
     /// Finding-2 guard: rendering a SUB-RECT of the field (the partial-upload
     /// path) is pixel-identical, for the cells it covers, to a full-field render
     /// at the same global extent. This is the correctness precondition for
@@ -2398,12 +3101,16 @@ mod tests {
             }
         }
         let (min, max) = field.min_max();
-        let full = render_field_rect(&field, (0, field.width - 1, 0, field.height - 1), min, max);
+        // Blank paint grid → the overlay is a no-op, so this still pins the pure
+        // terrain partial==full invariant.
+        let paint = PaintGrid::blank(field.width, field.height);
+        let pal = default_palette();
+        let full = render_field_rect(&field, &paint, &pal, (0, field.width - 1, 0, field.height - 1), min, max, None);
 
         // A halo-expanded interior sub-rect, exactly as the drag path would build.
         let sub_rect = expand_rect((20, 27, 14, 19), 1, field.width, field.height);
         let (sx0, sx1, sy0, sy1) = sub_rect;
-        let sub = render_field_rect(&field, sub_rect, min, max);
+        let sub = render_field_rect(&field, &paint, &pal, sub_rect, min, max, None);
 
         let fw = field.width as usize;
         for (ry, y) in (sy0..=sy1).enumerate() {

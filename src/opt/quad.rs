@@ -358,6 +358,7 @@ mod tests {
             fill_to_base: false,
             skip_floor: false,
             omit_below_h: 0,
+            max_brick_units: crate::opt::MAX_BRICK_UNITS,
         }
     }
 

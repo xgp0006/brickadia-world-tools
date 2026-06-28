@@ -341,7 +341,7 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     // cap positive when a single cell already exceeds it (unavoidable: one cell
     // is the minimum brick). A larger `size` merges fewer cells per brick.
     let max_quad_size =
-        (u32::from(super::MAX_BRICK_UNITS) / u32::from(options.size).max(1)).max(1);
+        (u32::from(options.max_brick_units) / u32::from(options.size).max(1)).max(1);
     let (all_quads, greedy_mesh_duration) =
         mesh_planes(planes_with_metadata, width, height, max_quad_size);
     progress!(0.7);
@@ -674,6 +674,7 @@ mod tests {
             fill_to_base: false,
             skip_floor: false,
             omit_below_h: 0,
+            max_brick_units: crate::opt::MAX_BRICK_UNITS,
         }
     }
 
@@ -1012,16 +1013,17 @@ mod tests {
 
     /// A merged brick's world footprint is `quad_cells * options.size`. The
     /// per-quad cell cap must shrink as `size` (= horizontal_scale * 5) grows so
-    /// no brick exceeds `MAX_BRICK_UNITS` (the cap the quadtree path also
-    /// enforces, quad.rs `line_optimize`). At `size = 35` a wide flat band merges
-    /// up to `floor(MAX_BRICK_UNITS/35)` cells — well past the old 100-stud cap,
-    /// which is the point (fewer, larger bricks), but never over `MAX_BRICK_UNITS`.
+    /// no brick exceeds `MAX_BRICK_UNITS` — the in-game-render limit (bigger bricks
+    /// silently drop in Brickadia → gaps). At `size = 35` a wide flat band merges
+    /// up to `floor(MAX_BRICK_UNITS/35)` cells: the cap is exercised (the largest
+    /// brick fills the budget to within one cell) but never overruns it.
     #[test]
     fn greedy_merges_never_exceed_the_brick_unit_cap() {
         let map = UniformMap { width: 800, height: 4 };
         let mut options = test_options(false);
         options.size = 35; // horizontal scale 7 (× 5 units/stud)
         options.fill_to_base = true;
+        let cell_size = options.size; // captured before `options` moves into the mesher
         let bricks =
             gen_greedy_heightmap(&map, &map, options, Some(0), Some((0, 0)), |_| true, None)
                 .expect("greedy mesh must succeed");
@@ -1038,11 +1040,12 @@ mod tests {
             );
             max_axis = max_axis.max(size.x).max(size.y);
         }
-        // The cap is actually exercised (the map is wider than the cap allows),
-        // and merging now exceeds the old conservative 500-unit limit.
+        // The cap is actually exercised: the largest brick fills the budget to
+        // within one cell (`floor(cap/size)*size`), proving merges aren't
+        // artificially small — yet none overruns `MAX_BRICK_UNITS`.
         assert!(
-            max_axis > 500,
-            "with the raised cap a wide flat band must merge past the old 500-unit limit, got {max_axis}",
+            max_axis > crate::opt::MAX_BRICK_UNITS - cell_size,
+            "a wide flat band must merge up to the cap (within one cell), got {max_axis}",
         );
     }
 

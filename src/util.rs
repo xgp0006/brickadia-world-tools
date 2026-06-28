@@ -47,6 +47,12 @@ pub struct GenOptions {
     /// skip exactly (only `h == 0` columns drop), so `skip_floor=false` stays a
     /// no-op and the sculpt default (`omit_below_m = 0`) is byte-identical.
     pub omit_below_h: u32,
+    /// Max world-unit footprint of a single merged brick on each XY axis (the
+    /// greedy per-quad cap = `max_brick_units / size`). Brickadia silently drops
+    /// procedural bricks above its in-game render limit, leaving holes — so this
+    /// is user-tunable in the sculpt export (lower until holes vanish; the mesher
+    /// makes a range of sizes up to it). Defaults to [`crate::opt::MAX_BRICK_UNITS`].
+    pub max_brick_units: u16,
 }
 
 impl GenOptions {

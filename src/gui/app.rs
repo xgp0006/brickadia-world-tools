@@ -228,6 +228,7 @@ impl HeightmapApp {
             skip_floor: false,
             // Convert tab never omits columns (skip_floor is off); inert.
             omit_below_h: 0,
+            max_brick_units: crate::opt::MAX_BRICK_UNITS,
         }
     }
 

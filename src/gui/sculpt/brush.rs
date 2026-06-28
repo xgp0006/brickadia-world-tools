@@ -6,11 +6,62 @@
 //! falloff function every tool multiplies its per-dab magnitude by — separated
 //! out so it is unit-testable without touching a [`HeightField`].
 
-/// The footprint of a brush dab. `Circle` is the only MVP shape; the enum is
-/// here so a future `Square`/custom stamp slots in without changing call sites.
+/// The footprint of a brush dab. Each shape is defined to inscribe within the
+/// `±radius_cells` bounding box `dab_rect` computes, so the same bound stays
+/// valid for every shape — only the distance *metric* feeding [`weight`]
+/// changes (see [`shape_distance`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BrushShape {
+    /// Euclidean disc — the default round brush.
     Circle,
+    /// Axis-aligned square (chebyshev metric); fills the bounding box.
+    Square,
+    /// 45°-rotated square / rhombus (manhattan metric); vertices at `(±r, 0)`
+    /// and `(0, ±r)`.
+    Diamond,
+    /// Flat-side hexagon with vertices touching the box edges.
+    Hexagon,
+}
+
+impl BrushShape {
+    /// All shapes in UI display order (for the tool-panel ComboBox).
+    pub(crate) const ALL: [BrushShape; 4] =
+        [BrushShape::Circle, BrushShape::Square, BrushShape::Diamond, BrushShape::Hexagon];
+
+    /// Short label for the UI.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            BrushShape::Circle => "Circle",
+            BrushShape::Square => "Square",
+            BrushShape::Diamond => "Diamond",
+            BrushShape::Hexagon => "Hexagon",
+        }
+    }
+}
+
+/// Distance from a dab center `(dx, dy)` cells away, normalized so the shape's
+/// boundary sits at `1.0` and its interior is `< 1.0` — the value [`weight`]
+/// expects. The metric per shape:
+///
+/// - Circle  → euclidean `√(dx²+dy²)`
+/// - Square  → chebyshev `max(|dx|, |dy|)`
+/// - Diamond → manhattan `|dx| + |dy|`
+/// - Hexagon → `max(|dx|, |dx|/2 + |dy|)` (flat-side hex inscribed in the box)
+///
+/// Each is divided by `radius_cells`. A non-positive or NaN radius returns
+/// `+∞`, which [`weight`] clamps to a zero influence (NaN-safe; no panic).
+pub(crate) fn shape_distance(shape: BrushShape, dx: f32, dy: f32, radius_cells: f32) -> f32 {
+    if radius_cells <= 0.0 || radius_cells.is_nan() {
+        return f32::INFINITY;
+    }
+    let (ax, ay) = (dx.abs(), dy.abs());
+    let metric = match shape {
+        BrushShape::Circle => (dx * dx + dy * dy).sqrt(),
+        BrushShape::Square => ax.max(ay),
+        BrushShape::Diamond => ax + ay,
+        BrushShape::Hexagon => ax.max(ax * 0.5 + ay),
+    };
+    metric / radius_cells
 }
 
 /// How a dab's strength tapers from its center (`d = 0`) to its edge (`d = 1`),
@@ -112,6 +163,30 @@ mod tests {
         // Linear is the exact 1 - d ramp.
         assert!((weight(Falloff::Linear, 0.25) - 0.75).abs() < 1e-6);
         assert!((weight(Falloff::Linear, 0.5) - 0.5).abs() < 1e-6);
+    }
+
+    /// Footprint metrics: at the center every shape is 0; along the axes every
+    /// shape reaches its boundary (=1) at distance `r`; and the box corner
+    /// `(r, r)` is inside only the Square — Circle/Diamond/Hexagon all exclude it.
+    #[test]
+    fn shape_distance_footprints() {
+        let r = 4.0;
+        for s in BrushShape::ALL {
+            assert!(shape_distance(s, 0.0, 0.0, r).abs() < 1e-6, "{s:?} center must be 0");
+            // On-axis boundary: every shape's metric equals r along ±x and ±y.
+            assert!((shape_distance(s, r, 0.0, r) - 1.0).abs() < 1e-6, "{s:?} +x boundary");
+            assert!((shape_distance(s, 0.0, r, r) - 1.0).abs() < 1e-6, "{s:?} +y boundary");
+        }
+        // The box corner: inside the Square (=1, on its edge), outside the rest.
+        assert!((shape_distance(BrushShape::Square, r, r, r) - 1.0).abs() < 1e-6);
+        assert!(shape_distance(BrushShape::Circle, r, r, r) > 1.0);
+        assert!(shape_distance(BrushShape::Diamond, r, r, r) > 1.0);
+        assert!(shape_distance(BrushShape::Hexagon, r, r, r) > 1.0);
+        // Diamond excludes a point the Square keeps: (0.6r, 0.6r) → manhattan 1.2r.
+        assert!(shape_distance(BrushShape::Diamond, 0.6 * r, 0.6 * r, r) > 1.0);
+        assert!(shape_distance(BrushShape::Square, 0.6 * r, 0.6 * r, r) < 1.0);
+        // Non-positive radius → +∞ (weight clamps it to zero influence).
+        assert!(shape_distance(BrushShape::Circle, 1.0, 1.0, 0.0).is_infinite());
     }
 
     /// Monotonic non-increasing from center to edge, and always within `[0, 1]`,

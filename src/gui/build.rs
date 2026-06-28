@@ -28,8 +28,9 @@ use super::tiles::{BBoxLatLon, TileFetchError, fetch_bbox};
 /// Brickadia Proton-prefix App ID for the Worlds/ install path lookup.
 const BRICKADIA_APP_ID: u32 = 2199420;
 /// Default brick color used by the flat colormap when no imagery source is
-/// selected. A warm slate-green that reads well against the OSM basemap.
-const DEFAULT_BRICK_COLOR: [u8; 4] = [0x9A, 0xA3, 0x7E, 0xFF];
+/// selected. A warm slate-green that reads well against the OSM basemap. Also the
+/// sculpt paint palette's unpainted slot 0, so an unpainted grid is byte-identical.
+pub(crate) const DEFAULT_BRICK_COLOR: [u8; 4] = [0x9A, 0xA3, 0x7E, 0xFF];
 /// Upper bound on generated brick count. A 64-tile high-relief fetch at a
 /// large vertical scale can produce millions of bricks (heavy save + memory);
 /// past this we return a checked error guiding the user to shrink the area or
@@ -453,7 +454,7 @@ pub(crate) fn build_one_tile(
     let bricks = match &imagery {
         Some(im) => generate_bricks_skip_floor(
             &heightmap, im, style, base, offset, skip_floor, omit_below_h,
-            Arc::clone(&progress), Arc::clone(&cancel), None,
+            crate::opt::MAX_BRICK_UNITS, Arc::clone(&progress), Arc::clone(&cancel), None,
         )?,
         None => {
             let flat = FlatColormap {
@@ -463,7 +464,7 @@ pub(crate) fn build_one_tile(
             };
             generate_bricks_skip_floor(
                 &heightmap, &flat, style, base, offset, skip_floor, omit_below_h,
-                Arc::clone(&progress), Arc::clone(&cancel), None,
+                crate::opt::MAX_BRICK_UNITS, Arc::clone(&progress), Arc::clone(&cancel), None,
             )?
         }
     };
@@ -932,7 +933,8 @@ pub(crate) fn generate_bricks(
     // `generate_bricks_skip_floor(true)` instead so a blank canvas reveals the
     // native Brickadia floor.
     generate_bricks_skip_floor(
-        heightmap, colormap, style, base_override, offset, false, 0, progress, cancel, None,
+        heightmap, colormap, style, base_override, offset, false, 0,
+        crate::opt::MAX_BRICK_UNITS, progress, cancel, None,
     )
 }
 
@@ -957,6 +959,7 @@ pub(crate) fn generate_bricks_skip_floor(
     offset: (i32, i32),
     skip_floor: bool,
     omit_below_h: u32,
+    max_brick_units: u16,
     progress: ProgressFn,
     cancel: Arc<AtomicBool>,
     keep_mask: Option<&[bool]>,
@@ -997,6 +1000,9 @@ pub(crate) fn generate_bricks_skip_floor(
         // Brick-Z omit threshold, derived meter-space by the caller. Default `0`
         // (the sculpt `omit_below_m = 0`) drops only true-floor columns.
         omit_below_h,
+        // User-tunable max brick footprint (units). Caps greedy merges so no brick
+        // exceeds Brickadia's in-game render limit (oversized bricks → holes).
+        max_brick_units,
     };
     let cancel_check = move |f: f32| -> bool {
         progress(BuildStage::GeneratingBricks, f);
@@ -1631,6 +1637,7 @@ mod tests {
             fill_to_base: false,
             skip_floor: false,
             omit_below_h: 0,
+            max_brick_units: crate::opt::MAX_BRICK_UNITS,
         };
         let bricks =
             crate::opt::gen_opt_heightmap(&heightmap, &cm, options, None, None, |_| true).expect("gen");

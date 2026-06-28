@@ -19,6 +19,18 @@ pub(crate) const FLOOR_M: f32 = 0.0;
 /// rgba-encoded `HeightmapPNG` decoder the CLI/map pipeline already uses.
 pub(crate) const HEIGHTMAP_PNG_SCALE: f32 = 100.0;
 
+/// Snap a height (meters) to the nearest `step_m` multiple — the "terrace"
+/// transform that turns smooth relief into discrete stepped plateaus while
+/// keeping the altitude accurate (to within `step_m / 2`). A non-positive step
+/// is a no-op (smooth). Non-destructive: applied at render/convert, never to the
+/// stored field, so the smooth/stepped choice flips per project.
+pub(crate) fn terrace_height(m: f32, step_m: f32) -> f32 {
+    if step_m <= 0.0 || !step_m.is_finite() {
+        return m;
+    }
+    ((m / step_m).round() * step_m).max(FLOOR_M)
+}
+
 /// Convert + scale metadata carried alongside the height grid. None of these
 /// affect the grid values themselves; they parameterize the eventual convert
 /// (pitch, exaggeration, brick style) and name the output.
@@ -86,6 +98,28 @@ impl HeightField {
             for x in 0..width {
                 let lum = img.get_pixel(x, y).0[0];
                 cells.push((lum as f32).max(FLOOR_M));
+            }
+        }
+        Self { width, height, cells, meta }
+    }
+
+    /// Decode an rgba-encoded heightmap PNG produced by [`to_heightmap_png`] (or
+    /// the Stage 1 CLI pipeline): each pixel's RGBA bytes are a big-endian `u32`
+    /// of `round(meters * HEIGHTMAP_PNG_SCALE)`. The exact inverse of
+    /// `to_heightmap_png`, so a sculpted field round-trips losslessly (to 1/scale
+    /// precision). Cells are already floor-relative — NO min subtraction —
+    /// clamped `>= FLOOR_M`.
+    ///
+    /// This is the decoder the GUI "load heightmap image" path must use for our
+    /// own 4-channel exports; reading them as 8-bit luminance instead crushes
+    /// every height by ~0.045× (the round-trip bug).
+    pub(crate) fn from_heightmap_png(img: &image::RgbaImage, meta: FieldMeta) -> Self {
+        let (width, height) = (img.width(), img.height());
+        let mut cells = Vec::with_capacity((width as usize) * (height as usize));
+        for y in 0..height {
+            for x in 0..width {
+                let packed = u32::from_be_bytes(img.get_pixel(x, y).0);
+                cells.push((packed as f32 / HEIGHTMAP_PNG_SCALE).max(FLOOR_M));
             }
         }
         Self { width, height, cells, meta }
@@ -550,5 +584,60 @@ mod tests {
         assert_eq!(decoded.at(0, 0), 100, "decoder must recover 1.0 m * 100");
         assert_eq!(decoded.at(1, 0), 255, "decoder must recover 2.55 m * 100");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Terrace snaps heights to step multiples (accurate altitude, discrete
+    /// plateaus); a non-positive step is a smooth no-op; floor stays at floor.
+    #[test]
+    fn terrace_snaps_to_steps() {
+        // step 10: values land on the nearest 10 m plateau.
+        assert_eq!(terrace_height(192.0, 10.0), 190.0);
+        assert_eq!(terrace_height(196.0, 10.0), 200.0);
+        assert_eq!(terrace_height(132.0, 50.0), 150.0);
+        // accurate within step/2.
+        assert!((terrace_height(132.0, 10.0) - 132.0).abs() <= 5.0);
+        // step 0 / negative → smooth (identity); floor preserved.
+        assert_eq!(terrace_height(123.4, 0.0), 123.4);
+        assert_eq!(terrace_height(0.0, 25.0), 0.0);
+        // never below floor (a sub-half-step sliver snaps to 0, not negative).
+        assert!(terrace_height(3.0, 25.0) >= FLOOR_M);
+    }
+
+    /// Round-trip bug regression: a field exported with `to_heightmap_png` and
+    /// re-imported with `from_heightmap_png` preserves every height (to 1/scale).
+    /// And the OLD luminance path (`from_image` on the same PNG) crushes them —
+    /// the bug the GUI importer hit (192 m → ~8 m).
+    #[test]
+    fn heightmap_png_round_trip_is_lossless() {
+        let mut f = HeightField::flat(4, 3, test_meta());
+        // Heights spanning the user's range, incl 132 m and 192 m.
+        let vals = [0.0f32, 7.25, 132.0, 192.0, 50.5, 1.0, 337.0, 15.0, 0.0, 99.9, 200.0, 4.0];
+        for (i, &v) in vals.iter().enumerate() {
+            f.set((i as u32) % 4, (i as u32) / 4, v);
+        }
+
+        let png = f.to_heightmap_png();
+        let rt = HeightField::from_heightmap_png(&png, test_meta());
+        assert_eq!((rt.width, rt.height), (f.width, f.height), "dims preserved");
+        for y in 0..f.height {
+            for x in 0..f.width {
+                assert!(
+                    (rt.at(x, y) - f.at(x, y)).abs() < 0.01,
+                    "({x},{y}) round-trip lost height: {} != {}",
+                    rt.at(x, y),
+                    f.at(x, y),
+                );
+            }
+        }
+
+        // The buggy path: reading our 4-channel PNG as 8-bit luminance crushes
+        // 192 m to a single-digit value (proves why the importer must branch).
+        let luma = image::DynamicImage::ImageRgba8(png).to_luma8();
+        let crushed = HeightField::from_image(&luma, test_meta());
+        assert!(
+            crushed.at(3, 0) < 50.0,
+            "luminance decode must visibly crush 192 m (got {}) — the bug",
+            crushed.at(3, 0),
+        );
     }
 }
