@@ -256,12 +256,20 @@ impl StampKind {
     pub(crate) const ALL: [StampKind; 4] =
         [StampKind::Cone, StampKind::Mesa, StampKind::Crater, StampKind::Ramp];
 
-    pub(crate) fn label(self) -> &'static str {
+    /// Full tooltip: the landform this primitive stamps and the knob that shapes
+    /// it (also carries the name, e.g. "Cone — …").
+    pub(crate) fn help(self) -> &'static str {
         match self {
-            StampKind::Cone => "Cone",
-            StampKind::Mesa => "Mesa",
-            StampKind::Crater => "Crater",
-            StampKind::Ramp => "Ramp",
+            StampKind::Cone => "Cone — sharp peak at center sloping straight to the edge. A simple hill or mountain.",
+            StampKind::Mesa => {
+                "Mesa — flat top with an eased shoulder down to the edge. Plateaus and table-mountains; \
+                 Inner ratio sets the flat width."
+            }
+            StampKind::Crater => {
+                "Crater — sunken bowl with a raised rim. Impact craters and calderas; \
+                 Inner ratio positions the rim."
+            }
+            StampKind::Ramp => "Ramp — straight linear slope along the angle. Roads, embankments, and access ramps.",
         }
     }
 }

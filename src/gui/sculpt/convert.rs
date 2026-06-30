@@ -206,18 +206,25 @@ pub(crate) fn convert_heightfield(
     })
 }
 
-/// Shared-edge tile boundaries along ONE axis: `extent` cells split into
-/// `ceil(extent / tile_cells)` half-open ranges `[start, end)` where adjacent
-/// ranges SHARE one edge cell (`end_i == start_{i+1} + 1`). The shared cell is
-/// meshed by both neighbors and placed at the same world slot (the cumulative
-/// `start` offset cancels the local index), so the seam is watertight and
-/// duplicate-on-top rather than gapped. A single range (`tile_cells >= extent`)
-/// returns one `[0, extent)` covering the whole axis — the no-split path that
-/// stitches byte-identically to a single mesh.
+/// Non-overlapping tile boundaries along ONE axis: `extent` cells split into
+/// `ceil(extent / tile_cells)` half-open ranges `[start, end)` that PARTITION
+/// the axis — adjacent ranges abut (`end_i == start_{i+1}`) with NO shared cell.
+/// Each cell belongs to exactly one tile; the per-tile world offset places every
+/// absolute cell at the same integer world slot (`2*size*c + center`), so a
+/// tile's last column and its neighbor's first column sit one per-cell pitch
+/// (`2*size`) apart — exactly as two adjacent cells in a single mesh. The seam is
+/// therefore watertight by integer identity: no gap AND no overlap. A single
+/// range (`tile_cells >= extent`) returns one `[0, extent)` covering the whole
+/// axis — the no-split path that stitches byte-identically to a single mesh.
 ///
-/// Each returned range's WIDTH is `<= tile_cells + 1` (the body plus the one
-/// shared boundary cell), so a tile never exceeds the per-tile cell budget the
-/// caller checks. `extent` and `tile_cells` are both clamped to `>= 1`.
+/// (An earlier variant overlapped ONE shared cell per seam — an `end` of
+/// `start + step + 1` — which double-meshed every seam column into two
+/// exactly-coincident bricks. Coincident solid bricks Z-fight in Brickadia and
+/// render as the seam lines users saw on big/tiled exports. The partition
+/// removes them; the offset algebra already made the shared cell unnecessary.)
+///
+/// Each returned range's WIDTH is `<= tile_cells`, so a tile never exceeds the
+/// per-tile cell budget the caller checks. `extent`/`tile_cells` clamp to `>= 1`.
 fn tile_bounds(extent: u32, tile_cells: u32) -> Vec<(u32, u32)> {
     let extent = extent.max(1);
     let step = tile_cells.max(1);
@@ -227,35 +234,31 @@ fn tile_bounds(extent: u32, tile_cells: u32) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     let mut start = 0u32;
     // Bounded by ceil(extent/step) iterations; `start` advances by `step` each
-    // pass and the loop stops once a range reaches the far edge (Rule 2).
+    // pass until a range reaches the far edge. Non-overlapping: the next tile
+    // begins exactly where this one ends (`start = end`), so each cell is meshed
+    // once. The final tile clamps to `extent`.
     while start < extent {
-        // Body of `step` cells plus one SHARED edge cell with the next tile, so
-        // the next tile begins on this tile's last column. The final tile clamps
-        // to `extent` (no neighbor to share with).
-        let end = (start + step + 1).min(extent);
+        let end = (start + step).min(extent);
         out.push((start, end));
-        if end == extent {
-            break;
-        }
-        // Next tile starts on the shared edge cell (end - 1).
-        start = end - 1;
+        start = end;
     }
     out
 }
 
 /// Convert an edited [`HeightField`] into ONE stitched save by meshing it as a
-/// grid of shared-edge sub-fields (spec §5, the manual "Tile this export" path).
+/// grid of partition sub-fields (spec §5, the manual "Tile this export" path).
 /// The field is split into `ceil(w / tile_cells) × ceil(h / tile_cells)`
-/// sub-fields by [`tile_bounds`] (adjacent sub-fields share their exact edge
-/// column/row — seams are exact by integer cell identity, no projection drift).
+/// sub-fields by [`tile_bounds`] (a non-overlapping partition — adjacent
+/// sub-fields abut at their exact edge, no shared/duplicated cell).
 ///
 /// Each sub-field meshes through the EXACT same pipeline as `convert_heightfield`
 /// (uniform `size` from one [`derive_scale`], `base_override` from `floor_level_m`,
 /// `global_min = 0`, the meter-space `omit_below_m`, the same scale/micro), with a
 /// per-tile world offset from cumulative cells + global centering via
-/// [`tile_world_offset`] — the SAME algebra `grid.rs::world_offset` uses. The
-/// shared edge cell's cumulative `off_cells` cancels its local index, so a shared
-/// column lands on the identical world slot from either neighbor (watertight).
+/// [`tile_world_offset`] — the SAME algebra `grid.rs::world_offset` uses. Every
+/// absolute cell lands on the identical integer world slot regardless of its
+/// tile, so adjacent tiles abut at the per-cell pitch — watertight, no gap and
+/// no overlap.
 ///
 /// Bricks accumulate into ONE `Vec<Brick>` and `bricks_to_save` runs ONCE → one
 /// stitched `.brdb`/`.brz`. The aggregate cap is `MAX_GRID_BRICKS` (checked before
@@ -1135,23 +1138,24 @@ mod tests {
         f
     }
 
-    /// `tile_bounds` splits into shared-edge half-open ranges: a 2×… split steps
-    /// by `tile_cells` cells and adjacent ranges share one edge cell, so the
-    /// per-tile world offsets abut at exactly the `2*size` per-cell pitch — the
-    /// shared column lands on the IDENTICAL world slot from either neighbor.
+    /// `tile_bounds` partitions into NON-overlapping half-open ranges: a 2×…
+    /// split steps by `tile_cells` cells and adjacent ranges abut. The per-tile
+    /// world offsets place every ABSOLUTE cell on one fixed world slot, so a
+    /// tile's last column and its neighbor's first column sit exactly one
+    /// per-cell pitch (`2*size`) apart — watertight, no gap and no overlap.
     #[test]
     fn tiled_export_world_offset_abutment() {
-        // A 16×16 field, tile_cells=8 → a 2×2 split with shared edges.
+        // A 16×16 field, tile_cells=8 → a 2×2 partition.
         let field = hill_field(16, 16);
         let x_bounds = tile_bounds(16, 8);
         let y_bounds = tile_bounds(16, 8);
         assert_eq!(x_bounds.len(), 2, "16 cells / tile 8 → 2 columns of tiles");
         assert_eq!(y_bounds.len(), 2, "16 cells / tile 8 → 2 rows of tiles");
 
-        // Adjacent ranges share their edge cell: A = [0,9), B = [8,16) → B starts
-        // on A's last column (8). (tile_bounds emits body+1 = 9-wide first tile.)
-        assert_eq!(x_bounds[0], (0, 9), "first tile is body(8)+shared(1) wide");
-        assert_eq!(x_bounds[1].0, x_bounds[0].1 - 1, "next tile starts on the shared column");
+        // Non-overlapping partition: A = [0,8), B = [8,16) → B starts exactly
+        // where A ends, no shared cell.
+        assert_eq!(x_bounds[0], (0, 8), "first tile is exactly tile_cells wide");
+        assert_eq!(x_bounds[1].0, x_bounds[0].1, "next tile starts where the prior ends");
 
         let (hscale, _v) = derive_scale(
             field.meta.cell_m,
@@ -1162,22 +1166,24 @@ mod tests {
         let size = crate::gui::build::cell_size_units(hscale, field.meta.micro);
         let size_i = i32::from(size);
 
-        // The per-cell world pitch is 2*size: column c (absolute) lands at
-        // 2*size*c + center_x for EVERY tile that contains it. Verify the shared
-        // column (abs 8) maps to the same world-x from tile 0 and tile 1.
+        // The per-cell world pitch is 2*size: absolute column c lands at
+        // 2*size*c + center_x in whatever tile contains it. Tile 0's last column
+        // is absolute 7 (local 7); tile 1's first is absolute 8 (local 0). They
+        // must sit exactly one pitch apart — abut with no gap, no overlap.
         let off0 = tile_world_offset(x_bounds[0].0, 0, 16, 16, size); // tile col 0, start 0
         let off1 = tile_world_offset(x_bounds[1].0, 0, 16, 16, size); // tile col 1, start 8
-        // Shared column is local x=8 in tile 0 and local x=0 in tile 1.
-        let from_tile0_x = off0.0 + 2 * size_i * 8;
-        let from_tile1_x = off1.0; // local x=0 → no per-cell pitch added
+        let tile0_last_x = off0.0 + 2 * size_i * 7; // absolute col 7, local x=7
+        let tile1_first_x = off1.0; // absolute col 8, local x=0
         assert_eq!(
-            from_tile0_x, from_tile1_x,
-            "the shared column must land on ONE world-x from either neighbor (abut, no gap)",
+            tile1_first_x - tile0_last_x,
+            2 * size_i,
+            "adjacent tiles abut at exactly one per-cell pitch (no gap, no overlap)",
         );
-        // …and it equals the absolute-column world placement a single mesh uses:
-        // center_x = -(16*size), so column 8 → -(16*size) + 2*size*8 = 0.
+        // …and each lands where a single mesh places that absolute column:
+        // center_x = -(16*size), so column c → -(16*size) + 2*size*c.
         let center_x = -(16 * size_i);
-        assert_eq!(from_tile0_x, center_x + 2 * size_i * 8, "abut at the 2*size per-cell pitch");
+        assert_eq!(tile0_last_x, center_x + 2 * size_i * 7, "tile 0 col 7 at the single-mesh slot");
+        assert_eq!(tile1_first_x, center_x + 2 * size_i * 8, "tile 1 col 8 at the single-mesh slot");
     }
 
     /// A field that fits within ONE tile (`tile_cells >= max(w,h)`) tiles into a
@@ -1210,22 +1216,26 @@ mod tests {
         );
     }
 
-    /// `tile_bounds` invariants: ranges are contiguous shared-edge, cover the full
-    /// extent, each width ≤ tile_cells+1 (the per-tile cell budget the convert
-    /// relies on), and an over-size tile collapses to one full-extent range.
+    /// `tile_bounds` invariants: ranges PARTITION the extent (contiguous,
+    /// non-overlapping), cover it fully, each width ≤ tile_cells (the per-tile
+    /// cell budget the convert relies on), and an over-size tile collapses to one
+    /// full-extent range.
     #[test]
-    fn tile_bounds_shared_edge_and_coverage() {
+    fn tile_bounds_partition_and_coverage() {
         let b = tile_bounds(16, 8);
-        // Contiguous via the shared edge: each range starts on the prior's last cell.
+        // Contiguous partition: each range starts exactly where the prior ends —
+        // no shared cell, no gap.
         for w in b.windows(2) {
-            assert_eq!(w[1].0, w[0].1 - 1, "adjacent tiles share one edge cell");
+            assert_eq!(w[1].0, w[0].1, "adjacent tiles abut with no shared cell");
         }
         assert_eq!(b.first().unwrap().0, 0, "first tile starts at 0");
         assert_eq!(b.last().unwrap().1, 16, "last tile reaches the extent");
         for &(s, e) in &b {
             assert!(e > s, "every range is non-empty");
-            assert!(e - s <= 8 + 1, "tile width ≤ tile_cells + the shared edge cell");
+            assert!(e - s <= 8, "tile width ≤ tile_cells");
         }
+        // 16 / 8 → exactly two non-overlapping tiles.
+        assert_eq!(b, vec![(0, 8), (8, 16)], "clean partition into tile_cells-wide ranges");
         // Over-size tile → one full range; a 1-cell field → one [0,1).
         assert_eq!(tile_bounds(20, 64), vec![(0, 20)]);
         assert_eq!(tile_bounds(1, 8), vec![(0, 1)]);
@@ -1233,18 +1243,18 @@ mod tests {
 
     /// End-to-end tiled convert (spec §5): a multi-tile field routed through the
     /// public `convert_heightfield_tiled` writes ONE stitched save whose
-    /// `brick_count` equals the accumulated geometry of its shared-edge sub-fields
-    /// (the seams are watertight duplicate-on-top, never gaps). brz-only +
-    /// no-install so the test never touches a Brickadia tree.
+    /// `brick_count` equals the accumulated geometry of its partition sub-fields
+    /// (the seams abut watertight, never gaps). brz-only + no-install so the test
+    /// never touches a Brickadia tree.
     #[test]
     fn tiled_export_stitches_all_tiles() {
-        // 18×18 hill, tile_cells=8 → a 3×3 shared-edge split (non-trivial seams).
+        // 18×18 hill, tile_cells=8 → a 3×3 partition split (non-trivial seams).
         let field = hill_field(18, 18);
         let x_bounds = tile_bounds(18, 8);
         let y_bounds = tile_bounds(18, 8);
         assert!(x_bounds.len() >= 2 && y_bounds.len() >= 2, "must actually subdivide");
 
-        // The expected stitched count: mesh each shared-edge sub-field via the SAME
+        // The expected stitched count: mesh each partition sub-field via the SAME
         // building block the path uses and sum (the watertight, seam-duplicated
         // union). This is the geometry the convert must write.
         let mut expected = 0usize;
@@ -1285,6 +1295,74 @@ mod tests {
         if !outcome.brdb_path.as_os_str().is_empty() {
             let _ = std::fs::remove_file(&outcome.brdb_path);
         }
+    }
+
+    /// A field with a DISTINCT height in every cell, so the greedy mesher can
+    /// never merge two cells — each cell becomes its own brick. That makes a
+    /// seam-duplicated column an EXACTLY coincident brick (the defect's clean
+    /// signature), not a partially-overlapping merge that's harder to detect.
+    fn ramp_field(w: u32, h: u32) -> HeightField {
+        let mut f = HeightField::flat(w, h, meta_proper());
+        for y in 0..h {
+            for x in 0..w {
+                f.set(x, y, 5.0 + x as f32 * 0.7 + y as f32 * 1.3);
+            }
+        }
+        f
+    }
+
+    /// Count bricks that EXACTLY coincide with at least one other (same position
+    /// AND size). A single greedy mesh partitions space, so it emits ZERO
+    /// coincidences; any coincidence in a tiled stitch is a seam-duplicated cell
+    /// — two solid bricds in one voxel, which Z-fight in Brickadia and read as a
+    /// seam line ("straight lines on a regular grid" on big/tiled exports).
+    fn coincident_brick_count(bricks: &[brdb::Brick]) -> usize {
+        let mut seen: std::collections::HashMap<(i32, i32, i32, u16, u16, u16), usize> =
+            std::collections::HashMap::new();
+        for b in bricks {
+            let (p, s) = brick_geom(b);
+            *seen.entry((p.x, p.y, p.z, s.x, s.y, s.z)).or_insert(0) += 1;
+        }
+        seen.values().filter(|&&n| n > 1).map(|&n| n - 1).sum()
+    }
+
+    /// REGRESSION (user bug: "cuts in the terrain … only on big/tiled worlds …
+    /// straight lines on a regular grid"). A multi-tile stitch must not place two
+    /// EXACTLY coincident bricks at a seam — coincident solid bricks Z-fight in
+    /// Brickadia and render as the seam lines the user sees. The single mesh of
+    /// the same field is the watertight reference: it emits zero coincidences, so
+    /// the tiled stitch must too. The shared-edge (overlapping) tiler FAILS this;
+    /// a clean half-open partition (abutting, by the integer offset algebra)
+    /// passes while still covering every column.
+    #[test]
+    fn tiled_seams_emit_no_coincident_duplicate_bricks() {
+        // Distinct-per-cell heights → no greedy merge → every seam-shared column
+        // is a standalone, exactly-coincident brick if the tiler overlaps.
+        let field = ramp_field(24, 24);
+        let x_bounds = tile_bounds(24, 8);
+        let y_bounds = tile_bounds(24, 8);
+        assert!(x_bounds.len() >= 3 && y_bounds.len() >= 3, "must subdivide into seams");
+
+        // The watertight reference: a single greedy mesh never coincides.
+        let single = mesh_field(&field, true);
+        assert_eq!(
+            coincident_brick_count(&single),
+            0,
+            "a single mesh partitions space — it must emit no coincident bricks",
+        );
+
+        // The tiled stitch of the SAME field, via the real per-tile building block.
+        let mut tiled: Vec<brdb::Brick> = Vec::new();
+        for &(y0, y1) in &y_bounds {
+            for &(x0, x1) in &x_bounds {
+                tiled.extend(mesh_sub(&field, x0, y0, x1, y1, true));
+            }
+        }
+        assert_eq!(
+            coincident_brick_count(&tiled),
+            0,
+            "tiled seams must not duplicate cells — coincident bricks Z-fight into seam lines",
+        );
     }
 
     /// Neither format selected → a checked error, never a silent no-op write.

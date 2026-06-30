@@ -18,8 +18,9 @@ change the sculpt/convert/mesh math, only how scale is expressed and which contr
 2. **Brush size** slider reads/writes in studs ("Ø N studs"). Cells stay internal.
 3. **World size** shown in studs; set via a **World width (studs)** field that back-solves the scale.
 4. "Vertical exaggeration" → **Terrain height** (1× = realistic). "Micro bricks" → **Fine detail**.
-5. **Height pick:** `Alt`+click samples the hovered cell's height into the active height value;
-   normal click/drag applies. The Eyedropper checkbox + collapsible + Pick-into selector are removed.
+5. **Height pick:** hold **`E`** + click samples the hovered cell's height into the active height value;
+   normal click/drag applies. (E, not Alt — window managers grab Alt+drag to move the window, so the
+   pick silently failed cross-platform.) The Eyedropper checkbox + collapsible + Pick-into selector are removed.
 6. **One flat panel**, grouped Surface · Build size · Output. Exactly **one** `▸ Advanced` expander remains.
 7. **Tiling: fully automatic** — auto-split when over the brick/RAM cap with a one-line notice; manual override in Advanced.
 8. **Brick cap visible, plain:** "Max brick size: N studs — lower if flat areas show holes," edited in studs.
@@ -30,7 +31,7 @@ change the sculpt/convert/mesh math, only how scale is expressed and which contr
 [ Shape  Stamp  Paint  Zone ]            (mode bar, iconified — unchanged)
 
 Brush:  tool · size [Ø N studs] · strength · falloff · shape
-        ℹ Alt+click to sample a height
+        ℹ Hold E + click to sample a height
 
 Surface:  Smooth ⇄ Stepped (+ step size) · Sea level [N studs] · Fill flat ground ☐
 
@@ -70,8 +71,8 @@ Output:  name [____] · World(.brdb) ☑ · Prefab(.brz) ☐ · Install ☑ · O
 - **Auto-tiling:** reuse the existing `tiled_estimate`/over-cap detection; when the single-mesh estimate
   exceeds the brick/RAM cap, set the export to tile automatically and show "Big world — split into N tiles."
   No silent truncation: the notice always states the tile count.
-- **Alt-sample:** the canvas pointer path already routes modifiers; map `Alt`+click → sample-into-active-height,
-  retiring the `pick_mode`/`pick_into` state.
+- **Hold-E sample:** the canvas pointer path checks `eyedropper_active` (the `E` key held) → sample-into-
+  active-height, retiring the `pick_mode`/`pick_into` state. (Was Alt; moved to E because WMs grab Alt+drag.)
 
 ## Out of scope (separate backlog, still pending)
 
@@ -83,5 +84,5 @@ Output:  name [____] · World(.brdb) ☑ · Prefab(.brz) ☐ · Install ☑ · O
 - Unit: `brush_studs ↔ radius_cells` round-trip at a few scales.
 - Unit: World-width back-solve produces the requested width within integer-rounding tolerance.
 - Unit: `max_brick studs ↔ units` conversion.
-- Unit/logic: `Alt`+click maps to sample-into-active-height (modifier→action mapping).
+- Unit/logic: holding `E` maps to sample-into-active-height (`eyedropper_active` → action mapping).
 - Regression gate: `cargo test` + `clippy -D warnings` + release build green; existing 238 tests still pass.

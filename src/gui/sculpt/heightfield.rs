@@ -255,11 +255,10 @@ impl HeightField {
 
     /// Extract a sub-grid by INTEGER cell ranges `[x0, x1) × [y0, y1)` (the
     /// grid-tiled export seam, spec §5). Ranges are half-open in cells; an
-    /// adjacent sub-field whose `x0` equals this one's `x1` does NOT overlap,
-    /// while one whose `x0` equals this one's `x1 - 1` SHARES that exact edge
-    /// column. The tiler builds shared-edge ranges so seams are exact by integer
-    /// cell identity — there is no projection or zoom drift like the geographic
-    /// grid, the values are the same source cells.
+    /// adjacent sub-field whose `x0` equals this one's `x1` abuts without overlap
+    /// (the tiler builds such a partition). Seams are exact by integer cell
+    /// identity — there is no projection or zoom drift like the geographic grid,
+    /// the values are the same source cells.
     ///
     /// The carried [`FieldMeta`] is cloned verbatim (same pitch/scale/micro), so
     /// every sub-field meshes at the identical scale — the seam abuts. Debug-checks

@@ -28,13 +28,13 @@ impl BrushShape {
     pub(crate) const ALL: [BrushShape; 4] =
         [BrushShape::Circle, BrushShape::Square, BrushShape::Diamond, BrushShape::Hexagon];
 
-    /// Short label for the UI.
-    pub(crate) fn label(self) -> &'static str {
+    /// Full tooltip: the footprint and what it's good for (also carries the name).
+    pub(crate) fn help(self) -> &'static str {
         match self {
-            BrushShape::Circle => "Circle",
-            BrushShape::Square => "Square",
-            BrushShape::Diamond => "Diamond",
-            BrushShape::Hexagon => "Hexagon",
+            BrushShape::Circle => "Circle — round falloff, the all-purpose brush for organic terrain.",
+            BrushShape::Square => "Square — fills its bounding box with crisp right-angle edges.",
+            BrushShape::Diamond => "Diamond — 45° rhombus footprint; good for ridgelines and chamfers.",
+            BrushShape::Hexagon => "Hexagon — flat-sided hex footprint that tiles cleanly for honeycomb terrain.",
         }
     }
 }

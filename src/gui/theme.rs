@@ -70,6 +70,15 @@ pub fn install_theme(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
     style.visuals.widgets.noninteractive.fg_stroke.color = TEXT_PRIMARY;
+
+    // Tooltip timing (UX best practice): a short ~250 ms delay so tips appear
+    // promptly on intentional hover without flickering during cursor transit, and
+    // a grace window so sliding along a button row keeps the tip up instead of
+    // re-waiting per button. egui's default delay feels sluggish for a tool panel.
+    style.interaction.tooltip_delay = 0.25;
+    style.interaction.tooltip_grace_time = 0.25;
+    style.interaction.show_tooltips_only_when_still = true;
+
     ctx.set_style(style);
 }
 

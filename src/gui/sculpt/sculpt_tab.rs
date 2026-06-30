@@ -123,6 +123,17 @@ fn slider_drag_speed(base_speed: f64, m: DragModifiers) -> f64 {
     base_speed * modifier_step(m)
 }
 
+/// The eyedropper (height pick) key. Bound to holding **E**, not Alt: window
+/// managers commonly reserve Alt+click/drag to MOVE the window (Hyprland, GNOME,
+/// Windows), so the app never sees an Alt+primary drag and the pick silently
+/// fails. A plain letter key is WM-neutral and works the same on every platform.
+const EYEDROPPER_KEY: egui::Key = egui::Key::E;
+
+/// True while the eyedropper is engaged (the [`EYEDROPPER_KEY`] is held down).
+fn eyedropper_active(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.key_down(EYEDROPPER_KEY))
+}
+
 /// An [`egui::Slider`] whose draggable value-box honors the F2 modifier scaling
 /// (spec §2 / DoD §8 "every numeric slider"): while a modifier is held, the
 /// value box's drag speed is `base_speed` scaled by [`modifier_step`] — Ctrl ⇒
@@ -201,20 +212,35 @@ enum PaintTool {
     Bucket,
 }
 
+/// Which height field a click-to-arm map pick writes into. This is the EXPLICIT
+/// pick (click a field's eyedropper → click the map → it fills that field),
+/// distinct from the momentary hold-E eyedropper that always targets the active
+/// Set/Flatten value. Keeping them separate is why nothing gets "mixed up": the
+/// armed pick is one-shot, visibly flagged, and aimed at one named field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickTarget {
+    SetHeight,
+    SeaLevel,
+    FloorLevel,
+}
+
+impl PickTarget {
+    /// The field's display name (also the on-canvas pick prompt).
+    fn field_label(self) -> &'static str {
+        match self {
+            Self::SetHeight => "Set to",
+            Self::SeaLevel => "Sea level",
+            Self::FloorLevel => "Floor level",
+        }
+    }
+}
+
 impl SculptMode {
     const ALL: [SculptMode; 4] = [Self::Shape, Self::Stamp, Self::Paint, Self::Zone];
 
-    fn label(self) -> &'static str {
-        match self {
-            // DISPLAY names. The variant names `Shape`/`Zone` are kept internal —
-            // `Zone` collides with SculptTool::Zone, so a clean rename is risky.
-            // The mode is "Sculpt" (height brushes); the mask mode is "Mask".
-            Self::Shape => "Sculpt",
-            Self::Stamp => "Stamp",
-            Self::Paint => "Paint",
-            Self::Zone => "Mask",
-        }
-    }
+    // DISPLAY names live in `help()` (each starts with the name, e.g. "Sculpt —
+    // …"). The variant names `Shape`/`Zone` stay internal — `Zone` collides with
+    // SculptTool::Zone, so a clean rename is risky; the UI says "Sculpt"/"Mask".
 
     /// Phosphor glyph for this mode's tab-bar button.
     fn icon(self) -> &'static str {
@@ -224,6 +250,28 @@ impl SculptMode {
             Self::Stamp => ph::STAMP,
             Self::Paint => ph::PAINT_BRUSH,
             Self::Zone => ph::SELECTION,
+        }
+    }
+
+    /// Full tooltip: what this mode does, in one or two plain sentences.
+    fn help(self) -> &'static str {
+        match self {
+            Self::Shape => {
+                "Sculpt — freehand height brushes (Raise, Lower, Smooth, Flatten, Set). \
+                 Drag on the map to reshape the land."
+            }
+            Self::Stamp => {
+                "Stamp — drop a ready-made landform (cone, mesa, crater, ramp) in one click. \
+                 Fast hills, plateaus, and pits without brushing."
+            }
+            Self::Paint => {
+                "Paint — color the terrain with palette swatches (a splatmap). \
+                 Affects brick color only, never height."
+            }
+            Self::Zone => {
+                "Mask — draw regions that limit the export: Omit cuts holes, Include keeps only \
+                 what's inside. Heights are untouched; it only decides which bricks are written."
+            }
         }
     }
 }
@@ -243,19 +291,6 @@ impl SculptTool {
         }
     }
 
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Raise => "Raise",
-            Self::Lower => "Lower",
-            Self::Smooth => "Smooth",
-            Self::Flatten => "Flatten",
-            Self::Set => "Set height",
-            Self::Stamp => "Stamp (primitive)",
-            Self::Paint => "Paint (color)",
-            Self::Zone => "Mask (omit/include)",
-        }
-    }
-
     /// Phosphor glyph paired with the label on tool buttons.
     fn icon(self) -> &'static str {
         use egui_phosphor::regular as ph;
@@ -268,6 +303,35 @@ impl SculptTool {
             Self::Stamp => ph::STAMP,
             Self::Paint => ph::PAINT_BRUSH,
             Self::Zone => ph::SELECTION,
+        }
+    }
+
+    /// Full tooltip: the tool's purpose AND how its strength behaves, so the one
+    /// shared strength slider reads sensibly per tool.
+    fn help(self) -> &'static str {
+        match self {
+            Self::Raise => {
+                "Raise — pushes terrain up under the brush. Strength is meters added per pass; \
+                 hold and drag to build height."
+            }
+            Self::Lower => {
+                "Lower — digs terrain down under the brush. Strength is meters removed per pass."
+            }
+            Self::Smooth => {
+                "Smooth — averages neighbouring heights to soften ridges, steps, and noise. \
+                 Strength is the blend amount (0–1) per pass."
+            }
+            Self::Flatten => {
+                "Flatten — eases terrain toward the “Set to” height, leaving a level shelf. \
+                 Strength is the blend amount (0–1); set the target height first."
+            }
+            Self::Set => {
+                "Set height — stamps terrain straight to the “Set to” value (no build-up). \
+                 Sample a height first by holding E, or arm the “Set to” eyedropper, then click."
+            }
+            Self::Stamp => "Stamp — drop a parametric landform in one click (see Stamp mode).",
+            Self::Paint => "Paint — color cells with the active swatch (see Paint mode).",
+            Self::Zone => "Mask — draw omit/include regions for export (see Mask mode).",
         }
     }
 
@@ -404,6 +468,10 @@ pub(crate) struct SculptState {
     brush: Brush,
     /// Target height (meters above floor) for Flatten/Set.
     target_height: f32,
+    /// Armed click-to-arm map pick: while `Some`, the next canvas click reads the
+    /// hovered cell's height into this field and disarms (one-shot). `None` = off.
+    /// Independent of the hold-E eyedropper (see [`PickTarget`]).
+    armed_pick: Option<PickTarget>,
     /// Parameters for the Stamp primitive tool (cone/mesa/crater/ramp).
     stamp: StampParams,
     /// Per-cell splat-paint palette indices, parallel to the height field (same
@@ -502,7 +570,7 @@ pub(crate) struct SculptState {
     micro: bool,
     /// Manual grid-tiled export toggle (spec §5). Default off = single mesh.
     /// On routes the convert through `convert_heightfield_tiled`, which
-    /// subdivides the field into shared-edge sub-fields stitched into one save.
+    /// subdivides the field into partition sub-fields stitched into one save.
     tile_export: bool,
     /// Sub-field edge length (cells) for a tiled export — drives the tile count
     /// and per-tile budget of `convert_heightfield_tiled`.
@@ -567,6 +635,7 @@ impl Default for SculptState {
                 falloff: Falloff::Smoothstep,
             },
             target_height: 20.0,
+            armed_pick: None,
             stamp: StampParams::default(),
             // No field yet → a 0×0 grid; `set_field` re-blanks it to the field dims.
             paint: PaintGrid::blank(0, 0),
@@ -746,12 +815,25 @@ impl SculptState {
         self.convert_cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Alt+click eyedropper: sample the hovered cell's height (meters above floor)
+    /// Hold-E eyedropper: sample the hovered cell's height (meters above floor)
     /// into the active Set/Flatten target. No-op without a field. Pure (no egui),
     /// so the sample → target path is unit-testable directly.
     fn sample_height_into_target(&mut self, cx: f32, cy: f32) {
         if let Some(field) = self.field.as_ref() {
             self.target_height = field.sample_cell_meters(cx, cy);
+        }
+    }
+
+    /// Click-to-arm pick: read the hovered cell's height (meters above floor) into
+    /// the named height field. Routes the same sampled value the hold-E eyedropper
+    /// uses, but to the specific field the user armed. No-op without a field. Pure.
+    fn sample_into(&mut self, target: PickTarget, cx: f32, cy: f32) {
+        let Some(field) = self.field.as_ref() else { return };
+        let h = field.sample_cell_meters(cx, cy);
+        match target {
+            PickTarget::SetHeight => self.target_height = h,
+            PickTarget::SeaLevel => self.omit_below_m = h,
+            PickTarget::FloorLevel => self.floor_level_m = h,
         }
     }
 
@@ -917,8 +999,24 @@ fn draw_new_canvas_section(state: &mut SculptState, ui: &mut Ui) {
 /// high-contrast selected state. Returns the click Response.
 fn icon_button(ui: &mut Ui, glyph: &str, selected: bool, tooltip: &str) -> egui::Response {
     let txt = egui::RichText::new(glyph).size(22.0);
-    ui.add_sized([34.0, 32.0], egui::Button::selectable(selected, txt))
-        .on_hover_text(tooltip)
+    let resp = ui.add_sized([34.0, 32.0], egui::Button::selectable(selected, txt));
+    // Fade-in hover glow: an ember outline that eases in over ~0.16 s while the
+    // button is hovered (and eases back out), so the cursor's target lights up
+    // smoothly instead of snapping. Selected buttons keep their fill; the glow
+    // layers on top. `animate_bool_with_time` drives the 0→1 alpha per button id.
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hover_glow"), resp.hovered(), 0.16);
+    if t > 0.0 {
+        let glow = crate::gui::theme::ACCENT.gamma_multiply(0.65 * t);
+        ui.painter().rect_stroke(
+            resp.rect.expand(1.0),
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.5, glow),
+            egui::StrokeKind::Outside,
+        );
+    }
+    resp.on_hover_text(tooltip)
 }
 
 /// A group section header — a slightly larger, strong title in the ember accent,
@@ -957,7 +1055,7 @@ fn draw_mode_bar(state: &mut SculptState, ui: &mut Ui) {
     let current = state.tool.mode();
     ui.horizontal(|ui| {
         for m in SculptMode::ALL {
-            let btn = icon_button(ui, m.icon(), current == m, m.label());
+            let btn = icon_button(ui, m.icon(), current == m, m.help());
             if btn.clicked() && current != m {
                 if m != SculptMode::Zone {
                     state.zone_draft.clear();
@@ -978,7 +1076,7 @@ fn draw_mode_bar(state: &mut SculptState, ui: &mut Ui) {
 fn draw_shape_tools(state: &mut SculptState, ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
         for t in SculptTool::SHAPE_TOOLS {
-            if icon_button(ui, t.icon(), state.tool == t, t.label()).clicked() {
+            if icon_button(ui, t.icon(), state.tool == t, t.help()).clicked() {
                 state.tool = t;
                 state.shape_tool = t; // remember for the next Shape-tab entry
             }
@@ -986,18 +1084,23 @@ fn draw_shape_tools(state: &mut SculptState, ui: &mut Ui) {
     });
     if matches!(state.tool, SculptTool::Flatten | SculptTool::Set) {
         let vscale = state.field.as_ref().map_or(1.0, |f| vertical_units_per_meter(&f.meta));
-        height_drag(ui, "Set to", &mut state.target_height, vscale).on_hover_text(
-            "Target height in Brickadia bricks + flats (1 brick = 3 flats). Alt+click \
-             the terrain to sample a height into here.",
+        height_drag_pickable(
+            ui, "Set to", &mut state.target_height, vscale,
+            PickTarget::SetHeight, &mut state.armed_pick,
+        )
+        .on_hover_text(
+            "Target height in Brickadia bricks + flats (1 brick = 3 flats). Hold E and click the \
+             terrain to sample, or click the eyedropper chip to pick straight into this box.",
         );
     }
     ui.small(format!(
-        "{}  Alt+click the terrain to sample a height into Set/Flatten",
+        "{}  Hold E + click the terrain to sample a height into Set/Flatten",
         egui_phosphor::regular::EYEDROPPER
     ))
     .on_hover_text(
-        "Hold Alt and click/drag the canvas to pick up that spot's height into the \
-         Set-height value; release Alt to sculpt with it.",
+        "Hold the E key and click/drag the canvas to pick up that spot's height into the \
+         Set-height value; release E to sculpt with it. (E, not Alt — Alt+drag moves the \
+         window on many systems.)",
     );
 }
 
@@ -1039,14 +1142,17 @@ fn meters_to_flats(m: f32, vscale: f32) -> f32 {
 fn flats_to_meters(flats: f32, vscale: f32) -> f32 {
     if vscale > 0.0 { flats * H_UNITS_PER_FLAT / vscale } else { 0.0 }
 }
-/// Render a flat count as Brickadia "Nb Mf" (bricks + flats).
+/// Render a flat count as Brickadia "Nb Mf" (bricks + flats). Sign-aware so a
+/// negative height (e.g. a Stamp peak that digs a crater) reads "-2b 1f".
 fn fmt_bricks_flats(flats: f32) -> String {
-    let total = flats.round().max(0.0) as i64;
+    let signed = flats.round() as i64;
+    let sign = if signed < 0 { "-" } else { "" };
+    let total = signed.abs();
     let (b, f) = (total / FLATS_PER_BRICK, total % FLATS_PER_BRICK);
     match (b, f) {
-        (0, f) => format!("{f}f"),
-        (b, 0) => format!("{b}b"),
-        (b, f) => format!("{b}b {f}f"),
+        (0, f) => format!("{sign}{f}f"),
+        (b, 0) => format!("{sign}{b}b"),
+        (b, f) => format!("{sign}{b}b {f}f"),
     }
 }
 /// Parse "3b 1f" / "3b1f" / "3b" / "1f" / a bare flat count → flats. Tolerates a
@@ -1056,14 +1162,25 @@ fn parse_bricks_flats(s: &str) -> Option<f64> {
     if s.is_empty() {
         return None;
     }
-    if let Ok(n) = s.parse::<f64>() {
-        return Some(n); // a bare number = flats
+    // A leading '-' negates the WHOLE expression (matches the formatter, which
+    // prints the sign once: -5 flats → "-1b 2f"). Strip it, parse the magnitude
+    // as positive, negate at the end so fmt↔parse round-trip on negatives.
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, s.as_str()),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let signed = |v: f64| if neg { -v } else { v };
+    if let Ok(n) = body.parse::<f64>() {
+        return Some(signed(n)); // a bare number = flats
     }
     let mut flats = 0.0;
     let mut num = String::new();
     let mut saw_unit = false;
-    for ch in s.chars() {
-        if ch.is_ascii_digit() || ch == '.' || ch == '-' {
+    for ch in body.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
             num.push(ch);
         } else if ch == 'b' || ch == 'f' {
             let v: f64 = num.trim().parse().ok()?;
@@ -1081,19 +1198,27 @@ fn parse_bricks_flats(s: &str) -> Option<f64> {
     if !num.is_empty() {
         return None; // trailing number with no unit
     }
-    saw_unit.then_some(flats)
+    saw_unit.then(|| signed(flats))
 }
 /// A height control edited in Brickadia bricks+flats, stored in meters. `vscale`
-/// is [`vertical_units_per_meter`] for the live field.
-fn height_drag(ui: &mut Ui, label: &str, meters: &mut f32, vscale: f32) -> egui::Response {
+/// is [`vertical_units_per_meter`] for the live field. `signed` allows negative
+/// heights (a Stamp peak that digs); unsigned clamps at the floor (0).
+fn height_drag_signed(
+    ui: &mut Ui,
+    label: &str,
+    meters: &mut f32,
+    vscale: f32,
+    signed: bool,
+) -> egui::Response {
     let mut flats = meters_to_flats(*meters, vscale);
+    let min = if signed { -1_000_000.0 } else { 0.0 };
     let resp = ui
         .horizontal(|ui| {
             ui.label(label);
             ui.add(
                 egui::DragValue::new(&mut flats)
                     .speed(1.0)
-                    .range(0.0..=1_000_000.0)
+                    .range(min..=1_000_000.0)
                     .custom_formatter(|p, _| fmt_bricks_flats(p as f32))
                     .custom_parser(parse_bricks_flats),
             )
@@ -1103,6 +1228,57 @@ fn height_drag(ui: &mut Ui, label: &str, meters: &mut f32, vscale: f32) -> egui:
         *meters = flats_to_meters(flats, vscale);
     }
     resp
+}
+
+/// Unsigned bricks+flats height control (floor-clamped) — the common case.
+fn height_drag(ui: &mut Ui, label: &str, meters: &mut f32, vscale: f32) -> egui::Response {
+    height_drag_signed(ui, label, meters, vscale, false)
+}
+
+/// A bricks+flats height field with an integrated eyedropper toggle: the label is
+/// a clickable [eyedropper + name] chip that ARMS a one-shot map pick into this
+/// field (click it, then click the terrain). Clicking again — or the canvas
+/// handler after a pick, or Esc — disarms. Returns the DragValue response so the
+/// caller can chain `.on_hover_text`/`.changed`. The chip lights up (selected
+/// look) while THIS field is the armed target, so it's unmistakable which box the
+/// next map click fills.
+fn height_drag_pickable(
+    ui: &mut Ui,
+    label: &str,
+    meters: &mut f32,
+    vscale: f32,
+    target: PickTarget,
+    armed: &mut Option<PickTarget>,
+) -> egui::Response {
+    let is_armed = *armed == Some(target);
+    ui.horizontal(|ui| {
+        let chip = ui
+            .add(egui::Button::selectable(
+                is_armed,
+                egui::RichText::new(format!("{}  {label}", egui_phosphor::regular::EYEDROPPER)),
+            ))
+            .on_hover_text(format!(
+                "Pick “{label}” from the map — click here, then click the terrain to read that \
+                 spot's height into this box (one-shot; Esc cancels). Like holding E, but aimed \
+                 at this field instead of Set/Flatten."
+            ));
+        if chip.clicked() {
+            *armed = if is_armed { None } else { Some(target) };
+        }
+        let mut flats = meters_to_flats(*meters, vscale);
+        let dv = ui.add(
+            egui::DragValue::new(&mut flats)
+                .speed(1.0)
+                .range(0.0..=1_000_000.0)
+                .custom_formatter(|p, _| fmt_bricks_flats(p as f32))
+                .custom_parser(parse_bricks_flats),
+        );
+        if dv.changed() {
+            *meters = flats_to_meters(flats, vscale);
+        }
+        dv
+    })
+    .inner
 }
 
 fn draw_brush_section(state: &mut SculptState, ui: &mut Ui) {
@@ -1155,7 +1331,7 @@ fn draw_brush_section(state: &mut SculptState, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label("Tip");
         for s in BrushShape::ALL {
-            if icon_button(ui, brush_shape_icon(s), state.brush.shape == s, s.label()).clicked() {
+            if icon_button(ui, brush_shape_icon(s), state.brush.shape == s, s.help()).clicked() {
                 state.brush.shape = s;
             }
         }
@@ -1167,17 +1343,16 @@ fn draw_stamp_section(state: &mut SculptState, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label("Form");
         for k in StampKind::ALL {
-            if icon_button(ui, stamp_kind_icon(k), state.stamp.kind == k, k.label()).clicked() {
+            if icon_button(ui, stamp_kind_icon(k), state.stamp.kind == k, k.help()).clicked() {
                 state.stamp.kind = k;
             }
         }
     });
-    ui.horizontal(|ui| {
-        ui.label("Peak (m)");
-        // Signed: a negative peak digs (crater pit / inverted cone), clamped to
-        // floor at apply time.
-        modifier_drag(ui, &mut state.stamp.peak_m, 0.5, -10_000.0..=100_000.0);
-    });
+    // Peak height in Brickadia bricks+flats (signed: a negative peak digs a
+    // crater pit / inverted cone, clamped to floor at apply time).
+    let vscale = state.field.as_ref().map_or(1.0, |f| vertical_units_per_meter(&f.meta));
+    height_drag_signed(ui, "Peak", &mut state.stamp.peak_m, vscale, true)
+        .on_hover_text("Stamp height in bricks + flats. Negative digs a pit.");
     // Mesa plateau width and crater rim position both ride `inner_ratio`; Cone is
     // radially uniform and Ramp is directional, so the knob only matters for the
     // first two — show it for all but label its role.
@@ -1195,22 +1370,21 @@ fn draw_paint_section(state: &mut SculptState, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label("Method");
         use egui_phosphor::regular as ph;
-        if icon_button(ui, ph::PAINT_BRUSH, state.paint_tool == PaintTool::Brush, "Brush — drag to paint").clicked() {
+        if icon_button(ui, ph::PAINT_BRUSH, state.paint_tool == PaintTool::Brush,
+            "Brush — drag to paint the active swatch onto cells.").clicked() {
             state.paint_tool = PaintTool::Brush;
         }
-        if icon_button(ui, ph::PAINT_BUCKET, state.paint_tool == PaintTool::Bucket, "Bucket — flood-fill").clicked() {
+        if icon_button(ui, ph::PAINT_BUCKET, state.paint_tool == PaintTool::Bucket,
+            "Bucket — click a cell to flood-fill every connected cell within the height Tolerance. \
+             Match Tolerance to the terrace step to fill a whole plateau.").clicked() {
             state.paint_tool = PaintTool::Bucket;
         }
     });
     if state.paint_tool == PaintTool::Bucket {
-        ui.horizontal(|ui| {
-            ui.label("Tolerance (m)");
-            modifier_drag(ui, &mut state.bucket_tolerance_m, 0.5, 0.0..=100_000.0);
-        })
-        .response
-        .on_hover_text(
-            "Click a cell: fills cells within this height of it. Match the terrace \
-             step to flood a whole plateau.",
+        let vscale = state.field.as_ref().map_or(1.0, |f| vertical_units_per_meter(&f.meta));
+        height_drag(ui, "Tolerance", &mut state.bucket_tolerance_m, vscale).on_hover_text(
+            "Click a cell: fills cells within this height (bricks + flats) of it. Match \
+             the terrace step to flood a whole plateau.",
         );
         ui.checkbox(&mut state.bucket_global, "Global (all matching cells)")
             .on_hover_text("Off: only the contiguous region you click. On: every matching cell.");
@@ -1356,10 +1530,12 @@ fn draw_zone_section(state: &mut SculptState, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label("Mode");
         use egui_phosphor::regular as ph;
-        if icon_button(ui, ph::PROHIBIT, state.zone_mode == ZoneMode::Omit, "Omit — cut a hole").clicked() {
+        if icon_button(ui, ph::PROHIBIT, state.zone_mode == ZoneMode::Omit,
+            "Omit — draw a loop; terrain inside it is cut from the export (a hole or removed region).").clicked() {
             state.zone_mode = ZoneMode::Omit;
         }
-        if icon_button(ui, ph::CHECK_CIRCLE, state.zone_mode == ZoneMode::Include, "Include — keep only inside").clicked() {
+        if icon_button(ui, ph::CHECK_CIRCLE, state.zone_mode == ZoneMode::Include,
+            "Include — draw loops; only terrain inside them is exported, everything else is dropped.").clicked() {
             state.zone_mode = ZoneMode::Include;
         }
     });
@@ -1464,7 +1640,7 @@ fn single_mesh_estimate(cells: u64, available_ram: u64) -> ExportEstimate {
     ExportEstimate { est_bricks, peak_bytes, over_brick_cap, fits_ram, tile_count: 1 }
 }
 
-/// Tiles along one axis for a `tile_cells`-cell grid-tiled export: shared-edge
+/// Tiles along one axis for a `tile_cells`-cell grid-tiled export: partition
 /// sub-fields step by `tile_cells` cells, so `ceil(extent / tile_cells)` tiles
 /// (always ≥ 1). Mirrors `convert::tile_bounds`'s count without allocating —
 /// the single source of truth for the readout's tile figure.
@@ -1473,7 +1649,7 @@ fn tiles_on_axis(extent: u32, tile_cells: u32) -> u32 {
 }
 
 /// Compute the grid-tiled estimate (spec §1 + §5): a `w × h` field split into
-/// `ceil(w/tile)·ceil(h/tile)` shared-edge sub-fields stitched into ONE save.
+/// `ceil(w/tile)·ceil(h/tile)` partition sub-fields stitched into ONE save.
 /// Reuses `estimate_grid`'s memory model — the peak working set is ONE tile's
 /// mesh (meshing is sequential) plus the stitched write-vec over the aggregate
 /// brick count — and the aggregate cap is `MAX_GRID_BRICKS` (NOT the per-mesh
@@ -1487,11 +1663,11 @@ fn tiled_estimate(width: u32, height: u32, tile_cells: u32, available_ram: u64) 
     let rows = tiles_on_axis(height, tile_cells);
     let tile_count = cols.saturating_mul(rows);
 
-    // Aggregate brick ceiling: ≤ 1 brick / field cell (the shared edge cells add
-    // a thin duplicate seam, conservatively folded into the per-tile ceiling
-    // below). The field's own cell count bounds the union from below; the tiled
-    // sum (with shared edges) is the honest aggregate the stitch produces.
-    let body = u64::from(tile_cells.max(1)) + 1; // shared-edge tile width on an axis
+    // Aggregate brick ceiling: ≤ 1 brick / field cell. Tiles partition the field
+    // (no shared/duplicated seam cell), so a full tile is exactly `tile_cells`
+    // wide; the last tile may be narrower, making this a slight over-estimate —
+    // the safe direction for a RAM/cap budget.
+    let body = u64::from(tile_cells.max(1)); // partition tile width on an axis
     let per_tile_cells = body.saturating_mul(body);
     let est_bricks = per_tile_cells.saturating_mul(u64::from(tile_count));
 
@@ -1586,9 +1762,14 @@ fn draw_export_section(state: &mut SculptState, ui: &mut Ui) -> ExportEstimate {
         {
             state.out.skip_floor = !fill_flat;
         }
-        height_drag(ui, "Sea level", &mut state.omit_below_m, vscale).on_hover_text(
+        height_drag_pickable(
+            ui, "Sea level", &mut state.omit_below_m, vscale,
+            PickTarget::SeaLevel, &mut state.armed_pick,
+        )
+        .on_hover_text(
             "Terrain at or below this height (bricks + flats) emits no bricks — drop water / \
-             low ground. 0 drops only the true floor.",
+             low ground. 0 drops only the true floor. Use the eyedropper chip to pick a \
+             shoreline height off the map.",
         );
         let terr_toggle = ui
             .checkbox(&mut state.terrace, "Stepped relief")
@@ -1599,11 +1780,13 @@ fn draw_export_section(state: &mut SculptState, ui: &mut Ui) -> ExportEstimate {
             .changed();
         let mut step_changed = false;
         if state.terrace {
-            ui.horizontal(|ui| {
-                ui.label("Step height (m)");
-                step_changed =
-                    modifier_drag(ui, &mut state.terrace_step_m, 0.5, 0.1..=10_000.0).changed();
-            });
+            step_changed = height_drag(ui, "Step height", &mut state.terrace_step_m, vscale)
+                .on_hover_text("Plateau step in bricks + flats — terrain snaps to multiples of this.")
+                .changed();
+            // A terrace step must stay positive (it divides the snap); clamp to at
+            // least one flat so a drag-to-zero can't make a degenerate step.
+            let one_flat = flats_to_meters(1.0, vscale);
+            state.terrace_step_m = state.terrace_step_m.max(one_flat.max(f32::MIN_POSITIVE));
         }
         if terr_toggle || step_changed {
             state.mark_dirty_all();
@@ -1697,8 +1880,14 @@ fn draw_export_section(state: &mut SculptState, ui: &mut Ui) -> ExportEstimate {
 
         // ---- Advanced: the ONLY collapsible left ----
         ui.collapsing("Advanced", |ui| {
-            height_drag(ui, "Floor level", &mut state.floor_level_m, vscale)
-                .on_hover_text("Base-plane height the build sits on (bricks + flats). Usually 0.");
+            height_drag_pickable(
+                ui, "Floor level", &mut state.floor_level_m, vscale,
+                PickTarget::FloorLevel, &mut state.armed_pick,
+            )
+            .on_hover_text(
+                "Base-plane height the build sits on (bricks + flats). Usually 0. Click the \
+                 eyedropper chip, then a spot on the map, to seat the floor at that height.",
+            );
             ui.checkbox(&mut state.force_tile, "Always tile (force split)").on_hover_text(
                 "Force grid-tiling even for a world that fits a single mesh. A too-big world \
                  auto-tiles on its own regardless.",
@@ -1899,7 +2088,7 @@ fn draw_canvas(state: &mut SculptState, ctx: &egui::Context, ui: &mut Ui) {
 
         // Brush overlay + smooth radius animation. Animating every frame while the
         // pointer is over the canvas keeps the resize buttery regardless of grid
-        // size (it touches no texture). Shown always; the Alt eyedropper readout
+        // size (it touches no texture). Shown always; the hold-E eyedropper readout
         // (below) layers its own cursor hint over it.
         paint_brush_overlay(state, ctx, ui, &response, rect);
     }
@@ -2078,20 +2267,27 @@ fn paint_zone_overlay(state: &SculptState, ui: &Ui, response: &egui::Response, r
 }
 
 /// Draw the eyedropper's on-canvas readout (spec §3): while pick mode is active,
-/// a small label in the canvas's top-left shows the hovered cell's height while
-/// Alt is held, so the eyedropper value is visible without looking at the side
-/// panel. No-op unless Alt is held.
+/// a small label in the canvas's top-left shows the hovered cell's height (in
+/// bricks + flats) while E is held, so the eyedropper value is visible without
+/// looking at the side panel. No-op unless the eyedropper key is held.
 fn paint_pick_readout(state: &SculptState, ui: &Ui, response: &egui::Response, rect: Rect) {
-    if !ui.input(|i| i.modifiers.alt) {
+    let armed = state.armed_pick;
+    // Active when the hold-E eyedropper is down OR a field pick is armed.
+    if armed.is_none() && !eyedropper_active(ui.ctx()) {
         return;
     }
     let Some(field) = state.field.as_ref() else { return };
-    let mut text = "Alt+click samples height → Set".to_owned();
+    // Where the sampled value lands: the armed field, else Set (hold-E target).
+    let dest = armed.map_or("Set", PickTarget::field_label);
+    let tail = if armed.is_some() { "Esc cancels" } else { "release E to sculpt" };
+    let mut text = format!("click samples height → {dest}");
     if response.hovered()
         && let Some(ptr) = response.hover_pos()
     {
         let (cx, cy) = screen_to_cell(state, ptr);
-        text = format!("sample {:.2} m → Set  ·  release Alt to sculpt", field.sample_cell_meters(cx, cy));
+        let vscale = vertical_units_per_meter(&field.meta);
+        let flats = meters_to_flats(field.sample_cell_meters(cx, cy), vscale);
+        text = format!("sample {} → {dest}  ·  {tail}", fmt_bricks_flats(flats));
     }
     let painter = ui.painter_at(rect);
     // Offset below the slice-overlay legend so the two don't overlap.
@@ -2234,12 +2430,35 @@ fn paint_slice_overlay(ui: &Ui, rect: Rect) {
 /// Snapshots the affected rect at stroke start (for undo) and commits it when the
 /// stroke ends.
 fn handle_sculpt_input(state: &mut SculptState, response: &egui::Response, fw: u32, fh: u32) {
-    // Alt held = eyedropper (spec §5, Photoshop-style): a primary click/drag
+    // Armed click-to-arm pick (clicked a height field's eyedropper chip): the next
+    // primary click reads that spot's height into THAT field, then disarms. This
+    // is a deliberate, one-shot mode — it suppresses sculpting while armed and is
+    // separate from hold-E, so the two never collide. Esc cancels.
+    if let Some(target) = state.armed_pick {
+        response.ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        if response.ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.armed_pick = None;
+            return;
+        }
+        if (response.clicked_by(egui::PointerButton::Primary)
+            || response.drag_started_by(egui::PointerButton::Primary))
+            && let Some(ptr) = response.interact_pointer_pos()
+        {
+            let (cx, cy) = screen_to_cell(state, ptr);
+            state.sample_into(target, cx, cy);
+            state.armed_pick = None;
+        }
+        return; // never sculpt while a pick is armed
+    }
+
+    // Hold E = eyedropper (spec §5, Photoshop-style): a primary click/drag
     // samples the hovered cell's height into the active Set/Flatten target, no dab
-    // — release Alt to sculpt. Reuses the SAME map `Response` hit-test.
-    if response.ctx.input(|i| i.modifiers.alt) {
+    // — release E to sculpt. Reuses the SAME map `Response` hit-test. (E, not Alt:
+    // window managers grab Alt+drag to move the window — see `eyedropper_active`.)
+    if eyedropper_active(&response.ctx) {
+        response.ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         // If a sculpt stroke was in progress and the primary releases this frame
-        // while Alt is now held, COMMIT it first — otherwise its already-applied
+        // while E is now held, COMMIT it first — otherwise its already-applied
         // dabs are dropped from the undo timeline (audit 2026-06-30). Don't sample
         // on that release frame (it's the end of a stroke, not a pick).
         if response.drag_stopped_by(egui::PointerButton::Primary) {
@@ -3061,7 +3280,7 @@ fn start_convert(state: &mut SculptState) {
         .name("h2brz-sculpt-convert".into())
         .spawn(move || {
             // "Tile this export" routes through the grid-tiled stitch path (one
-            // stitched save built from shared-edge sub-fields); off = single mesh.
+            // stitched save built from partition sub-fields); off = single mesh.
             let paint_layer = Some(PaintLayer { grid: &paint_grid, palette: &palette });
             let result = if tile_export {
                 convert_heightfield_tiled(
@@ -3495,6 +3714,17 @@ mod tests {
         assert_eq!(parse_bricks_flats("3 b"), None, "number then space then unit is junk");
         // Round-trip through format isn't required, but parse∘fmt preserves count.
         assert_eq!(parse_bricks_flats(&fmt_bricks_flats(7.0)), Some(7.0));
+
+        // Signed (the Stamp peak digs craters): the sign prints ONCE over the
+        // whole magnitude and round-trips through parse, so a negative peak typed
+        // or dragged shows and reads back the same brick stack.
+        assert_eq!(fmt_bricks_flats(-7.0), "-2b 1f");
+        assert_eq!(fmt_bricks_flats(-3.0), "-1b");
+        assert_eq!(fmt_bricks_flats(-2.0), "-2f");
+        assert_eq!(parse_bricks_flats("-2b 1f"), Some(-7.0), "leading - negates the whole");
+        assert_eq!(parse_bricks_flats("-5"), Some(-5.0), "bare negative flats");
+        assert_eq!(parse_bricks_flats(&fmt_bricks_flats(-7.0)), Some(-7.0), "negative round-trip");
+        assert_eq!(parse_bricks_flats("-"), None, "a lone minus is junk");
     }
 
     /// `cell_to_screen` and `screen_to_cell` must stay exact inverses at ANY view
@@ -3687,19 +3917,19 @@ mod tests {
     /// the estimate uses, without re-exporting a private constant into the test.
     const RAM_RESERVE_BYTES_LOCAL: u64 = 12 * 1024 * 1024 * 1024;
 
-    /// Alt+click eyedropper: sampling a cell writes that cell's height (meters
+    /// Hold-E eyedropper: sampling a cell writes that cell's height (meters
     /// above floor) into the active Set/Flatten target. Exercises the pure
     /// `sample_height_into_target` core the canvas handler calls after mapping the
     /// pointer to a cell — including the nearest-cell floor for a fractional point.
     #[test]
-    fn alt_sample_sets_target_height() {
+    fn eyedropper_sample_sets_target_height() {
         let mut state = SculptState::new();
         let mut field = HeightField::flat(4, 4, meta());
         field.set(2, 1, 42.5);
         state.set_field(field);
 
         state.sample_height_into_target(2.0, 1.0);
-        assert_eq!(state.target_height, 42.5, "Alt+click samples the hovered height into Set/Flatten");
+        assert_eq!(state.target_height, 42.5, "the eyedropper samples the hovered height into Set/Flatten");
         // A fractional pointer inside the same cell floors to it (nearest-cell).
         state.target_height = 0.0;
         state.sample_height_into_target(2.9, 1.1);
@@ -3707,6 +3937,30 @@ mod tests {
         // An untouched cell is at the floor (0 m).
         state.sample_height_into_target(0.0, 0.0);
         assert_eq!(state.target_height, 0.0, "an unedited cell samples to the floor");
+    }
+
+    /// Click-to-arm pick routes the sampled height into the SPECIFIC field armed —
+    /// Set/Sea level/Floor level — never crossing wires. (The arm/disarm UI lives
+    /// in egui; this pins the pure routing core the canvas handler calls.)
+    #[test]
+    fn armed_pick_routes_height_to_each_field() {
+        let mut state = SculptState::new();
+        let mut field = HeightField::flat(4, 4, meta());
+        field.set(1, 1, 11.0);
+        field.set(2, 2, 22.0);
+        field.set(3, 3, 33.0);
+        state.set_field(field);
+
+        state.sample_into(PickTarget::SetHeight, 1.0, 1.0);
+        assert_eq!(state.target_height, 11.0, "SetHeight pick fills target_height");
+        state.sample_into(PickTarget::SeaLevel, 2.0, 2.0);
+        assert_eq!(state.omit_below_m, 22.0, "SeaLevel pick fills omit_below_m");
+        state.sample_into(PickTarget::FloorLevel, 3.0, 3.0);
+        assert_eq!(state.floor_level_m, 33.0, "FloorLevel pick fills floor_level_m");
+
+        // Each pick is independent — the others are untouched by the last.
+        assert_eq!(state.target_height, 11.0, "earlier picks are not disturbed");
+        assert_eq!(state.omit_below_m, 22.0, "earlier picks are not disturbed");
     }
 
     /// `mark_dirty_rect` unions sub-rects but a pending FULL rebuild (no rect)
