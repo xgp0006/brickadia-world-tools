@@ -284,6 +284,58 @@ impl HeightField {
         }
         HeightField { width: sw, height: sh, cells, meta: self.meta.clone() }
     }
+
+    /// Bake a preview view-rotation into the grid: produce an axis-aligned copy of
+    /// the field **as it appears rotated by `theta` radians** (CCW), so a feature
+    /// the user lined up with screen-down exports along +Y — the brick slice axis.
+    /// Output spans the rotated bounding box; height is bilinear-sampled; cells
+    /// that fall outside the source rectangle become `FLOOR_M` (native ground → no
+    /// bricks). `theta == 0` returns a verbatim clone (identity, byte-for-byte).
+    ///
+    /// LOSSY by design (resampling fuzzes hard edges / terrace plateaus) — the
+    /// stored field is untouched; this runs only at export when `view_rot != 0`.
+    pub(crate) fn rotated(&self, theta: f32) -> HeightField {
+        if theta == 0.0 {
+            return self.clone();
+        }
+        let (w, h) = (self.width as f32, self.height as f32);
+        let (s, c) = theta.sin_cos();
+        let (hw, hh) = (w * 0.5, h * 0.5);
+        let (new_w, new_h) = rotated_dims(self.width, self.height, theta);
+        let (oc_x, oc_y) = (new_w as f32 * 0.5, new_h as f32 * 0.5);
+        let mut cells = Vec::with_capacity((new_w as usize) * (new_h as usize));
+        for oy in 0..new_h {
+            for ox in 0..new_w {
+                // Centre the output cell, rotate back by R(-theta), re-centre on the
+                // source. R(-θ)·(px,py) = (px·c + py·s, -px·s + py·c).
+                let px = ox as f32 + 0.5 - oc_x;
+                let py = oy as f32 + 0.5 - oc_y;
+                let fx = (px * c + py * s) + hw - 0.5;
+                let fy = (-px * s + py * c) + hh - 0.5;
+                // Outside the source (beyond a half-cell margin) → floor.
+                let v = if fx < -0.5 || fy < -0.5 || fx > w - 0.5 || fy > h - 0.5 {
+                    FLOOR_M
+                } else {
+                    self.sample_bilinear(fx, fy)
+                };
+                cells.push(v);
+            }
+        }
+        HeightField { width: new_w, height: new_h, cells, meta: self.meta.clone() }
+    }
+}
+
+/// Axis-aligned `(width, height)` that hold the source `w×h` grid rotated by
+/// `theta` radians. Shared by [`HeightField::rotated`], [`super::paint::PaintGrid::rotated`],
+/// and the zone rotation so the height, its parallel paint grid, and the keep-mask
+/// all land on the IDENTICAL rotated grid. The `-1e-3` trims f32 round-off so
+/// axis-aligned angles (90°/180°/270°) give exact integer dims instead of +1.
+pub(crate) fn rotated_dims(w: u32, h: u32, theta: f32) -> (u32, u32) {
+    let (s, c) = theta.sin_cos();
+    let (hw, hh) = (w as f32 * 0.5, h as f32 * 0.5);
+    let nw = (2.0 * (hw * c.abs() + hh * s.abs()) - 1e-3).ceil().max(1.0);
+    let nh = (2.0 * (hw * s.abs() + hh * c.abs()) - 1e-3).ceil().max(1.0);
+    (nw as u32, nh as u32)
 }
 
 #[cfg(test)]
@@ -306,6 +358,95 @@ mod tests {
             centroid_lat: 0.0,
             source_name: "test".to_string(),
         }
+    }
+
+    /// Rotating by 0 is a verbatim identity; a 45° rotation grows the bounding
+    /// box, preserves interior height, and floors the now-empty corners.
+    #[test]
+    fn rotated_zero_is_identity_and_45_preserves_interior() {
+        let f = HeightField { width: 10, height: 10, cells: vec![5.0; 100], meta: test_meta() };
+        let id = f.rotated(0.0);
+        assert_eq!((id.width, id.height), (10, 10));
+        assert_eq!(id.cells, f.cells, "θ=0 must be a byte-identical clone");
+
+        let r = f.rotated(std::f32::consts::FRAC_PI_4);
+        assert!(r.width >= 14 && r.height >= 14, "45° grows the bbox: {}×{}", r.width, r.height);
+        let center = r.at(r.width / 2, r.height / 2);
+        assert!((center - 5.0).abs() < 1e-3, "interior height preserved: {center}");
+        assert_eq!(r.at(0, 0), FLOOR_M, "a corner outside the source rotates to floor");
+    }
+
+    /// A 90° rotation swaps the grid dimensions exactly.
+    #[test]
+    fn rotated_90_swaps_dims() {
+        let f = HeightField { width: 6, height: 4, cells: vec![3.0; 24], meta: test_meta() };
+        let r = f.rotated(std::f32::consts::FRAC_PI_2);
+        assert_eq!((r.width, r.height), (4, 6), "90° swaps width/height");
+    }
+
+    /// AUDIT — slice↔rotation correlation. A ridge along source +X (a horizontal
+    /// row) is PERPENDICULAR to the +Y slice axis, so at 0° it slices into many
+    /// short bricks. Rotating the terrain +90° must stand it up along output +Y (a
+    /// single tall column) so it slices into one long run — the whole point of
+    /// "rotate to align with the slice lanes". This verifies the export half lands
+    /// the feature on the slice axis the fixed screen-down overlay advertises.
+    #[test]
+    fn rotated_stands_a_cross_slice_ridge_up_along_the_slice_axis() {
+        let (w, h) = (9u32, 9u32);
+        let mut cells = vec![0.0f32; (w * h) as usize];
+        for x in 0..w {
+            cells[((h / 2) * w + x) as usize] = 10.0; // horizontal ridge (source +X)
+        }
+        let r = HeightField { width: w, height: h, cells, meta: test_meta() }
+            .rotated(std::f32::consts::FRAC_PI_2);
+        let mut col_high = vec![0u32; r.width as usize];
+        for y in 0..r.height {
+            for x in 0..r.width {
+                if r.at(x, y) > 5.0 {
+                    col_high[x as usize] += 1;
+                }
+            }
+        }
+        let total: u32 = col_high.iter().sum();
+        let max_col = *col_high.iter().max().unwrap();
+        assert!(total > 0, "ridge vanished under rotation");
+        assert!(max_col >= 5, "ridge should stand up as a tall column after 90°, max {max_col}");
+        assert!(
+            max_col as f32 >= 0.6 * total as f32,
+            "ridge mass must concentrate in one column (vertical, along +Y slice): {max_col}/{total}",
+        );
+    }
+
+    /// AUDIT — rotation DIRECTION (no mirror). Display and export share `R(θ)`, so a
+    /// +90° turn (`R(90°): (x,y)→(−y,x)`) must carry a source TOP-LEFT block to the
+    /// output TOP-RIGHT — not bottom-left, which a sign flip / mirror would produce.
+    /// If this fails, the baked export is mirrored vs what the user saw on screen.
+    #[test]
+    fn rotated_direction_matches_display_no_mirror() {
+        let (w, h) = (9u32, 9u32);
+        let mut cells = vec![0.0f32; (w * h) as usize];
+        for y in 0..3 {
+            for x in 0..3 {
+                cells[(y * w + x) as usize] = 10.0; // source top-left block
+            }
+        }
+        let r = HeightField { width: w, height: h, cells, meta: test_meta() }
+            .rotated(std::f32::consts::FRAC_PI_2);
+        let (mut sx, mut sy, mut n) = (0.0f32, 0.0f32, 0.0f32);
+        for y in 0..r.height {
+            for x in 0..r.width {
+                if r.at(x, y) > 5.0 {
+                    sx += x as f32;
+                    sy += y as f32;
+                    n += 1.0;
+                }
+            }
+        }
+        assert!(n > 0.0, "block vanished");
+        let (cx, cy) = (sx / n, sy / n);
+        let (mid_x, mid_y) = (r.width as f32 / 2.0, r.height as f32 / 2.0);
+        assert!(cx > mid_x, "top-left must rotate to the RIGHT half at +90° (no mirror): cx={cx} mid={mid_x}");
+        assert!(cy < mid_y, "top-left must stay in the TOP half at +90°: cy={cy} mid={mid_y}");
     }
 
     /// A small, irregular DEM with a non-zero minimum so the floor-subtraction

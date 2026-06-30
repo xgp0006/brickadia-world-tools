@@ -23,6 +23,7 @@ egui_extras = { version = "0.33.3", features = [
   "file",
   "image",
 ], optional = true }
+egui-phosphor = { version = "0.11", optional = true }
 walkers = { version = "0.52", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
@@ -38,6 +39,7 @@ gui = [
   "dep:egui",
   "dep:eframe",
   "dep:egui_extras",
+  "dep:egui-phosphor",
   "dep:poll-promise",
   "dep:native-dialog",
   "dep:arboard",

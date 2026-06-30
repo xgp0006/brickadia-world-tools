@@ -96,34 +96,6 @@ fn modifier_step(m: DragModifiers) -> f64 {
     }
 }
 
-/// Which level a sampled eyedropper height (meters) is routed into (spec §3).
-/// The active keyboard modifier at click time selects the destination: a plain
-/// click sets the Flatten/Set target, Alt the floor level, Ctrl the omit level.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PickTarget {
-    /// Plain click → the Flatten/Set `target_height`.
-    Target,
-    /// Alt-click → `floor_level_m` (the base plane).
-    Floor,
-    /// Ctrl-click → `omit_below_m` (the omit-water level).
-    Omit,
-}
-
-/// Route an eyedropper sample by the held modifiers (spec §3): **plain ⇒
-/// target**, **Alt ⇒ floor**, **Ctrl ⇒ omit**. Precedence when BOTH are held:
-/// **Ctrl wins** (omit) — mirroring [`modifier_step`]'s "Ctrl wins" rule so the
-/// whole UI shares one modifier precedence. Pure so the routing is unit-tested
-/// directly without an egui context.
-fn pick_target(m: DragModifiers) -> PickTarget {
-    if m.ctrl {
-        PickTarget::Omit
-    } else if m.alt {
-        PickTarget::Floor
-    } else {
-        PickTarget::Target
-    }
-}
-
 /// A [`egui::DragValue`] whose drag speed scales with the held keyboard
 /// modifiers while the widget is hovered (spec §2): Ctrl ⇒ fine (×0.1), Alt ⇒
 /// coarse (×10), none ⇒ `base_speed`. `range` clamps the value. Applied to every
@@ -234,16 +206,30 @@ impl SculptMode {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Shape => "Shape",
+            // DISPLAY names. The variant names `Shape`/`Zone` are kept internal —
+            // `Zone` collides with SculptTool::Zone, so a clean rename is risky.
+            // The mode is "Sculpt" (height brushes); the mask mode is "Mask".
+            Self::Shape => "Sculpt",
             Self::Stamp => "Stamp",
             Self::Paint => "Paint",
-            Self::Zone => "Zone",
+            Self::Zone => "Mask",
+        }
+    }
+
+    /// Phosphor glyph for this mode's tab-bar button.
+    fn icon(self) -> &'static str {
+        use egui_phosphor::regular as ph;
+        match self {
+            Self::Shape => ph::MOUNTAINS,
+            Self::Stamp => ph::STAMP,
+            Self::Paint => ph::PAINT_BRUSH,
+            Self::Zone => ph::SELECTION,
         }
     }
 }
 
 impl SculptTool {
-    /// The five height brushes selectable inside Shape mode.
+    /// The five height brushes selectable inside Sculpt mode.
     const SHAPE_TOOLS: [SculptTool; 5] =
         [Self::Raise, Self::Lower, Self::Smooth, Self::Flatten, Self::Set];
 
@@ -266,7 +252,22 @@ impl SculptTool {
             Self::Set => "Set height",
             Self::Stamp => "Stamp (primitive)",
             Self::Paint => "Paint (color)",
-            Self::Zone => "Zone (omit/include)",
+            Self::Zone => "Mask (omit/include)",
+        }
+    }
+
+    /// Phosphor glyph paired with the label on tool buttons.
+    fn icon(self) -> &'static str {
+        use egui_phosphor::regular as ph;
+        match self {
+            Self::Raise => ph::ARROW_FAT_UP,
+            Self::Lower => ph::ARROW_FAT_DOWN,
+            Self::Smooth => ph::WAVE_SINE,
+            Self::Flatten => ph::EQUALS,
+            Self::Set => ph::RULER,
+            Self::Stamp => ph::STAMP,
+            Self::Paint => ph::PAINT_BRUSH,
+            Self::Zone => ph::SELECTION,
         }
     }
 
@@ -430,6 +431,9 @@ pub(crate) struct SculptState {
     // button, scroll to zoom).
     pan: Vec2,
     zoom: f32,
+    /// View rotation in radians (CCW). Free-angle: rotates the preview + the
+    /// scan/slice overlay; baked into the export by a resample at convert time.
+    view_rot: f32,
     view_initialized: bool,
 
     // Rendering cache: the terrain texture is rebuilt only when `dirty`.
@@ -524,21 +528,11 @@ pub(crate) struct SculptState {
     /// Brickadia silently drops procedural bricks above its render limit, leaving
     /// holes — lower this until they vanish. Default 250 (50 studs).
     max_brick_units: u16,
-    /// Eyedropper height-picker mode (spec §3). When on, a primary click on the
-    /// canvas samples the hovered cell's height (meters) and routes it by the
-    /// held modifier (plain → target, Alt → floor, Ctrl → omit) instead of
-    /// laying a brush dab — pick mode SUPPRESSES brush painting so the two never
-    /// fire on the same click. Toggled from the Export panel; default off.
-    pick_mode: bool,
-    /// Where a plain eyedropper click stores its sample (Target/Floor/Omit). Set
-    /// by a selector so the destination doesn't depend on holding Ctrl/Alt at
-    /// click time — that modifier gesture is unreliable on Wayland/Hyprland (the
-    /// compositor can grab modifier+click). Modifiers still override when they do
-    /// register.
-    pick_into: PickTarget,
-    /// The last height sampled by the eyedropper (meters above floor), shown as a
-    /// small on-canvas readout. `None` until the first pick.
-    last_pick: Option<f32>,
+    /// Show the greedy-mesher scan/slice direction overlay on the canvas.
+    slice_overlay: bool,
+    /// Manual tiling override (Advanced): force grid-tiling even for a world that
+    /// fits a single mesh. Auto-tiling still engages on its own when over-cap.
+    force_tile: bool,
     /// Cached available-RAM bytes for the Export estimate's button gate + GiB
     /// readout, refreshed on a coarse cadence (see [`refresh_available_ram`])
     /// instead of every frame — a per-frame `/proc/meminfo` scan is wasted sync
@@ -584,6 +578,7 @@ impl Default for SculptState {
             bucket_global: false,
             pan: Vec2::ZERO,
             zoom: 4.0,
+            view_rot: 0.0,
             view_initialized: false,
             texture: None,
             dirty: true,
@@ -613,9 +608,8 @@ impl Default for SculptState {
             terrace: false,
             terrace_step_m: 10.0,
             max_brick_units: 250,
-            pick_into: PickTarget::Target,
-            pick_mode: false,
-            last_pick: None,
+            slice_overlay: false,
+            force_tile: false,
             // Seed generous so a pre-first-refresh gate never blocks; the first
             // panel draw refreshes it from the live figure.
             available_ram: u64::MAX,
@@ -752,17 +746,25 @@ impl SculptState {
         self.convert_cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Store an eyedropper sample (meters) into the level its [`PickTarget`]
-    /// selects (spec §3): the Flatten/Set target, the floor level, or the omit
-    /// level. Also records it as the `last_pick` for the on-canvas readout. Pure
-    /// state mutation (no egui), so the routing is unit-testable directly.
-    fn apply_pick(&mut self, target: PickTarget, meters: f32) {
-        match target {
-            PickTarget::Target => self.target_height = meters,
-            PickTarget::Floor => self.floor_level_m = meters,
-            PickTarget::Omit => self.omit_below_m = meters,
+    /// Alt+click eyedropper: sample the hovered cell's height (meters above floor)
+    /// into the active Set/Flatten target. No-op without a field. Pure (no egui),
+    /// so the sample → target path is unit-testable directly.
+    fn sample_height_into_target(&mut self, cx: f32, cy: f32) {
+        if let Some(field) = self.field.as_ref() {
+            self.target_height = field.sample_cell_meters(cx, cy);
         }
-        self.last_pick = Some(meters);
+    }
+
+    /// Push the panel's live scale knobs into the field's `FieldMeta` so every
+    /// studs-from-meta display (World width, brush studs) stays current frame-to-
+    /// frame. `start_convert` performs the identical sync, so this is display-only.
+    fn sync_scale_to_field_meta(&mut self) {
+        let (spm, vexag, micro) = (self.studs_per_meter, self.vertical_exaggeration, self.micro);
+        if let Some(f) = self.field.as_mut() {
+            f.meta.studs_per_meter = spm;
+            f.meta.vertical_exaggeration = vexag;
+            f.meta.micro = micro;
+        }
     }
 }
 
@@ -813,7 +815,39 @@ fn draw_controls(state: &mut SculptState, ui: &mut Ui) {
         return;
     }
 
+    // Keep the field's scale metadata in lockstep with the live panel knobs each
+    // frame, so studs-sourced displays (World width, brush studs, "1 brick = N
+    // studs") reflect edits IMMEDIATELY instead of reading the pre-edit scale and
+    // snapping back (meta was previously synced to state only at convert). The
+    // convert re-applies the same sync, so this changes display only, not export.
+    state.sync_scale_to_field_meta();
+
     draw_mode_bar(state, ui);
+    // View controls: free-angle rotation of the preview (and the scan overlay),
+    // plus the slice-direction toggle. Rotating re-orients the terrain relative to
+    // the brick slice axis — align a long ridge with it for longer, fewer bricks.
+    ui.horizontal(|ui| {
+        ui.label("Rotate terrain");
+        let mut deg = state.view_rot.to_degrees();
+        if ui
+            .add(egui::DragValue::new(&mut deg).suffix("°").speed(1.0).range(-180.0..=180.0))
+            .on_hover_text(
+                "Spin the depthmap against the FIXED screen-down slice direction. Line a ridge up \
+                 with the slice lanes, then export — the rotation bakes in (height, paint, and \
+                 zones together) so it slices into long bricks. Resampling softens detail off-axis.",
+            )
+            .changed()
+        {
+            state.view_rot = deg.to_radians();
+        }
+        if ui.button(format!("{} Reset", egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)).clicked() {
+            state.view_rot = 0.0;
+        }
+        ui.checkbox(&mut state.slice_overlay, "Slice dir").on_hover_text(
+            "Show the fixed screen-down slice direction (cyan = slice, amber = widen). The terrain \
+             rotates under it — align ridges to the lanes for longer, fewer bricks.",
+        );
+    });
     ui.add_space(8.0);
     // Each mode shows only its own controls (no catch-all dropdown).
     match state.tool.mode() {
@@ -869,8 +903,8 @@ fn draw_new_canvas_section(state: &mut SculptState, ui: &mut Ui) {
             load_heightmap_image(state);
         }
         ui.small(
-            "Large canvases are intended to be tiled at export — see “Tile this \
-             export” in the Export panel.",
+            "Large canvases are fine — the export auto-splits a too-big world into \
+             stitched tiles for you.",
         );
     });
 }
@@ -878,11 +912,53 @@ fn draw_new_canvas_section(state: &mut SculptState, ui: &mut Ui) {
 /// The top mode tab bar: Shape / Stamp / Paint / Zone. Switching modes sets the
 /// active tool to that mode's tool (Shape restores the last height brush) and
 /// drops any in-progress zone draft when leaving Zone.
+/// A GIMP/Photoshop-style icon-only tool button: a fixed square with the phosphor
+/// glyph centered (22px), a hover tooltip (no text label), and the theme's
+/// high-contrast selected state. Returns the click Response.
+fn icon_button(ui: &mut Ui, glyph: &str, selected: bool, tooltip: &str) -> egui::Response {
+    let txt = egui::RichText::new(glyph).size(22.0);
+    ui.add_sized([34.0, 32.0], egui::Button::selectable(selected, txt))
+        .on_hover_text(tooltip)
+}
+
+/// A group section header — a slightly larger, strong title in the ember accent,
+/// with a little space above. Gives the panel real visual hierarchy instead of a
+/// flat wall of same-weight labels.
+fn section_header(ui: &mut Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(title)
+            .size(14.0)
+            .strong()
+            .color(crate::gui::theme::ACCENT),
+    );
+}
+
+fn brush_shape_icon(s: BrushShape) -> &'static str {
+    use egui_phosphor::regular as ph;
+    match s {
+        BrushShape::Circle => ph::CIRCLE,
+        BrushShape::Square => ph::SQUARE,
+        BrushShape::Diamond => ph::DIAMOND,
+        BrushShape::Hexagon => ph::HEXAGON,
+    }
+}
+fn stamp_kind_icon(k: StampKind) -> &'static str {
+    use egui_phosphor::regular as ph;
+    match k {
+        StampKind::Cone => ph::TRIANGLE,
+        StampKind::Mesa => ph::SQUARE,
+        StampKind::Crater => ph::BOWL_FOOD,
+        StampKind::Ramp => ph::STAIRS,
+    }
+}
+
 fn draw_mode_bar(state: &mut SculptState, ui: &mut Ui) {
     let current = state.tool.mode();
     ui.horizontal(|ui| {
         for m in SculptMode::ALL {
-            if ui.selectable_label(current == m, m.label()).clicked() && current != m {
+            let btn = icon_button(ui, m.icon(), current == m, m.label());
+            if btn.clicked() && current != m {
                 if m != SculptMode::Zone {
                     state.zone_draft.clear();
                 }
@@ -900,28 +976,164 @@ fn draw_mode_bar(state: &mut SculptState, ui: &mut Ui) {
 /// Shape mode's height-brush sub-selector (Raise/Lower/Smooth/Flatten/Set) plus
 /// the target-height field the value-driven brushes use.
 fn draw_shape_tools(state: &mut SculptState, ui: &mut Ui) {
-    ui.label("Brush tool");
     ui.horizontal_wrapped(|ui| {
         for t in SculptTool::SHAPE_TOOLS {
-            if ui.selectable_label(state.tool == t, t.label()).clicked() {
+            if icon_button(ui, t.icon(), state.tool == t, t.label()).clicked() {
                 state.tool = t;
                 state.shape_tool = t; // remember for the next Shape-tab entry
             }
         }
     });
     if matches!(state.tool, SculptTool::Flatten | SculptTool::Set) {
-        ui.horizontal(|ui| {
-            ui.label("Target height (m)");
-            modifier_drag(ui, &mut state.target_height, 0.5, 0.0..=100_000.0);
-        });
+        let vscale = state.field.as_ref().map_or(1.0, |f| vertical_units_per_meter(&f.meta));
+        height_drag(ui, "Set to", &mut state.target_height, vscale).on_hover_text(
+            "Target height in Brickadia bricks + flats (1 brick = 3 flats). Alt+click \
+             the terrain to sample a height into here.",
+        );
     }
+    ui.small(format!(
+        "{}  Alt+click the terrain to sample a height into Set/Flatten",
+        egui_phosphor::regular::EYEDROPPER
+    ))
+    .on_hover_text(
+        "Hold Alt and click/drag the canvas to pick up that spot's height into the \
+         Set-height value; release Alt to sculpt with it.",
+    );
+}
+
+/// Studs of brick footprint spanned by one field cell at the current scale.
+/// A single unmerged cell becomes one brick whose footprint is `2*hscale*upf`
+/// world units (see [`crate::gui::map_tab::derive_scale`]); 1 stud = 5 units, so
+/// a cell — and thus the smallest representable brick — is `2*hscale*upf/5` studs
+/// wide. Uses the *achieved* integer `hscale`, so it reflects what actually
+/// exports (low scales snap up to the 1-brick minimum), not the pre-rounding ask.
+fn studs_per_cell(meta: &FieldMeta) -> f32 {
+    let upf = if meta.micro { 1.0_f32 } else { 5.0 };
+    let (hscale, _) = crate::gui::map_tab::derive_scale(
+        meta.cell_m,
+        meta.studs_per_meter,
+        meta.vertical_exaggeration,
+        meta.micro,
+    );
+    2.0 * f32::from(hscale) * upf / 5.0
+}
+
+// --- Brickadia vertical parity: heights in BRICKS + FLATS (plates) ---
+//
+// The export emits procedural bricks whose smallest vertical step (parity 2 →
+// `BrickSize.z = 2`) is one FLAT/plate, and `z` steps by `brick_height·2`
+// (`opt/generate.rs::emit_column_bricks`), so ONE FLAT = 4 units of the heightmap
+// height `h = round(m · vertical_scale)`. Derived from our source — solid.
+// A standard BRICK = 3 flats (LEGO/Brickadia ratio) — the ONE value NOT in our
+// code; confirm against the live game (matches the user's "based off LEGO heights").
+const H_UNITS_PER_FLAT: f32 = 4.0;
+const FLATS_PER_BRICK: i64 = 3;
+
+/// Heightmap units per meter at the current scale (the vertical leg of `derive_scale`).
+fn vertical_units_per_meter(meta: &FieldMeta) -> f32 {
+    build_derive_scale(meta.cell_m, meta.studs_per_meter, meta.vertical_exaggeration, meta.micro).1
+}
+fn meters_to_flats(m: f32, vscale: f32) -> f32 {
+    m * vscale / H_UNITS_PER_FLAT
+}
+fn flats_to_meters(flats: f32, vscale: f32) -> f32 {
+    if vscale > 0.0 { flats * H_UNITS_PER_FLAT / vscale } else { 0.0 }
+}
+/// Render a flat count as Brickadia "Nb Mf" (bricks + flats).
+fn fmt_bricks_flats(flats: f32) -> String {
+    let total = flats.round().max(0.0) as i64;
+    let (b, f) = (total / FLATS_PER_BRICK, total % FLATS_PER_BRICK);
+    match (b, f) {
+        (0, f) => format!("{f}f"),
+        (b, 0) => format!("{b}b"),
+        (b, f) => format!("{b}b {f}f"),
+    }
+}
+/// Parse "3b 1f" / "3b1f" / "3b" / "1f" / a bare flat count → flats. Tolerates a
+/// space between the brick and flat parts or none (char-scan, not whitespace-split).
+fn parse_bricks_flats(s: &str) -> Option<f64> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(n) = s.parse::<f64>() {
+        return Some(n); // a bare number = flats
+    }
+    let mut flats = 0.0;
+    let mut num = String::new();
+    let mut saw_unit = false;
+    for ch in s.chars() {
+        if ch.is_ascii_digit() || ch == '.' || ch == '-' {
+            num.push(ch);
+        } else if ch == 'b' || ch == 'f' {
+            let v: f64 = num.trim().parse().ok()?;
+            num.clear();
+            flats += if ch == 'b' { v * FLATS_PER_BRICK as f64 } else { v };
+            saw_unit = true;
+        } else if ch.is_whitespace() {
+            if !num.is_empty() {
+                return None; // a number with no unit before a space
+            }
+        } else {
+            return None; // junk
+        }
+    }
+    if !num.is_empty() {
+        return None; // trailing number with no unit
+    }
+    saw_unit.then_some(flats)
+}
+/// A height control edited in Brickadia bricks+flats, stored in meters. `vscale`
+/// is [`vertical_units_per_meter`] for the live field.
+fn height_drag(ui: &mut Ui, label: &str, meters: &mut f32, vscale: f32) -> egui::Response {
+    let mut flats = meters_to_flats(*meters, vscale);
+    let resp = ui
+        .horizontal(|ui| {
+            ui.label(label);
+            ui.add(
+                egui::DragValue::new(&mut flats)
+                    .speed(1.0)
+                    .range(0.0..=1_000_000.0)
+                    .custom_formatter(|p, _| fmt_bricks_flats(p as f32))
+                    .custom_parser(parse_bricks_flats),
+            )
+        })
+        .inner;
+    if resp.changed() {
+        *meters = flats_to_meters(flats, vscale);
+    }
+    resp
 }
 
 fn draw_brush_section(state: &mut SculptState, ui: &mut Ui) {
-    ui.label("Brush");
-    // Radius/strength keep the slider track but route the value-box drag through
-    // the F2 modifier scaling (spec §2 / DoD §8): Ctrl ⇒ fine, Alt ⇒ coarse.
-    modifier_slider(ui, &mut state.brush.radius_cells, 1.0..=200.0, 0.2, "radius (cells)", true);
+    section_header(ui, "Brush");
+    // Brush size shown + edited in Brickadia STUDS (the export unit), while the
+    // stored value stays radius-in-cells (so the overlay ring + dab spacing are
+    // unchanged). The slider position is still cells; the formatter/parser convert
+    // diameter_studs = 2·cells·studs_per_cell. Drag keeps the Ctrl/Alt fine/coarse.
+    let spc = state.field.as_ref().map_or(1.0, |f| studs_per_cell(&f.meta));
+    let mods = ui.input(|i| i.modifiers);
+    let speed = slider_drag_speed(0.2, DragModifiers { ctrl: mods.ctrl, alt: mods.alt });
+    ui.add(
+        egui::Slider::new(&mut state.brush.radius_cells, 1.0..=200.0)
+            .text("brush size")
+            .logarithmic(true)
+            .drag_value_speed(speed)
+            .custom_formatter(move |n, _| format!("Ø {:.0} studs", n * 2.0 * f64::from(spc)))
+            .custom_parser(move |s| {
+                s.trim()
+                    .trim_end_matches("studs")
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .map(|studs| studs / (2.0 * f64::from(spc)))
+            }),
+    );
+    ui.small(format!("1 brick = {spc:.1} studs")).on_hover_text(
+        "Sizes are in Brickadia studs. One field cell is the smallest brick \
+         (1 brick = the value shown); keep features at least ~1 brick wide so they \
+         survive on export.",
+    );
     // Stamp drives height via its own `peak_m`; Paint hard-writes an index with no
     // falloff — neither uses the brush strength, so hide it for both.
     if !matches!(state.tool, SculptTool::Stamp | SculptTool::Paint) {
@@ -941,19 +1153,23 @@ fn draw_brush_section(state: &mut SculptState, ui: &mut Ui) {
         ui.selectable_value(&mut state.brush.falloff, Falloff::Constant, "Hard");
     });
     ui.horizontal(|ui| {
-        ui.label("Shape");
+        ui.label("Tip");
         for s in BrushShape::ALL {
-            ui.selectable_value(&mut state.brush.shape, s, s.label());
+            if icon_button(ui, brush_shape_icon(s), state.brush.shape == s, s.label()).clicked() {
+                state.brush.shape = s;
+            }
         }
     });
 }
 
 fn draw_stamp_section(state: &mut SculptState, ui: &mut Ui) {
-    ui.label("Primitive (stamps once per click)");
+    section_header(ui, "Primitive");
     ui.horizontal(|ui| {
-        ui.label("Shape");
+        ui.label("Form");
         for k in StampKind::ALL {
-            ui.selectable_value(&mut state.stamp.kind, k, k.label());
+            if icon_button(ui, stamp_kind_icon(k), state.stamp.kind == k, k.label()).clicked() {
+                state.stamp.kind = k;
+            }
         }
     });
     ui.horizontal(|ui| {
@@ -978,8 +1194,13 @@ fn draw_paint_section(state: &mut SculptState, ui: &mut Ui) {
     // gradient button below). Brush/Bucket pick how a click behaves on the canvas.
     ui.horizontal(|ui| {
         ui.label("Method");
-        ui.selectable_value(&mut state.paint_tool, PaintTool::Brush, "🖌 Brush");
-        ui.selectable_value(&mut state.paint_tool, PaintTool::Bucket, "🪣 Bucket");
+        use egui_phosphor::regular as ph;
+        if icon_button(ui, ph::PAINT_BRUSH, state.paint_tool == PaintTool::Brush, "Brush — drag to paint").clicked() {
+            state.paint_tool = PaintTool::Brush;
+        }
+        if icon_button(ui, ph::PAINT_BUCKET, state.paint_tool == PaintTool::Bucket, "Bucket — flood-fill").clicked() {
+            state.paint_tool = PaintTool::Bucket;
+        }
     });
     if state.paint_tool == PaintTool::Bucket {
         ui.horizontal(|ui| {
@@ -996,7 +1217,7 @@ fn draw_paint_section(state: &mut SculptState, ui: &mut Ui) {
     }
     ui.separator();
 
-    ui.label("Palette (paint → brick color)");
+    section_header(ui, "Palette");
     // Swatch grid: click to select the active swatch the brush writes.
     ui.horizontal_wrapped(|ui| {
         for i in 0..state.palette.len() {
@@ -1053,7 +1274,7 @@ fn draw_paint_section(state: &mut SculptState, ui: &mut Ui) {
 /// whole splat grid from the terrain's heatmap (so the painted colors match the
 /// canvas). Sets the palette to the gradient bands and fills every cell by band.
 fn draw_gradient_section(state: &mut SculptState, ui: &mut Ui) {
-    ui.label("Height gradient");
+    section_header(ui, "Height gradient");
     // Preview the ramp as a continuous strip (the same hypsometric the canvas uses).
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(240.0), 16.0), Sense::hover());
     let n = 64u32;
@@ -1078,7 +1299,7 @@ fn draw_gradient_section(state: &mut SculptState, ui: &mut Ui) {
 /// `res × res` cell blocks, so a coarser splat means blockier color and far
 /// fewer brick color-splits. The preview draws the resulting splat-cell grid.
 fn draw_splat_resolution_section(state: &mut SculptState, ui: &mut Ui) {
-    ui.label("Splat resolution");
+    section_header(ui, "Splat resolution");
     ui.horizontal(|ui| {
         for r in [1u32, 2, 4, 8] {
             let label = if r == 1 { "1× (per cell)".to_string() } else { format!("1∕{r}") };
@@ -1131,11 +1352,16 @@ fn fill_splat_from_gradient(state: &mut SculptState) {
 }
 
 fn draw_zone_section(state: &mut SculptState, ui: &mut Ui) {
-    ui.label("Zone mask (XY cookie-cutter)");
+    section_header(ui, "Mask");
     ui.horizontal(|ui| {
         ui.label("Mode");
-        ui.selectable_value(&mut state.zone_mode, ZoneMode::Omit, "🚫 Omit");
-        ui.selectable_value(&mut state.zone_mode, ZoneMode::Include, "✅ Include");
+        use egui_phosphor::regular as ph;
+        if icon_button(ui, ph::PROHIBIT, state.zone_mode == ZoneMode::Omit, "Omit — cut a hole").clicked() {
+            state.zone_mode = ZoneMode::Omit;
+        }
+        if icon_button(ui, ph::CHECK_CIRCLE, state.zone_mode == ZoneMode::Include, "Include — keep only inside").clicked() {
+            state.zone_mode = ZoneMode::Include;
+        }
     });
     ui.horizontal(|ui| {
         ui.label("Style");
@@ -1167,11 +1393,11 @@ fn draw_zone_section(state: &mut SculptState, ui: &mut Ui) {
     for (i, z) in state.zones.iter().enumerate() {
         ui.horizontal(|ui| {
             let (icon, name) = match z.mode {
-                ZoneMode::Omit => ("🚫", "Omit"),
-                ZoneMode::Include => ("✅", "Include"),
+                ZoneMode::Omit => (egui_phosphor::regular::PROHIBIT, "Omit"),
+                ZoneMode::Include => (egui_phosphor::regular::CHECK_CIRCLE, "Include"),
             };
             ui.label(format!("{icon} {name} · {} pts", z.polygon.len()));
-            if ui.small_button("✖").on_hover_text("Delete zone").clicked() {
+            if ui.small_button("✖").on_hover_text("Delete region").clicked() {
                 delete = Some(i);
             }
         });
@@ -1305,7 +1531,17 @@ fn refresh_available_ram(state: &mut SculptState, ui: &Ui) {
 /// tiling toggle + size, and a live brick/RAM estimate. Returns the estimate so
 /// the convert section can gate its button on it.
 fn draw_export_section(state: &mut SculptState, ui: &mut Ui) -> ExportEstimate {
-    let dims = state.field.as_ref().map_or((0, 0), |f| (f.width, f.height));
+    // Use the EXPORT dims for the estimate + auto-tile gate: a non-zero view
+    // rotation bakes a larger rotated bounding box at convert, so estimating on the
+    // unrotated grid would under-count bricks/RAM and skip auto-tiling. Mirror
+    // start_convert's rotated_dims. Audit 2026-06-30 (rotated-dims estimate).
+    let dims = state.field.as_ref().map_or((0, 0), |f| {
+        if state.view_rot != 0.0 {
+            super::heightfield::rotated_dims(f.width, f.height, state.view_rot)
+        } else {
+            (f.width, f.height)
+        }
+    });
     let cells = u64::from(dims.0) * u64::from(dims.1);
     // RAM is read from a coarse-cadence cache (see refresh_available_ram), not the
     // raw /proc/meminfo scan every frame — it only gates the button + a GiB
@@ -1315,32 +1551,104 @@ fn draw_export_section(state: &mut SculptState, ui: &mut Ui) -> ExportEstimate {
     // The estimate (and the button gate) follows the SAME path the convert will
     // take: the grid math when tiling (tile count + per-tile peak + aggregate
     // cap), the cheap single-mesh figure otherwise.
+    // Auto-tiling: a single mesh that would trip the in-game brick cap or RAM is
+    // split into stitched tiles AUTOMATICALLY — the user never toggles it (the old
+    // "Tiling" knob nobody understood). `tile_cells` (sub-tile size) stays tunable
+    // in Advanced; a notice in the panel says when a split happens.
+    let single = single_mesh_estimate(cells, available_ram);
+    // !single.fits_ram already subsumes over_brick_cap (fits_ram = within RAM AND
+    // !over_brick_cap), so the auto trigger is simply "single mesh doesn't fit";
+    // OR the Advanced manual override.
+    state.tile_export = !single.fits_ram || state.force_tile;
     let estimate = if state.tile_export {
         tiled_estimate(dims.0, dims.1, state.tile_cells, available_ram)
     } else {
-        single_mesh_estimate(cells, available_ram)
+        single
     };
 
     egui::CollapsingHeader::new("Export").default_open(true).show(ui, |ui| {
-        // ---- Scale (drives FieldMeta) ----
-        ui.label("Scale");
+        // Vertical scale (heightmap units/m) for the bricks+flats height controls,
+        // from the live (frame-synced) field meta.
+        let vscale = state.field.as_ref().map_or(1.0, |f| vertical_units_per_meter(&f.meta));
+
+        // ---- Surface: how the terrain builds (flat — no dropdowns) ----
+        section_header(ui, "Surface");
+        // "Fill flat ground" is the inverse of skip_floor (off → native floor shows
+        // through flat areas; on → a base plate under everything).
+        let mut fill_flat = !state.out.skip_floor;
+        if ui
+            .checkbox(&mut fill_flat, "Fill flat ground")
+            .on_hover_text(
+                "Off (default): flat areas emit no bricks, so the native Brickadia floor shows \
+                 through. On: a watertight base plate is built under everything.",
+            )
+            .changed()
+        {
+            state.out.skip_floor = !fill_flat;
+        }
+        height_drag(ui, "Sea level", &mut state.omit_below_m, vscale).on_hover_text(
+            "Terrain at or below this height (bricks + flats) emits no bricks — drop water / \
+             low ground. 0 drops only the true floor.",
+        );
+        let terr_toggle = ui
+            .checkbox(&mut state.terrace, "Stepped relief")
+            .on_hover_text(
+                "Snap heights to discrete plateaus (stepped look) in the preview AND export. \
+                 Off = smooth. The stored field is untouched, so you can flip per project.",
+            )
+            .changed();
+        let mut step_changed = false;
+        if state.terrace {
+            ui.horizontal(|ui| {
+                ui.label("Step height (m)");
+                step_changed =
+                    modifier_drag(ui, &mut state.terrace_step_m, 0.5, 0.1..=10_000.0).changed();
+            });
+        }
+        if terr_toggle || step_changed {
+            state.mark_dirty_all();
+        }
+
+        ui.separator();
+        // ---- Build size (in studs — the unit you build in) ----
+        section_header(ui, "Build size");
+        // World width is typed in STUDS; it back-solves studs/meter (kept internal).
+        // world_studs = field.width · studs_per_cell ≈ width · studs/m · cell_m, so
+        // studs/m = target_width / (width · cell_m). Read field data as owned values
+        // first so the studs/meter write below isn't a borrow conflict.
+        if let Some((fw, fh, cell_m, spc)) = state.field.as_ref().map(|f| {
+            (f.width as f32, f.height as f32, f.meta.cell_m as f32, studs_per_cell(&f.meta))
+        }) {
+            let mut world_w = fw * spc;
+            ui.horizontal(|ui| {
+                ui.label("World width");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut world_w)
+                            .suffix(" studs")
+                            .speed(f64::from(spc).max(1.0))
+                            .range(2.0..=200_000.0),
+                    )
+                    .on_hover_text("How wide the build is, in studs. Sets the scale; height follows.")
+                    .changed()
+                {
+                    state.studs_per_meter = (world_w / (fw * cell_m)).clamp(0.01, 64.0);
+                }
+            });
+            ui.small(format!("World: {:.0} × {:.0} studs", fw * spc, fh * spc));
+        }
         ui.horizontal(|ui| {
-            ui.label("Studs / meter");
-            modifier_drag(ui, &mut state.studs_per_meter, 0.1, 0.01..=64.0);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Vertical exaggeration");
+            ui.label("Terrain height");
             modifier_drag(ui, &mut state.vertical_exaggeration, 0.1, 0.1..=64.0);
         });
-        draw_scale_readout(state, ui);
-        ui.checkbox(&mut state.micro, "Micro bricks (fine detail)").on_hover_text(
-            "On: SmoothTile → Micro — ~5× finer cells at the same physical scale, for crisp \
-             relief detail. Off: standard SmoothTile bricks.",
+        ui.checkbox(&mut state.micro, "Fine detail (micro bricks)").on_hover_text(
+            "On: ~5× finer bricks at the same physical scale, for crisp relief detail. \
+             Off: standard bricks.",
         );
 
         ui.separator();
         // ---- Output name + formats ----
-        ui.label("Output name");
+        section_header(ui, "Output");
         ui.add(
             TextEdit::singleline(&mut state.output_name)
                 .hint_text("sculpt")
@@ -1352,141 +1660,71 @@ fn draw_export_section(state: &mut SculptState, ui: &mut Ui) -> ExportEstimate {
         ui.checkbox(&mut state.out.overwrite, "Overwrite existing");
 
         ui.separator();
-        // Advanced knobs grouped into collapsibles so the panel stays scannable
-        // instead of one flat wall of unrelated controls.
-
-        // ---- Terrain shaping: what gets built and how ----
-        ui.collapsing("Terrain shaping", |ui| {
-            ui.checkbox(&mut state.out.skip_floor, "Skip flat floor (reveal native ground)")
-                .on_hover_text(
-                    "On (default for sculpt): flat (zero-height) areas emit no bricks, so the \
-                     native Brickadia floor shows through. Off: a watertight base plate is built \
-                     under everything (matches a direct Map build).",
-                );
-            ui.horizontal(|ui| {
-                ui.label("Floor level (m)");
-                modifier_drag(ui, &mut state.floor_level_m, 0.5, 0.0..=100_000.0);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Omit below (m)");
-                modifier_drag(ui, &mut state.omit_below_m, 0.5, 0.0..=100_000.0);
-            })
-            .response
-            .on_hover_text(
-                "Columns whose source height is at or below this level emit no bricks (native \
-                 floor / 'omit water'). Default 0 drops only true-floor columns.",
+        // ---- Bricks (flat, plain studs) ----
+        ui.horizontal(|ui| {
+            ui.label("Max brick size");
+            ui.add(
+                egui::DragValue::new(&mut state.max_brick_units)
+                    .range(40..=12_000)
+                    .speed(5.0)
+                    .custom_formatter(|n, _| format!("{:.0} studs", n / 5.0))
+                    .custom_parser(|s| {
+                        s.trim()
+                            .trim_end_matches("studs")
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                            .map(|studs| studs * 5.0)
+                    }),
             );
-            let terr_toggle = ui
-                .checkbox(&mut state.terrace, "▤ Terrace (stepped relief)")
-                .on_hover_text(
-                    "Snap heights to discrete plateaus (accurate altitude, stepped look) at both \
-                     the live preview and export. Off = smooth. The stored field is untouched, so \
-                     you can flip per project.",
-                )
-                .changed();
-            let mut step_changed = false;
-            if state.terrace {
-                ui.horizontal(|ui| {
-                    ui.label("Step height (m)");
-                    step_changed =
-                        modifier_drag(ui, &mut state.terrace_step_m, 0.5, 0.1..=10_000.0).changed();
-                });
-            }
-            // Terracing changes what the canvas shows, so force a re-render.
-            if terr_toggle || step_changed {
-                state.mark_dirty_all();
-            }
-        });
-
-        // ---- Bricks: the in-game render-limit knob (fixes holes) ----
-        ui.collapsing("Bricks (fix holes)", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Max brick size (units)");
-                ui.add(egui::DragValue::new(&mut state.max_brick_units).range(40..=12_000).speed(5.0));
-            })
-            .response
-            .on_hover_text(
-                "Largest merged brick the export emits. Brickadia silently drops procedural \
-                 bricks bigger than its render limit, leaving HOLES in big flat areas. Lower this \
-                 until holes vanish (250 = 50 studs is a safe start); raise it for fewer, larger \
-                 bricks once you know what your game renders.",
-            );
-        });
-
-        // ---- Eyedropper: sample a height into a chosen destination ----
-        ui.collapsing("Eyedropper (sample height)", |ui| {
-            ui.checkbox(&mut state.pick_mode, "🔬 Pick height on click").on_hover_text(
-                "On: click the canvas to sample the hovered cell's height (meters) into the \
-                 destination chosen below. (Ctrl/Alt+click also route to Omit/Floor where the \
-                 compositor allows it.)",
-            );
-            if state.pick_mode {
-                ui.horizontal(|ui| {
-                    ui.label("Pick into");
-                    ui.selectable_value(&mut state.pick_into, PickTarget::Target, "Target");
-                    ui.selectable_value(&mut state.pick_into, PickTarget::Floor, "Floor");
-                    ui.selectable_value(&mut state.pick_into, PickTarget::Omit, "Omit");
-                });
-            }
-            if let Some(m) = state.last_pick {
-                ui.small(format!("last sample: {m:.2} m"));
-            }
-        });
-
-        // ---- Tiling: split a big world into stitched sub-exports ----
-        ui.collapsing("Tiling (big worlds)", |ui| {
-            ui.checkbox(&mut state.tile_export, "Tile this export").on_hover_text(
-                "Off: one single mesh. On: subdivide the field into grid-tiled sub-exports \
-                 stitched into one save.",
-            );
-            if state.tile_export {
-                ui.horizontal(|ui| {
-                    ui.label("Tile size (cells)");
-                    modifier_drag(ui, &mut state.tile_cells, 8.0, 16..=4096);
-                });
-            }
-        });
+        })
+        .response
+        .on_hover_text(
+            "Largest brick the export emits, in studs. Lower this until in-game holes in flat \
+             areas vanish (50 studs is a safe start).",
+        );
 
         ui.separator();
-        // ---- Live estimate ----
+        // ---- Live estimate + auto-tiling notice ----
         draw_estimate_readout(state, ui, estimate);
+        if state.tile_export {
+            // Informational (not a warning): auto-tiling is intended behaviour.
+            ui.small(format!(
+                "Big world — auto-split into {} stitched tiles on export.",
+                estimate.tile_count
+            ));
+        }
+
+        // ---- Advanced: the ONLY collapsible left ----
+        ui.collapsing("Advanced", |ui| {
+            height_drag(ui, "Floor level", &mut state.floor_level_m, vscale)
+                .on_hover_text("Base-plane height the build sits on (bricks + flats). Usually 0.");
+            ui.checkbox(&mut state.force_tile, "Always tile (force split)").on_hover_text(
+                "Force grid-tiling even for a world that fits a single mesh. A too-big world \
+                 auto-tiles on its own regardless.",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Tile size (studs)");
+                // Tile size stored in cells; shown in studs (cell ≈ studs_per_cell).
+                let spc = state.field.as_ref().map_or(1.0, |f| studs_per_cell(&f.meta));
+                let mut tile_studs = state.tile_cells as f32 * spc;
+                if ui
+                    .add(egui::DragValue::new(&mut tile_studs).suffix(" studs").speed(spc.max(1.0)))
+                    .changed()
+                {
+                    state.tile_cells = ((tile_studs / spc.max(0.001)).round() as u32).clamp(16, 4096);
+                }
+            })
+            .response
+            .on_hover_text("Sub-tile size used when a big world splits.");
+        });
     });
 
     estimate
 }
 
-/// Live "≈ N studs/m · relief · ~M m/cell" readout (spec §1), mirroring the Map
-/// tab's `draw_output_estimate`. The achieved studs/m is the integer-`derive_scale`
-/// realized value (may differ slightly from the set target), so the user sees the
-/// true scale the convert will build at — including the cap when a coarse cell
-/// can't reach the requested studs/m.
-fn draw_scale_readout(state: &SculptState, ui: &mut Ui) {
-    let Some(field) = state.field.as_ref() else { return };
-    let cell_m = field.meta.cell_m;
-    if !cell_m.is_finite() || cell_m <= 0.0 {
-        return;
-    }
-    let (hscale, vertical) = build_derive_scale(
-        cell_m,
-        state.studs_per_meter,
-        state.vertical_exaggeration,
-        state.micro,
-    );
-    let upf = if state.micro { 1.0 } else { 5.0 };
-    // studs/m = 2*hscale*upf / cell_m / 5 (BrickSize half-extent → 2*size pitch).
-    let achieved = 2.0 * f64::from(hscale) * upf / cell_m / 5.0;
-    let relief = if (state.vertical_exaggeration - 1.0).abs() < 0.05 {
-        "1:1".to_owned()
-    } else {
-        format!("×{:.1}", state.vertical_exaggeration)
-    };
-    ui.small(format!(
-        "≈ {achieved:.1} studs/m · relief {relief} · ~{cell_m:.0} m/cell · vert {vertical:.1} u/m"
-    ));
-}
-
-/// `derive_scale` lives on the map tab; thin re-export shim so the scale readout
-/// reads the SAME integer-brick scale the convert derives (single source of truth).
+/// `derive_scale` lives on the map tab; thin re-export shim so the scale helpers
+/// read the SAME integer-brick scale the convert derives (single source of truth).
 fn build_derive_scale(cell_m: f64, studs_per_meter: f32, exaggeration: f32, micro: bool) -> (u16, f32) {
     crate::gui::map_tab::derive_scale(cell_m, studs_per_meter, exaggeration, micro)
 }
@@ -1509,20 +1747,22 @@ fn draw_estimate_readout(state: &SculptState, ui: &mut Ui, est: ExportEstimate) 
         ui.small(format!("≈ {} bricks · peak ~{ram_gib:.1} GiB", est.est_bricks));
     }
     if est.over_brick_cap {
-        // The cap differs by path: a single mesh trips MAX_BRICKS (the remedy is to
-        // tile); a tiled stitch trips the aggregate MAX_GRID_BRICKS (the remedy is
-        // a smaller canvas/scale — tiling can't grow past the stitch ceiling).
-        let (cap, remedy) = if state.tile_export {
-            (build::MAX_GRID_BRICKS, "shrink the canvas or lower the scale")
-        } else {
-            (build::MAX_BRICKS, "enable 'Tile this export' or shrink the canvas")
-        };
-        ui.colored_label(STATUS_WARN_FG, format!("Over the {cap}-brick cap — {remedy}."));
+        // Auto-tiling already engages whenever a single mesh would trip the cap, so
+        // over_brick_cap here means even the STITCHED grid exceeds MAX_GRID_BRICKS —
+        // tiling can't grow past the stitch ceiling, so the remedy is a smaller
+        // canvas/scale. (The old "enable Tile this export" branch is gone — tiling
+        // is automatic now.)
+        ui.colored_label(
+            STATUS_WARN_FG,
+            format!(
+                "Over the {}-brick cap — shrink the canvas or lower the scale.",
+                build::MAX_GRID_BRICKS
+            ),
+        );
     } else if !est.fits_ram {
         ui.colored_label(
             STATUS_WARN_FG,
-            "Estimated peak RAM exceeds what's free — shrink the canvas, lower the scale, or \
-             tile the export.",
+            "Estimated peak RAM exceeds what's free — shrink the canvas or lower the scale.",
         );
     }
 }
@@ -1587,11 +1827,14 @@ fn draw_last_result(state: &SculptState, ui: &mut Ui) {
                 outcome.elevation_max_m,
             ),
         );
-        if let Some(dest) = &outcome.installed_path {
-            ui.small(format!("installed → {}", dest.display()));
-        } else {
-            ui.small(format!("wrote → {}", outcome.brdb_path.display()));
-        }
+        // Show the filename only (the full path wraps into an ugly multi-line blob);
+        // the complete path is on hover.
+        let (verb, path) = match &outcome.installed_path {
+            Some(dest) => ("installed", dest),
+            None => ("wrote", &outcome.brdb_path),
+        };
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        ui.small(format!("{verb} → {name}")).on_hover_text(path.display().to_string());
         if let Some(warn) = &outcome.install_warning {
             ui.colored_label(STATUS_ERROR_FG, format!("⚠ {warn}"));
         }
@@ -1636,10 +1879,16 @@ fn draw_canvas(state: &mut SculptState, ctx: &egui::Context, ui: &mut Ui) {
 
     // Handle zoom (scroll) and pan (middle/secondary drag) before painting so the
     // overlay and dabs use the up-to-date transform.
-    handle_view_input(state, &response, ui, rect);
+    handle_view_input(state, &response, ui);
 
     // Paint the terrain texture at the current pan/zoom.
     paint_terrain(state, ui, rect, fw, fh);
+
+    // Brick slice direction — FIXED screen reference (down). The terrain rotates
+    // under it; aligning a ridge to the cyan lanes makes it slice into long bricks.
+    if state.slice_overlay {
+        paint_slice_overlay(ui, rect);
+    }
 
     if state.tool == SculptTool::Zone {
         // Zone tool: the primary button draws loops (no dabs, no brush ring).
@@ -1650,12 +1899,9 @@ fn draw_canvas(state: &mut SculptState, ctx: &egui::Context, ui: &mut Ui) {
 
         // Brush overlay + smooth radius animation. Animating every frame while the
         // pointer is over the canvas keeps the resize buttery regardless of grid
-        // size (it touches no texture). Suppressed in eyedropper pick mode: a pick
-        // samples a SINGLE cell, so a radius ring would imply area painting that
-        // does not happen — the pick readout is the cursor UI then.
-        if !state.pick_mode {
-            paint_brush_overlay(state, ctx, ui, &response, rect);
-        }
+        // size (it touches no texture). Shown always; the Alt eyedropper readout
+        // (below) layers its own cursor hint over it.
+        paint_brush_overlay(state, ctx, ui, &response, rect);
     }
 
     // Zone overlay: committed zones are always shown (so they're visible while
@@ -1832,26 +2078,24 @@ fn paint_zone_overlay(state: &SculptState, ui: &Ui, response: &egui::Response, r
 }
 
 /// Draw the eyedropper's on-canvas readout (spec §3): while pick mode is active,
-/// a small label in the canvas's top-left shows the last sampled height (meters)
-/// and the live hovered cell's height, so the value is visible without looking
-/// at the side panel. No-op when pick mode is off.
+/// a small label in the canvas's top-left shows the hovered cell's height while
+/// Alt is held, so the eyedropper value is visible without looking at the side
+/// panel. No-op unless Alt is held.
 fn paint_pick_readout(state: &SculptState, ui: &Ui, response: &egui::Response, rect: Rect) {
-    if !state.pick_mode {
+    if !ui.input(|i| i.modifiers.alt) {
         return;
     }
     let Some(field) = state.field.as_ref() else { return };
-    let mut text = match state.last_pick {
-        Some(m) => format!("eyedropper · last {m:.2} m"),
-        None => "eyedropper · click to sample".to_owned(),
-    };
+    let mut text = "Alt+click samples height → Set".to_owned();
     if response.hovered()
         && let Some(ptr) = response.hover_pos()
     {
         let (cx, cy) = screen_to_cell(state, ptr);
-        text = format!("{text}  ·  hover {:.2} m", field.sample_cell_meters(cx, cy));
+        text = format!("sample {:.2} m → Set  ·  release Alt to sculpt", field.sample_cell_meters(cx, cy));
     }
     let painter = ui.painter_at(rect);
-    let pos = rect.min + Vec2::new(8.0, 8.0);
+    // Offset below the slice-overlay legend so the two don't overlap.
+    let pos = rect.min + Vec2::new(8.0, 28.0);
     painter.text(
         pos,
         egui::Align2::LEFT_TOP,
@@ -1874,7 +2118,7 @@ fn init_view(state: &mut SculptState, rect: Rect, fw: u32, fh: u32) {
 }
 
 /// Scroll-to-zoom (anchored at the pointer) and middle/secondary-drag-to-pan.
-fn handle_view_input(state: &mut SculptState, response: &egui::Response, ui: &Ui, rect: Rect) {
+fn handle_view_input(state: &mut SculptState, response: &egui::Response, ui: &Ui) {
     // Pan with the middle or secondary button so the primary button is free for
     // sculpting (mirrors the Map tab's "secondary/middle pans while drawing").
     if response.dragged_by(egui::PointerButton::Middle)
@@ -1893,48 +2137,120 @@ fn handle_view_input(state: &mut SculptState, response: &egui::Response, ui: &Ui
         let factor = (scroll * 0.005).exp();
         let new_zoom = (old_zoom * factor).clamp(0.05, 64.0);
         if (new_zoom - old_zoom).abs() > f32::EPSILON {
-            // Keep the cell under the pointer stationary: solve pan so the
-            // pointer maps to the same cell before and after the zoom change.
-            let cell = (ptr - rect.min.to_vec2() - state.pan) / old_zoom;
-            state.pan = (ptr - rect.min.to_vec2()) - cell * new_zoom;
+            // Keep the cell under the pointer stationary across the zoom change,
+            // routed through the SAME rotation-aware transform the tools use (no
+            // hand-rolled affine that would drift once view_rot != 0). Solve pan
+            // so cell_to_screen(cell_under_ptr) == ptr at the new zoom.
+            let (cx, cy) = screen_to_cell(state, ptr);
             state.zoom = new_zoom;
+            let (rx, ry) = rotate_vec(state.view_rot, cx, cy);
+            state.pan = egui::vec2(ptr.x - rx * new_zoom, ptr.y - ry * new_zoom);
         }
     }
 }
 
-/// Screen position of cell-space coordinate `(cx, cy)`.
-fn cell_to_screen(state: &SculptState, cx: f32, cy: f32) -> Pos2 {
-    Pos2::new(state.pan.x + cx * state.zoom, state.pan.y + cy * state.zoom)
+/// Rotate a 2D vector by `theta` radians (CCW). The view-rotation primitive both
+/// transform helpers share, so they stay exact inverses (`R(θ)` then `R(−θ)`).
+#[inline]
+fn rotate_vec(theta: f32, x: f32, y: f32) -> (f32, f32) {
+    let (s, c) = theta.sin_cos();
+    (x * c - y * s, x * s + y * c)
 }
 
-/// Cell-space coordinate under screen position `p` (inverse of `cell_to_screen`).
+/// Screen position of cell-space coordinate `(cx, cy)`.
+/// `screen = pan + zoom · R(view_rot) · cell`.
+fn cell_to_screen(state: &SculptState, cx: f32, cy: f32) -> Pos2 {
+    let (rx, ry) = rotate_vec(state.view_rot, cx, cy);
+    Pos2::new(state.pan.x + rx * state.zoom, state.pan.y + ry * state.zoom)
+}
+
+/// Cell-space coordinate under screen position `p` — the exact inverse of
+/// [`cell_to_screen`]: `cell = R(−view_rot) · ((p − pan) / zoom)`.
 fn screen_to_cell(state: &SculptState, p: Pos2) -> (f32, f32) {
-    (
-        (p.x - state.pan.x) / state.zoom,
-        (p.y - state.pan.y) / state.zoom,
-    )
+    let ux = (p.x - state.pan.x) / state.zoom;
+    let uy = (p.y - state.pan.y) / state.zoom;
+    rotate_vec(-state.view_rot, ux, uy)
 }
 
 fn paint_terrain(state: &SculptState, ui: &Ui, rect: Rect, fw: u32, fh: u32) {
     let Some(tex) = state.texture.as_ref() else { return };
-    let top_left = cell_to_screen(state, 0.0, 0.0);
-    let bottom_right = cell_to_screen(state, fw as f32, fh as f32);
-    let img_rect = Rect::from_min_max(top_left, bottom_right);
     let painter = ui.painter_at(rect);
-    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-    painter.image(tex.id(), img_rect, uv, Color32::WHITE);
+    // `painter.image()` fills an axis-aligned Rect only, so a rotated view needs an
+    // explicit textured quad: the four field corners through the rotation-aware
+    // transform, UVs 0..1, two triangles. At view_rot == 0 this is the same blit.
+    let corners = [
+        (cell_to_screen(state, 0.0, 0.0), Pos2::new(0.0, 0.0)),
+        (cell_to_screen(state, fw as f32, 0.0), Pos2::new(1.0, 0.0)),
+        (cell_to_screen(state, fw as f32, fh as f32), Pos2::new(1.0, 1.0)),
+        (cell_to_screen(state, 0.0, fh as f32), Pos2::new(0.0, 1.0)),
+    ];
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    for (pos, uv) in corners {
+        mesh.vertices.push(egui::epaint::Vertex { pos, uv, color: Color32::WHITE });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(mesh);
+}
+
+/// Overlay the brick slice direction as a FIXED screen-space reference: bricks
+/// slice DOWN-screen (the exported +Y after the view-rotation bake) and widen to
+/// the RIGHT. Deliberately NOT drawn in cell space — it must stay put while the
+/// terrain rotates under it, so the user can spin the depthmap to line a ridge up
+/// with these cyan lanes (→ long bricks along the slice). Truthful once the export
+/// bakes `view_rot` (see `start_convert`); at 0° it is the literal export axis.
+fn paint_slice_overlay(ui: &Ui, rect: Rect) {
+    let painter = ui.painter_at(rect);
+    let slice = Stroke::new(2.0, Color32::from_rgba_unmultiplied(120, 210, 255, 200));
+    let widen = Stroke::new(1.6, Color32::from_rgba_unmultiplied(255, 180, 120, 170));
+    // Cyan slice lanes: vertical (screen-down) with a downward arrowhead.
+    let lanes = 6;
+    for i in 0..lanes {
+        let x = rect.left() + rect.width() * (i as f32 + 0.5) / lanes as f32;
+        let top = Pos2::new(x, rect.top() + rect.height() * 0.12);
+        let bot = Pos2::new(x, rect.top() + rect.height() * 0.88);
+        painter.line_segment([top, bot], slice);
+        painter.line_segment([bot, bot + Vec2::new(-6.0, -9.0)], slice);
+        painter.line_segment([bot, bot + Vec2::new(6.0, -9.0)], slice);
+    }
+    // Amber widen arrow (screen-right) near the top edge.
+    let wy = rect.top() + rect.height() * 0.055;
+    let (wa, wb) = (
+        Pos2::new(rect.left() + rect.width() * 0.12, wy),
+        Pos2::new(rect.left() + rect.width() * 0.30, wy),
+    );
+    painter.line_segment([wa, wb], widen);
+    painter.line_segment([wb, wb + Vec2::new(-9.0, -6.0)], widen);
+    painter.line_segment([wb, wb + Vec2::new(-9.0, 6.0)], widen);
+    painter.text(
+        rect.min + Vec2::new(8.0, 8.0),
+        egui::Align2::LEFT_TOP,
+        "bricks slice ↓ — rotate the terrain to align ridges with these lanes   ·   widen →",
+        egui::FontId::proportional(12.0),
+        Color32::from_rgb(180, 220, 255),
+    );
 }
 
 /// Lay sculpt dabs along a primary-button drag, spaced ~`radius * DAB_SPACING`.
 /// Snapshots the affected rect at stroke start (for undo) and commits it when the
 /// stroke ends.
 fn handle_sculpt_input(state: &mut SculptState, response: &egui::Response, fw: u32, fh: u32) {
-    // Eyedropper pick mode SUPPRESSES brush painting (spec §3): a primary click
-    // samples the hovered cell and routes it, then returns so no dab is laid —
-    // the two never fire on the same click. Reuses the SAME map `Response`
-    // hit-test (no second interact widget).
-    if state.pick_mode {
-        handle_pick_input(state, response);
+    // Alt held = eyedropper (spec §5, Photoshop-style): a primary click/drag
+    // samples the hovered cell's height into the active Set/Flatten target, no dab
+    // — release Alt to sculpt. Reuses the SAME map `Response` hit-test.
+    if response.ctx.input(|i| i.modifiers.alt) {
+        // If a sculpt stroke was in progress and the primary releases this frame
+        // while Alt is now held, COMMIT it first — otherwise its already-applied
+        // dabs are dropped from the undo timeline (audit 2026-06-30). Don't sample
+        // on that release frame (it's the end of a stroke, not a pick).
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
+            commit_stroke(state);
+        } else if (response.clicked_by(egui::PointerButton::Primary)
+            || response.dragged_by(egui::PointerButton::Primary))
+            && let Some(ptr) = response.interact_pointer_pos()
+        {
+            let (cx, cy) = screen_to_cell(state, ptr);
+            state.sample_height_into_target(cx, cy);
+        }
         return;
     }
 
@@ -1974,33 +2290,6 @@ fn handle_sculpt_input(state: &mut SculptState, response: &egui::Response, fw: u
     if response.drag_stopped_by(egui::PointerButton::Primary) {
         commit_stroke(state);
     }
-}
-
-/// Eyedropper pick (spec §3): on a primary click, hit-test the pointer to a cell
-/// via the SAME view transform the brush uses (`screen_to_cell`), sample that
-/// cell's height in meters, and route it by the modifier held at click time
-/// (plain → target, Alt → floor, Ctrl → omit). Only `clicked_by(Primary)` fires
-/// — a middle/secondary drag still pans, and no brush dab is laid (the caller
-/// returned before the sculpt path).
-fn handle_pick_input(state: &mut SculptState, response: &egui::Response) {
-    if !response.clicked_by(egui::PointerButton::Primary) {
-        return;
-    }
-    let Some(ptr) = response.interact_pointer_pos() else { return };
-    let mods = response.ctx.input(|i| i.modifiers);
-    // A held modifier overrides the selector (Ctrl → omit, Alt → floor) when it
-    // registers; otherwise a plain click samples into the chosen `pick_into`
-    // destination. The selector is the reliable path — modifier+click is grabbed
-    // by the compositor on some Wayland setups.
-    let target = if mods.ctrl || mods.alt {
-        pick_target(DragModifiers { ctrl: mods.ctrl, alt: mods.alt })
-    } else {
-        state.pick_into
-    };
-    let (cx, cy) = screen_to_cell(state, ptr);
-    let Some(field) = state.field.as_ref() else { return };
-    let meters = field.sample_cell_meters(cx, cy);
-    state.apply_pick(target, meters);
 }
 
 /// Place a single Stamp primitive at the pressed cell. Fires once per press —
@@ -2735,6 +3024,25 @@ fn start_convert(state: &mut SculptState) {
     // build byte-identical to today.
     let paint_grid = state.paint.clone();
     let palette = state.palette.clone();
+
+    // Bake the preview view-rotation into the export grid: the height field, its
+    // parallel paint grid, AND the zone polygons rotate by the SAME angle onto the
+    // SAME rotated dims (`rotated_dims`), so a feature aligned with the screen-down
+    // slice lanes exports along +Y and the colormap + keep-mask stay registered to
+    // the rotated terrain. θ == 0 leaves all three byte-identical.
+    let (field, zones, paint_grid) = if state.view_rot != 0.0 {
+        let theta = state.view_rot;
+        let (sw, sh) = (field.width, field.height);
+        let (nw, nh) = super::heightfield::rotated_dims(sw, sh, theta);
+        (
+            field.rotated(theta),
+            crate::gui::zones::rotate_zones(&zones, sw, sh, nw, nh, theta),
+            paint_grid.rotated(theta),
+        )
+    } else {
+        (field, zones, paint_grid)
+    };
+
     state.last_outcome = None;
     state.last_error = None;
     state.convert_cancel.store(false, Ordering::Relaxed);
@@ -3140,6 +3448,99 @@ mod tests {
         assert_eq!(both, MODIFIER_FINE, "Ctrl+Alt: Ctrl wins (fine) — documented precedence");
     }
 
+    /// Brush/shape sizes are surfaced in Brickadia studs (the export unit). One
+    /// cell is the smallest brick: footprint `2*hscale*upf` units, 1 stud = 5
+    /// units → `studs_per_cell = 2*hscale*upf/5`. Uses the achieved integer
+    /// hscale, so a sub-1-brick ask snaps up to the 1-brick minimum.
+    #[test]
+    fn studs_per_cell_reflects_achieved_brick_scale() {
+        let meta = |cell_m: f64, spm: f32, micro: bool| FieldMeta {
+            cell_m,
+            studs_per_meter: spm,
+            vertical_exaggeration: 1.0,
+            micro,
+            centroid_lat: 0.0,
+            source_name: String::new(),
+        };
+        // Normal: derive_scale(1.0, 6.0) → hscale 3 → 2*3*5/5 = 6 studs/cell.
+        assert_eq!(studs_per_cell(&meta(1.0, 6.0, false)), 6.0);
+        // Micro reaches the same physical studs via a 5×-finer integer hscale (15).
+        assert_eq!(studs_per_cell(&meta(1.0, 6.0, true)), 6.0);
+        // A sub-1-brick ask clamps hscale to 1 (the minimum brick): 2*1*5/5 = 2.
+        assert_eq!(studs_per_cell(&meta(2.0, 0.5, false)), 2.0);
+    }
+
+    /// Brickadia vertical parity: 1 flat = 4 height-units; 1 brick = 3 flats. The
+    /// meters↔flats round-trip and the "Nb Mf" format/parse must be exact, so a
+    /// height the user types in bricks+flats exports to the matching brick stack.
+    #[test]
+    fn brickadia_height_bricks_flats_round_trip() {
+        // vscale = 4 units/m → 1 m = 1 flat, 3 m = 1 brick.
+        assert_eq!(meters_to_flats(1.0, 4.0), 1.0);
+        assert_eq!(meters_to_flats(3.0, 4.0), 3.0);
+        assert!((flats_to_meters(meters_to_flats(7.5, 4.0), 4.0) - 7.5).abs() < 1e-4);
+        assert_eq!(flats_to_meters(6.0, 0.0), 0.0, "guard div-by-zero vscale");
+        // Format: bricks + flats, suppressing zero parts.
+        assert_eq!(fmt_bricks_flats(7.0), "2b 1f");
+        assert_eq!(fmt_bricks_flats(3.0), "1b");
+        assert_eq!(fmt_bricks_flats(2.0), "2f");
+        assert_eq!(fmt_bricks_flats(0.0), "0f");
+        // Parse: spaced, space-LESS, single units, bare flats, and rejects junk.
+        assert_eq!(parse_bricks_flats("2b 1f"), Some(7.0));
+        assert_eq!(parse_bricks_flats("2b1f"), Some(7.0), "space-less compound must parse");
+        assert_eq!(parse_bricks_flats("1b"), Some(3.0));
+        assert_eq!(parse_bricks_flats("2f"), Some(2.0));
+        assert_eq!(parse_bricks_flats("5"), Some(5.0));
+        assert_eq!(parse_bricks_flats("garbage"), None);
+        assert_eq!(parse_bricks_flats("3 b"), None, "number then space then unit is junk");
+        // Round-trip through format isn't required, but parse∘fmt preserves count.
+        assert_eq!(parse_bricks_flats(&fmt_bricks_flats(7.0)), Some(7.0));
+    }
+
+    /// `cell_to_screen` and `screen_to_cell` must stay exact inverses at ANY view
+    /// rotation — every pointer tool routes through them, so drift here breaks
+    /// every brush/stamp/zone hit-test once the view is rotated.
+    #[test]
+    fn view_transform_inverse_holds_under_rotation() {
+        let mut st = SculptState { pan: egui::vec2(120.0, 80.0), zoom: 6.5, ..Default::default() };
+        for &deg in &[0.0_f32, 30.0, 90.0, 180.0, -47.0] {
+            st.view_rot = deg.to_radians();
+            for &(cx, cy) in &[(0.0_f32, 0.0), (12.3, 4.7), (200.0, 5.0)] {
+                let p = cell_to_screen(&st, cx, cy);
+                let (rx, ry) = screen_to_cell(&st, p);
+                assert!(
+                    (rx - cx).abs() < 1e-2 && (ry - cy).abs() < 1e-2,
+                    "round-trip failed at {deg}° cell ({cx},{cy}) → ({rx},{ry})",
+                );
+            }
+        }
+    }
+
+    /// The scroll-zoom anchor solve (mirrored from `handle_view_input`) keeps the
+    /// cell under the pointer fixed across a zoom change even when rotated.
+    #[test]
+    fn zoom_anchor_keeps_pointer_cell_fixed_under_rotation() {
+        let mut st = SculptState {
+            pan: egui::vec2(50.0, 60.0),
+            zoom: 4.0,
+            view_rot: 35.0_f32.to_radians(),
+            ..Default::default()
+        };
+        let ptr = Pos2::new(300.0, 220.0);
+        let before = screen_to_cell(&st, ptr);
+        // Exactly the anchor math handle_view_input runs on a zoom step.
+        let new_zoom = 7.3_f32;
+        let (cx, cy) = screen_to_cell(&st, ptr);
+        st.zoom = new_zoom;
+        let (rx, ry) = rotate_vec(st.view_rot, cx, cy);
+        st.pan = egui::vec2(ptr.x - rx * new_zoom, ptr.y - ry * new_zoom);
+        let after = screen_to_cell(&st, ptr);
+        assert!(
+            (after.0 - before.0).abs() < 1e-2 && (after.1 - before.1).abs() < 1e-2,
+            "pointer cell drifted across zoom: {before:?} → {after:?}",
+        );
+    }
+
     /// The brush radius/strength SLIDERS consume the same modifier scaling the
     /// DragValues do (spec §2 / DoD §8 "every numeric slider"): their value-box
     /// drag speed is `base_speed` scaled by Ctrl(×0.1)/Alt(×10)/none, via the
@@ -3286,68 +3687,26 @@ mod tests {
     /// the estimate uses, without re-exporting a private constant into the test.
     const RAM_RESERVE_BYTES_LOCAL: u64 = 12 * 1024 * 1024 * 1024;
 
-    /// Eyedropper modifier routing (spec §3): plain ⇒ target, Alt ⇒ floor,
-    /// Ctrl ⇒ omit, and BOTH held ⇒ Ctrl wins (omit) — the documented precedence
-    /// shared with `modifier_step`. Pure routing, no egui context.
+    /// Alt+click eyedropper: sampling a cell writes that cell's height (meters
+    /// above floor) into the active Set/Flatten target. Exercises the pure
+    /// `sample_height_into_target` core the canvas handler calls after mapping the
+    /// pointer to a cell — including the nearest-cell floor for a fractional point.
     #[test]
-    fn pick_target_modifier_routing() {
-        assert_eq!(
-            pick_target(DragModifiers { ctrl: false, alt: false }),
-            PickTarget::Target,
-            "plain click must route to the target height",
-        );
-        assert_eq!(
-            pick_target(DragModifiers { ctrl: false, alt: true }),
-            PickTarget::Floor,
-            "Alt must route to the floor level",
-        );
-        assert_eq!(
-            pick_target(DragModifiers { ctrl: true, alt: false }),
-            PickTarget::Omit,
-            "Ctrl must route to the omit level",
-        );
-        assert_eq!(
-            pick_target(DragModifiers { ctrl: true, alt: true }),
-            PickTarget::Omit,
-            "Ctrl+Alt: Ctrl wins (omit) — documented precedence",
-        );
-    }
-
-    /// Eyedropper end-to-end on real state (spec §3): a pick at a cell samples
-    /// that cell's height in meters and writes it into the level the modifier
-    /// routes to, recording it as `last_pick`. Drives `apply_pick` with the
-    /// sampler the canvas handler uses, so the click → sample → route path is
-    /// exercised without an egui pointer event.
-    #[test]
-    fn eyedropper_samples_cell_meters() {
+    fn alt_sample_sets_target_height() {
         let mut state = SculptState::new();
-        // A field with distinct, known cell heights (meters above floor).
         let mut field = HeightField::flat(4, 4, meta());
         field.set(2, 1, 42.5);
-        field.set(0, 3, 7.0);
         state.set_field(field);
 
-        // The sampler the canvas handler calls returns the hovered cell's meters.
-        let f = state.field.as_ref().unwrap();
-        assert_eq!(f.sample_cell_meters(2.0, 1.0), 42.5);
+        state.sample_height_into_target(2.0, 1.0);
+        assert_eq!(state.target_height, 42.5, "Alt+click samples the hovered height into Set/Flatten");
         // A fractional pointer inside the same cell floors to it (nearest-cell).
-        assert_eq!(f.sample_cell_meters(2.9, 1.1), 42.5);
-
-        // Plain click → target_height.
-        let m = state.field.as_ref().unwrap().sample_cell_meters(2.0, 1.0);
-        state.apply_pick(pick_target(DragModifiers { ctrl: false, alt: false }), m);
-        assert_eq!(state.target_height, 42.5, "plain pick must set the target height");
-        assert_eq!(state.last_pick, Some(42.5), "the sample must be recorded for the readout");
-
-        // Alt click → floor_level_m.
-        let m = state.field.as_ref().unwrap().sample_cell_meters(0.0, 3.0);
-        state.apply_pick(pick_target(DragModifiers { ctrl: false, alt: true }), m);
-        assert_eq!(state.floor_level_m, 7.0, "Alt pick must set the floor level");
-
-        // Ctrl click → omit_below_m.
-        let m = state.field.as_ref().unwrap().sample_cell_meters(2.0, 1.0);
-        state.apply_pick(pick_target(DragModifiers { ctrl: true, alt: false }), m);
-        assert_eq!(state.omit_below_m, 42.5, "Ctrl pick must set the omit-below level");
+        state.target_height = 0.0;
+        state.sample_height_into_target(2.9, 1.1);
+        assert_eq!(state.target_height, 42.5, "fractional pointer samples the same cell");
+        // An untouched cell is at the floor (0 m).
+        state.sample_height_into_target(0.0, 0.0);
+        assert_eq!(state.target_height, 0.0, "an unedited cell samples to the floor");
     }
 
     /// `mark_dirty_rect` unions sub-rects but a pending FULL rebuild (no rect)

@@ -29,6 +29,45 @@ pub(crate) struct Zone {
     pub polygon: Vec<(f32, f32)>,
 }
 
+/// Rotate every zone polygon by `theta` radians (CCW) about the source grid's
+/// centre into the rotated grid's frame, so the cookie-cutter keep-mask still
+/// registers with a [`super::sculpt::heightfield::HeightField::rotated`] /
+/// [`super::sculpt::paint::PaintGrid::rotated`] export. Vertices are corner-frame
+/// cell coordinates, and the height resample rotates the same corner frame about
+/// `(w/2, h/2) → (nw/2, nh/2)`, so this uses the identical transform. `theta == 0`
+/// clones verbatim. `new_w`/`new_h` are the rotated grid dims (from the shared
+/// `rotated_dims`, computed by the caller — `heightfield` is private to `sculpt`).
+pub(crate) fn rotate_zones(
+    zones: &[Zone],
+    src_w: u32,
+    src_h: u32,
+    new_w: u32,
+    new_h: u32,
+    theta: f32,
+) -> Vec<Zone> {
+    if theta == 0.0 {
+        return zones.to_vec();
+    }
+    let (s, c) = theta.sin_cos();
+    let (cs_x, cs_y) = (src_w as f32 * 0.5, src_h as f32 * 0.5);
+    let (co_x, co_y) = (new_w as f32 * 0.5, new_h as f32 * 0.5);
+    zones
+        .iter()
+        .map(|z| Zone {
+            mode: z.mode,
+            polygon: z
+                .polygon
+                .iter()
+                .map(|&(vx, vy)| {
+                    // O = co + R(θ)·(V − cs).
+                    let (dx, dy) = (vx - cs_x, vy - cs_y);
+                    (co_x + dx * c - dy * s, co_y + dx * s + dy * c)
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Row-major (`width * height`) keep-mask: `true` = export this cell. Each cell
 /// is classified at its CENTER `(x + 0.5, y + 0.5)`.
 pub(crate) fn rasterize(zones: &[Zone], width: u32, height: u32) -> Vec<bool> {
@@ -109,6 +148,23 @@ mod tests {
 
     fn at(mask: &[bool], w: u32, x: u32, y: u32) -> bool {
         mask[(y * w + x) as usize]
+    }
+
+    /// Rotating zones by 0 is identity; a +90° turn maps a vertex by the SAME
+    /// corner-frame rotation the height/paint resample uses: `O = co + R(θ)·(V−cs)`.
+    /// For an 8×8 grid (cs=co=(4,4)), vertex (0,0) → (8,0) at +90°. A wrong sign
+    /// (mirror) would send it to (0,8) — so this pins the direction too.
+    #[test]
+    fn rotate_zones_identity_and_90_maps_vertex_no_mirror() {
+        let z = vec![Zone { mode: ZoneMode::Omit, polygon: vec![(0.0, 0.0), (2.0, 0.0), (2.0, 2.0)] }];
+        assert_eq!(rotate_zones(&z, 8, 8, 8, 8, 0.0), z, "θ=0 is identity");
+        let r = rotate_zones(&z, 8, 8, 8, 8, std::f32::consts::FRAC_PI_2);
+        let v = r[0].polygon[0];
+        assert!(
+            (v.0 - 8.0).abs() < 1e-3 && (v.1 - 0.0).abs() < 1e-3,
+            "vertex (0,0) must map to (8,0) at +90° (no mirror), got {v:?}",
+        );
+        assert_eq!(r[0].mode, ZoneMode::Omit, "mode preserved");
     }
 
     #[test]

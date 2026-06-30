@@ -51,5 +51,10 @@ fn install_fonts(ctx: &egui::Context) {
         mono.insert(0, "plex_mono".to_owned());
     }
 
+    // Merge the Phosphor icon glyphs as a fallback in both families, so a
+    // `\u{e...}` codepoint in any label resolves to a line-art icon. Appended
+    // (not index 0), so it never shadows the text faces above.
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+
     ctx.set_fonts(fonts);
 }

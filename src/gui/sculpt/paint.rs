@@ -81,6 +81,36 @@ impl PaintGrid {
         self.cells[(y * self.width + x) as usize]
     }
 
+    /// Bake a view-rotation into the grid, matching [`super::heightfield::HeightField::rotated`]
+    /// EXACTLY (same `rotated_dims`, same source mapping) but NEAREST-neighbour —
+    /// palette indices are categorical and must never be interpolated. Cells that
+    /// fall outside the source become `0` (unpainted). `theta == 0` clones verbatim.
+    pub(crate) fn rotated(&self, theta: f32) -> PaintGrid {
+        if theta == 0.0 {
+            return self.clone();
+        }
+        let (new_w, new_h) = super::heightfield::rotated_dims(self.width, self.height, theta);
+        let (s, c) = theta.sin_cos();
+        let (hw, hh) = (self.width as f32 * 0.5, self.height as f32 * 0.5);
+        let (oc_x, oc_y) = (new_w as f32 * 0.5, new_h as f32 * 0.5);
+        let (mw, mh) = (self.width as i64, self.height as i64);
+        let mut cells = vec![0u8; (new_w as usize) * (new_h as usize)];
+        for oy in 0..new_h {
+            for ox in 0..new_w {
+                let px = ox as f32 + 0.5 - oc_x;
+                let py = oy as f32 + 0.5 - oc_y;
+                // Same inverse map as HeightField::rotated; nearest source cell.
+                let sx = ((px * c + py * s) + hw - 0.5).round() as i64;
+                let sy = ((-px * s + py * c) + hh - 0.5).round() as i64;
+                if sx >= 0 && sy >= 0 && sx < mw && sy < mh {
+                    cells[(oy * new_w + ox) as usize] =
+                        self.cells[(sy as usize) * (self.width as usize) + sx as usize];
+                }
+            }
+        }
+        PaintGrid { width: new_w, height: new_h, cells }
+    }
+
     /// Fill the resolution block of side `r` containing cell `(x, y)` with `idx`,
     /// clamped to the grid edge. `r = 1` sets a single cell; larger `r` paints
     /// blocky R×R splat regions (coarser color = fewer brick color-splits).
@@ -281,6 +311,32 @@ fn dominant_channel(p: [u8; 4]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The paint grid rotates onto the EXACT dims the height field does (so the
+    /// colormap stays registered), nearest-neighbour preserves palette indices
+    /// without inventing blended values, and θ=0 is identity.
+    #[test]
+    fn rotated_paint_matches_field_dims_and_nearest_preserves_indices() {
+        let mut g = PaintGrid::blank(9, 9);
+        for y in 3..6 {
+            for x in 3..6 {
+                g.cells[(y * 9 + x) as usize] = 7; // a 3×3 block of index 7
+            }
+        }
+        let theta = std::f32::consts::FRAC_PI_2;
+        let r = g.rotated(theta);
+        assert_eq!(
+            (r.width, r.height),
+            super::super::heightfield::rotated_dims(9, 9, theta),
+            "paint must land on the same rotated dims as the field",
+        );
+        assert_eq!(g.rotated(0.0), g, "θ=0 is a verbatim clone");
+        assert!(r.cells.contains(&7), "painted index survives rotation");
+        assert!(
+            r.cells.iter().all(|&i| i == 0 || i == 7),
+            "nearest-neighbour must not interpolate categorical indices",
+        );
+    }
 
     /// An all-unpainted grid resolves every cell to the palette's slot-0 color,
     /// which equals `DEFAULT_BRICK_COLOR` — the byte-identity guard: a no-paint

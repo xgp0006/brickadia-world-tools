@@ -13,6 +13,8 @@ const SURFACE_HOVER: Color32 = Color32::from_rgb(0x35, 0x3F, 0x4D);
 const ACCENT_EMBER: Color32 = Color32::from_rgb(0xC8, 0x64, 0x3C);
 const ACCENT_EMBER_DIM: Color32 = Color32::from_rgb(0x8E, 0x4A, 0x2C);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xE4, 0xE0, 0xD2);
+/// High-contrast text on the ember selected-fill (legibility fix).
+const TEXT_SELECTED: Color32 = Color32::from_rgb(0xFF, 0xF6, 0xEE);
 const STROKE_DIM: Color32 = Color32::from_rgb(0x3A, 0x42, 0x4E);
 
 /// Install the heightmap2brz visuals palette on the given egui context.
@@ -53,8 +55,11 @@ pub fn install_theme(ctx: &egui::Context) {
     visuals.widgets.open.fg_stroke = Stroke::new(1.0, ACCENT_EMBER);
     visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT_EMBER_DIM);
 
-    visuals.selection.bg_fill = ACCENT_EMBER_DIM;
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT_EMBER);
+    // Selected widgets (selectable_label/value): a SOLID bright-ember fill with
+    // near-white text. egui paints a selected label's text in `selection.stroke`,
+    // so the old ember-on-dim-ember was unreadable — this is the contrast fix.
+    visuals.selection.bg_fill = ACCENT_EMBER;
+    visuals.selection.stroke = Stroke::new(1.0, TEXT_SELECTED);
     visuals.hyperlink_color = ACCENT_EMBER;
     visuals.warn_fg_color = Color32::from_rgb(0xE6, 0xB7, 0x4F);
     visuals.error_fg_color = Color32::from_rgb(0xE6, 0x6E, 0x52);
@@ -68,6 +73,8 @@ pub fn install_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// The ember accent — for section headers and in-palette accents.
+pub(crate) const ACCENT: Color32 = ACCENT_EMBER;
 /// Bbox overlay stroke color — re-exported so map_tab.rs draws in palette.
 pub(crate) const BBOX_STROKE: Color32 = ACCENT_EMBER;
 /// Bbox overlay fill color (low alpha so the underlying tiles show through).
