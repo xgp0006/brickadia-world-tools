@@ -231,7 +231,6 @@
   function onPointerDown(ev: PointerEvent) {
     if (!session || ev.button !== 0) return;
     painting = true;
-    strokeStarted = true;
     canvasEl?.setPointerCapture(ev.pointerId);
     void applyAt(ev, true);
   }
@@ -244,7 +243,6 @@
   function onPointerUp(ev: PointerEvent) {
     if (!painting) return;
     painting = false;
-    strokeStarted = false;
     try {
       canvasEl?.releasePointerCapture(ev.pointerId);
     } catch {
