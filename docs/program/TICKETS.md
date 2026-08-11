@@ -54,10 +54,10 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 
 | ID | Title | Status |
 |----|-------|--------|
-| BWT-4.1 | Heightfield document model API (load DEM/PNG, ops, export) | todo |
-| BWT-4.2 | WebGL/canvas height preview | todo |
-| BWT-4.3 | Raise/Lower/Smooth/Flatten/Set | todo |
-| BWT-4.4 | Export via convert path | todo |
+| BWT-4.1 | Heightfield document model API (load DEM/PNG, ops, export) | done |
+| BWT-4.2 | WebGL/canvas height preview | done |
+| BWT-4.3 | Raise/Lower/Smooth/Flatten/Set | done |
+| BWT-4.4 | Export via convert path | done |
 | BWT-4.5 | Stamps, paint, zones, layers parity | todo |
 
 ## Phase 5 — Cutover

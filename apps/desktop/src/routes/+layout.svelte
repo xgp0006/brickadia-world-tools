@@ -12,6 +12,7 @@
     <div class="tabs">
       <a href="/" class:active={path === "/" || path === "/convert"}>Convert</a>
       <a href="/map" class:active={path.startsWith("/map")}>Map</a>
+      <a href="/sculpt" class:active={path.startsWith("/sculpt")}>Sculpt</a>
     </div>
   </nav>
   <div class="body">

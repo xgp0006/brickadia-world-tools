@@ -92,7 +92,8 @@ Progress: Tauri events `build:progress { phase, frac }` (mirror current channel)
 | Workspace | **Done** — members `.` + `apps/desktop/src-tauri` |
 | Tauri + Svelte Convert UI | **Phase 2** — dialog browse + `convert:progress` events |
 | Deno package manager | **Done** — `deno task *` (not npm) |
-| Map / Sculpt UI | Not started (core 3DEP fetch is on **egui** Map) |
+| Map UI | Phase 3 — MapLibre + bbox + dem_fetch_build (grid/tile still egui) |
+| Sculpt UI | Phase 4 MVP — `/sculpt` + `api::sculpt` (raise/lower/smooth/export; 4.5 parity later) |
 | Program PRDs | **docs/program/** — phases 0–5 + tickets BWT-* |
 
 Canonical phase order + tickets: [program/PROGRAM.md](./program/PROGRAM.md).

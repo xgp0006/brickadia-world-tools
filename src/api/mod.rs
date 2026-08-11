@@ -9,6 +9,8 @@ pub mod install;
 
 #[cfg(feature = "dem")]
 pub mod dem_build;
+#[cfg(feature = "dem")]
+pub mod sculpt;
 
 pub use convert::{
     BrickModeDto, ConvertProgress, ConvertRequest, ConvertResult, convert_heightmap,
@@ -21,6 +23,13 @@ pub use install::{
 
 #[cfg(feature = "dem")]
 pub use dem_build::{DemBuildProgress, DemBuildRequest, DemBuildResult, dem_fetch_build};
+#[cfg(feature = "dem")]
+pub use sculpt::{
+    SculptCreateBlankRequest, SculptExportRequest, SculptExportResult, SculptLoadPngRequest,
+    SculptPreview, SculptProgress, SculptSessionInfo, SculptStrokeRequest, SculptToolDto,
+    sculpt_apply_stroke, sculpt_close, sculpt_create_blank, sculpt_export, sculpt_info,
+    sculpt_load_png, sculpt_preview, sculpt_undo,
+};
 
 /// Crate version string for shell "about" / health checks.
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");

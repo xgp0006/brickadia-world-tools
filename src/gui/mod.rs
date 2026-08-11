@@ -46,8 +46,10 @@ mod grid_ui;
 mod map_tab;
 #[cfg(feature = "gui")]
 mod preview_source;
-#[cfg(feature = "gui")]
-mod sculpt;
+// Pure heightfield/brush/tools compile under `dem` (Tauri Sculpt API).
+// egui tab + paint/zones convert path stay `gui`-gated inside the module.
+#[cfg(feature = "dem")]
+pub(crate) mod sculpt;
 #[cfg(feature = "gui")]
 mod theme;
 #[cfg(feature = "gui")]

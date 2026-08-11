@@ -1,10 +1,11 @@
 //! Tauri shell for Brickadia World Tools.
-//! Phase 2: Convert with progress, install-to-Worlds, dialogs.
-//! Phase 3: Map DEM fetch+build (`dem_fetch_build` + `build:progress`).
+//! Phase 2: Convert · Phase 3: Map · Phase 4: Sculpt MVP.
 
 use heightmap::api::{
     self, ConvertProgress, ConvertRequest, ConvertResult, DemBuildProgress, DemBuildRequest,
-    DemBuildResult, DemPredictRequest, DemPredictResult,
+    DemBuildResult, DemPredictRequest, DemPredictResult, SculptCreateBlankRequest,
+    SculptExportRequest, SculptExportResult, SculptLoadPngRequest, SculptPreview, SculptProgress,
+    SculptSessionInfo, SculptStrokeRequest,
 };
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
@@ -28,7 +29,6 @@ fn dem_predict(request: DemPredictRequest) -> Result<DemPredictResult, String> {
 
 /// Convert heightmap (+ optional colormap) → `.brdb` / `.brz`.
 /// Emits `convert:progress` with [`ConvertProgress`] during the run.
-/// Optional install into Brickadia Worlds is soft-fail (see result fields).
 #[tauri::command]
 async fn convert_build(
     app: AppHandle,
@@ -74,6 +74,62 @@ fn install_save(path: String, overwrite: bool) -> Result<String, String> {
         .map(|p| p.display().to_string())
 }
 
+// ── Sculpt (Phase 4 MVP) ────────────────────────────────────────────────────
+
+#[tauri::command]
+fn sculpt_create_blank(request: SculptCreateBlankRequest) -> Result<SculptSessionInfo, String> {
+    api::sculpt_create_blank(request)
+}
+
+#[tauri::command]
+fn sculpt_load_png(request: SculptLoadPngRequest) -> Result<SculptSessionInfo, String> {
+    api::sculpt_load_png(request)
+}
+
+#[tauri::command]
+fn sculpt_close(session_id: u64) -> Result<(), String> {
+    api::sculpt_close(session_id)
+}
+
+#[tauri::command]
+fn sculpt_info(session_id: u64) -> Result<SculptSessionInfo, String> {
+    api::sculpt_info(session_id)
+}
+
+#[tauri::command]
+fn sculpt_preview(session_id: u64) -> Result<SculptPreview, String> {
+    api::sculpt_preview(session_id)
+}
+
+#[tauri::command]
+fn sculpt_apply_stroke(request: SculptStrokeRequest) -> Result<SculptSessionInfo, String> {
+    api::sculpt_apply_stroke(request)
+}
+
+#[tauri::command]
+fn sculpt_undo(session_id: u64) -> Result<SculptSessionInfo, String> {
+    api::sculpt_undo(session_id)
+}
+
+/// Mesh session → `.brdb`. Emits `sculpt:progress` during the run.
+#[tauri::command]
+async fn sculpt_export(
+    app: AppHandle,
+    request: SculptExportRequest,
+) -> Result<SculptExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        api::sculpt_export(
+            request,
+            move |p: SculptProgress| {
+                let _ = app.emit("sculpt:progress", &p);
+            },
+            || false,
+        )
+    })
+    .await
+    .map_err(|e| format!("sculpt export task failed: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -86,6 +142,14 @@ pub fn run() {
             dem_predict,
             dem_fetch_build,
             install_save,
+            sculpt_create_blank,
+            sculpt_load_png,
+            sculpt_close,
+            sculpt_info,
+            sculpt_preview,
+            sculpt_apply_stroke,
+            sculpt_undo,
+            sculpt_export,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
