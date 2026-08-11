@@ -1,9 +1,21 @@
 # F3 — Streaming / columnar mesher
 
 **Ticket:** BWT-F3  
-**Status:** Spec + implementation plan fleshed 2026-08-11 — **code not started**  
-**Priority:** After Grid (shipped). Unlocks multi-M cells in a **single** box without auto-coarsen.  
-**Related:** `MAX_DEM_CELLS` in `src/gui/tiles.rs` · `build_planes` / `mesh_planes` in `src/opt/generate.rs` · Grid already tiles **area** (orthogonal)
+**Status:** **Phase A1–A2 + Auto shipped 2026-08-11** (strip streaming). Spec below remains the design record.  
+**Priority:** After Grid (shipped). Unlocks larger single-box meshes without full-width plane RAM.  
+**Related:** `MAX_DEM_CELLS` in `src/gui/tiles.rs` · `build_planes` / `mesh_planes` / `gen_greedy_heightmap_strips` in `src/opt/generate.rs` · Grid already tiles **area** (orthogonal)
+
+### Implementation status
+
+| Item | State |
+|------|--------|
+| `GenOptions.streaming_mesh` (default false) | Done |
+| Strip path `STREAMING_STRIP_COLS=128` | Done |
+| Auto-on when DEM cells > 150k (`generate_bricks`) | Done |
+| Tests: wide plateau inflation ≤1.5× | Done |
+| `MAX_DEM_CELLS` 800k | Done |
+| Phase B color bucketing | Not done |
+| Phase C out-of-core bricks | Not done |
 
 ---
 

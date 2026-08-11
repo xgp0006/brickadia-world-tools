@@ -48,7 +48,7 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 | BWT-3.6 | DEM source picker (Terrarium/Mapbox/OpenTopo/3DEP) + keys | done |
 | BWT-3.7 | Install + overwrite + output name | done |
 | BWT-3.8 | Grid/tile path (or link “use Grid in egui until…”) | done |
-| BWT-3.9 | Phase 3 exit: one US 3DEP + one Terrarium world installed | ready (see F5-FLATS-AND-IN-GAME.md §3) |
+| BWT-3.9 | Phase 3 exit: one US 3DEP + one Terrarium world installed | tooling ready — **load Worlds/exit-terrarium + flats-cal-1b** |
 
 ## Phase 4 — Sculpt
 
@@ -66,8 +66,8 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 |----|-------|--------|
 | BWT-5.1 | Desktop entry → Tauri binary | done |
 | BWT-5.2 | Symlink `brickadia-world-tools-gui` dual-run period | done |
-| BWT-5.3 | Archive egui bin behind feature or docs-only | todo |
-| BWT-5.4 | README single-path user docs | doing |
+| BWT-5.3 | Archive egui bin behind feature or docs-only | deferred (dual-run is product choice) |
+| BWT-5.4 | README single-path user docs | done |
 
 ## Fidelity track
 
@@ -76,14 +76,14 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 | BWT-F0 | Downsample rename + window + tooltips | done |
 | BWT-F1 | MAX_DEM_CELLS 400k + USGS 3DEP wire | done |
 | BWT-F2 | OpenTopo COP30 (or extra demtype) | done |
-| BWT-F3 | Streaming/columnar mesher design + impl | design complete — impl pending (F3-STREAMING-MESHER.md) |
+| BWT-F3 | Streaming/columnar mesher design + impl | **done** (Phase A strip + auto; B/C later) |
 | BWT-F4 | Upstream wedge/hdmap selective harvest | done |
-| BWT-F5 | In-game FLATS_PER_BRICK confirm | ready (F5-FLATS-AND-IN-GAME.md §4 + brick_units) |
+| BWT-F5 | In-game FLATS_PER_BRICK confirm | **fixture installed** — user measure `flats-cal-1b` |
 
 ## House / process
 
 | ID | Title | Status |
 |----|-------|--------|
-| BWT-H1 | Clippy -D warnings CI | todo |
-| BWT-H2 | Program PRDs fleshed (this tree) | doing |
-| BWT-H3 | Vault tickets mirrored | todo |
+| BWT-H1 | Clippy -D warnings CI | deferred (pre-existing f32 warnings) |
+| BWT-H2 | Program PRDs fleshed (this tree) | done |
+| BWT-H3 | Vault tickets mirrored | done |

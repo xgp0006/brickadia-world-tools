@@ -37,7 +37,10 @@ pub(crate) const TILE_SIZE_PX: u32 = 256;
 /// the upgrade path is reworking opt/generate.rs's per-(height,color)-plane model.
 /// `pub(crate)` so build.rs can backstop the OpenTopography single-shot GeoTIFF
 /// path, which bypasses `pick_zoom`.
-pub(crate) const MAX_DEM_CELLS: u64 = 400_000;
+/// Soft mesh budget for `pick_zoom` / OpenTopo / 3DEP. Raised 400k→800k with F3
+/// strip streaming (large grids auto-stream in `generate_bricks`). Unique-color
+/// worst case still coarsens rather than OOM on 16 GB hosts.
+pub(crate) const MAX_DEM_CELLS: u64 = 800_000;
 const MIN_ZOOM: u32 = 1;
 const MAX_ZOOM: u32 = 18;
 /// Web Mercator latitude limit — the slippy-map tile grid is undefined beyond it.

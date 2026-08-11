@@ -266,6 +266,9 @@ fn optimize_linear<F: Fn(f32) -> bool>(
 /// offset (units) instead of being centered on the origin — grid mode passes a
 /// per-tile world offset so tiles abut. `None` defaults to exactly
 /// `-(width*size), -(height*size)`, byte-identical to the prior centering.
+/// Column strip width for F3 streaming mesh (cells).
+pub const STREAMING_STRIP_COLS: u32 = 128;
+
 pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     heightmap: &dyn Heightmap,
     colormap: &dyn Colormap,
@@ -284,7 +287,6 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
     }
     progress!(0.0);
 
-    info!("Building greedy mesh planes");
     let (width, height) = heightmap.size();
 
     if colormap.size() != heightmap.size() {
@@ -303,6 +305,23 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
             (width as usize) * (height as usize),
         ));
     }
+
+    if options.streaming_mesh && width > STREAMING_STRIP_COLS {
+        info!(
+            "Streaming greedy mesh: {width}×{height} in strips of {STREAMING_STRIP_COLS} cols"
+        );
+        return gen_greedy_heightmap_strips(
+            heightmap,
+            colormap,
+            options,
+            base_height_override,
+            offset,
+            progress_f,
+            keep_mask,
+        );
+    }
+
+    info!("Building greedy mesh planes");
 
     let pairs_vec = collect_height_color_pairs(heightmap, colormap, options.cull);
     // Lowest height present, used as the common base plane each terrain column
@@ -367,6 +386,145 @@ pub fn gen_greedy_heightmap<F: Fn(f32) -> bool>(
 
     progress!(1.0);
     Ok(all_bricks)
+}
+
+/// F3 strip path: mesh vertical bands of columns so plane storage stays O(strip)
+/// rather than O(full width × unique colors).
+fn gen_greedy_heightmap_strips<F: Fn(f32) -> bool>(
+    heightmap: &dyn Heightmap,
+    colormap: &dyn Colormap,
+    options: GenOptions,
+    base_height_override: Option<u32>,
+    offset: Option<(i32, i32)>,
+    progress_f: F,
+    keep_mask: Option<&[bool]>,
+) -> Result<Vec<Brick>, String> {
+    let (width, height) = heightmap.size();
+    let size_i = i32::from(options.size);
+    let (base_ox, base_oy) = offset.unwrap_or((-(width as i32) * size_i, -(height as i32) * size_i));
+
+    debug_assert!(
+        !options.skip_floor || base_height_override.is_some(),
+        "skip_floor implies explicit base_override in streaming path",
+    );
+
+    // Global floor for fill_to_base must match single-pass semantics.
+    let min_height = base_height_override.unwrap_or_else(|| {
+        let mut min_h = u32::MAX;
+        for x in 0..width {
+            for y in 0..height {
+                let h = heightmap.at(x, y);
+                let c = colormap.at(x, y);
+                if !options.cull || (h > 0 && c[3] > 0) {
+                    min_h = min_h.min(h);
+                }
+            }
+        }
+        if min_h == u32::MAX { 0 } else { min_h }
+    });
+
+    let max_quad_size =
+        (u32::from(options.max_brick_units) / u32::from(options.size).max(1)).max(1);
+
+    let n_strips = width.div_ceil(STREAMING_STRIP_COLS).max(1);
+    let mut all_bricks = Vec::new();
+    let mut strip_i = 0u32;
+
+    let mut x0 = 0u32;
+    while x0 < width {
+        if !progress_f(0.05 + 0.9 * (strip_i as f32 / n_strips as f32)) {
+            return Err(CANCELLED_MSG.to_string());
+        }
+        let x1 = (x0 + STREAMING_STRIP_COLS).min(width);
+        let win_h = WindowedHeightmap {
+            inner: heightmap,
+            x0,
+            x1,
+        };
+        let win_c = WindowedColormap {
+            inner: colormap,
+            x0,
+            x1,
+        };
+        let sub_mask_owned: Option<Vec<bool>> = keep_mask.map(|m| {
+            let sw = (x1 - x0) as usize;
+            let h = height as usize;
+            let w = width as usize;
+            let mut out = vec![false; sw * h];
+            for y in 0..h {
+                for xi in 0..sw {
+                    out[y * sw + xi] = m[y * w + x0 as usize + xi];
+                }
+            }
+            out
+        });
+        let sub_mask = sub_mask_owned.as_deref();
+
+        let pairs_vec = collect_height_color_pairs(&win_h, &win_c, options.cull);
+        if pairs_vec.is_empty() {
+            x0 = x1;
+            strip_i += 1;
+            continue;
+        }
+        let (planes, _) =
+            build_planes(&win_h, &win_c, options.cull, pairs_vec, sub_mask);
+        let strip_w = x1 - x0;
+        let (all_quads, _) = mesh_planes(planes, strip_w, height, max_quad_size);
+        // Shift strip-local quads into full-map X: +x0 * (2*size) on offset.
+        let strip_offset = (base_ox + (x0 as i32) * size_i * 2, base_oy);
+        let (bricks, _) = quads_to_bricks(
+            all_quads,
+            &options,
+            strip_w,
+            height,
+            min_height,
+            Some(strip_offset),
+            &progress_f,
+        )?;
+        all_bricks.extend(bricks);
+        x0 = x1;
+        strip_i += 1;
+    }
+
+    if !progress_f(1.0) {
+        return Err(CANCELLED_MSG.to_string());
+    }
+    info!(
+        "Streaming greedy mesh: {} bricks from {n_strips} strips",
+        all_bricks.len()
+    );
+    Ok(all_bricks)
+}
+
+/// Heightmap view of columns `[x0, x1)` — strip meshing (F3).
+struct WindowedHeightmap<'a> {
+    inner: &'a dyn Heightmap,
+    x0: u32,
+    x1: u32,
+}
+
+impl Heightmap for WindowedHeightmap<'_> {
+    fn at(&self, x: u32, y: u32) -> u32 {
+        self.inner.at(self.x0 + x, y)
+    }
+    fn size(&self) -> (u32, u32) {
+        (self.x1 - self.x0, self.inner.size().1)
+    }
+}
+
+struct WindowedColormap<'a> {
+    inner: &'a dyn Colormap,
+    x0: u32,
+    x1: u32,
+}
+
+impl Colormap for WindowedColormap<'_> {
+    fn at(&self, x: u32, y: u32) -> [u8; 4] {
+        self.inner.at(self.x0 + x, y)
+    }
+    fn size(&self) -> (u32, u32) {
+        (self.x1 - self.x0, self.inner.size().1)
+    }
 }
 
 /// Collect every unique (height, color) combination present in the maps,
@@ -675,6 +833,7 @@ mod tests {
             skip_floor: false,
             omit_below_h: 0,
             max_brick_units: crate::opt::MAX_BRICK_UNITS,
+            streaming_mesh: false,
         }
     }
 
@@ -1103,6 +1262,57 @@ mod tests {
         .expect("all-true mesh");
         assert!(!none.is_empty(), "fixture must emit bricks");
         assert_eq!(geom_of(&none), geom_of(&masked), "all-true mask == None");
+    }
+
+    /// F3: flag off stays on global path — width > strip still identical when false.
+    #[test]
+    fn streaming_mesh_false_is_stable_on_wide_plateau() {
+        let map = UniformMap {
+            width: STREAMING_STRIP_COLS + 40,
+            height: 32,
+        };
+        let mut opts = mask_test_options();
+        opts.streaming_mesh = false;
+        let global = gen_greedy_heightmap(
+            &map, &map, opts, Some(0), Some((0, 0)), |_| true, None,
+        )
+        .expect("global");
+        let mut opts2 = mask_test_options();
+        opts2.streaming_mesh = false;
+        let global2 = gen_greedy_heightmap(
+            &map, &map, opts2, Some(0), Some((0, 0)), |_| true, None,
+        )
+        .expect("global2");
+        assert_eq!(geom_of(&global), geom_of(&global2));
+        assert!(!global.is_empty());
+    }
+
+    #[test]
+    fn streaming_mesh_covers_wide_plateau_without_empty() {
+        let w = STREAMING_STRIP_COLS + 40;
+        let h = 32u32;
+        let map = UniformMap { width: w, height: h };
+        let mut opts = mask_test_options();
+        opts.streaming_mesh = true;
+        let bricks = gen_greedy_heightmap(
+            &map, &map, opts, Some(0), Some((0, 0)), |_| true, None,
+        )
+        .expect("stream");
+        assert!(!bricks.is_empty(), "streaming must emit bricks");
+        // Monochrome plateau: strip path should not explode past 2× global.
+        let mut opts_g = mask_test_options();
+        opts_g.streaming_mesh = false;
+        let global = gen_greedy_heightmap(
+            &map, &map, opts_g, Some(0), Some((0, 0)), |_| true, None,
+        )
+        .expect("global");
+        let ratio = bricks.len() as f64 / global.len().max(1) as f64;
+        assert!(
+            ratio <= 1.5,
+            "strip brick inflation {ratio:.2}× (stream {} vs global {})",
+            bricks.len(),
+            global.len()
+        );
     }
 
     #[test]

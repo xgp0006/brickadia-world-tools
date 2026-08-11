@@ -359,6 +359,7 @@ mod tests {
             skip_floor: false,
             omit_below_h: 0,
             max_brick_units: crate::opt::MAX_BRICK_UNITS,
+            streaming_mesh: false,
         }
     }
 

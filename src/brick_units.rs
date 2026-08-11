@@ -147,4 +147,86 @@ mod tests {
         let f = meters_to_flats(m, v);
         assert!((flats_to_meters(f, v) - m).abs() < 1e-5);
     }
+
+    /// Write a tiny calibration world for in-game FLATS check (BWT-F5).
+    /// Plateau of height h corresponding to UI `1b` at vscale=1 (h=12).
+    /// Run: `cargo test --lib write_flats_calibration_world -- --ignored --nocapture`
+    #[test]
+    #[ignore = "writes builds/flats-cal-1b.brdb for manual in-game measure"]
+    fn write_flats_calibration_world() {
+        use crate::map::{Colormap, Heightmap};
+        use crate::opt::gen_greedy_heightmap;
+        use crate::util::{bricks_to_save, write_save, GenOptions};
+        use brdb::assets::bricks::PB_DEFAULT_SMOOTH_TILE;
+
+        struct Plateau {
+            w: u32,
+            h: u32,
+            height: u32,
+        }
+        impl Heightmap for Plateau {
+            fn at(&self, _x: u32, _y: u32) -> u32 {
+                self.height
+            }
+            fn size(&self) -> (u32, u32) {
+                (self.w, self.h)
+            }
+        }
+        impl Colormap for Plateau {
+            fn at(&self, _x: u32, _y: u32) -> [u8; 4] {
+                [180, 180, 160, 255]
+            }
+            fn size(&self) -> (u32, u32) {
+                (self.w, self.h)
+            }
+        }
+
+        // UI 1b @ vscale=1 → 12 m → h = round(12 * 1) = 12 with scale=1 fill.
+        let h = (meters_for_one_brick_ui(1.0)).round() as u32;
+        assert_eq!(h, 12);
+        let map = Plateau {
+            w: 16,
+            h: 16,
+            height: h,
+        };
+        let opts = GenOptions {
+            size: 5,
+            scale: 1,
+            asset: PB_DEFAULT_SMOOTH_TILE,
+            cull: false,
+            micro: false,
+            stud: false,
+            snap: false,
+            img: false,
+            glow: false,
+            hdmap: false,
+            lrgb: false,
+            nocollide: false,
+            quadtree: false,
+            greedy: true,
+            fill_to_base: true,
+            skip_floor: false,
+            omit_below_h: 0,
+            max_brick_units: crate::opt::MAX_BRICK_UNITS,
+            streaming_mesh: false,
+        };
+        let bricks = gen_greedy_heightmap(&map, &map, opts, Some(0), None, |_| true, None)
+            .expect("mesh");
+        let dir = dirs::data_dir()
+            .expect("data_dir")
+            .join("heightmap2brz")
+            .join("builds");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("flats-cal-1b.brdb");
+        write_save(path.to_str().unwrap(), bricks).expect("write");
+        eprintln!(
+            "BWT-F5 fixture: wrote {} — load in Brickadia; pad should read as 1 brick (3 flats) if FLATS_PER_BRICK=3",
+            path.display()
+        );
+        // Try install (soft)
+        match crate::api::install_save(&path, true) {
+            Ok(p) => eprintln!("Installed to {}", p.display()),
+            Err(e) => eprintln!("Install skipped/failed (ok if no prefix): {e}"),
+        }
+    }
 }

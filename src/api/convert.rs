@@ -143,6 +143,7 @@ impl ConvertRequest {
             skip_floor: false,
             omit_below_h: 0,
             max_brick_units: MAX_BRICK_UNITS,
+            streaming_mesh: false,
         }
     }
 }

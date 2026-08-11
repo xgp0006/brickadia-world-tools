@@ -1,8 +1,21 @@
 # F5 + BWT-3.9 — In-game exit proof & FLATS_PER_BRICK calibration
 
 **Tickets:** BWT-F5 (FLATS), BWT-3.9 (Phase 3 exit: Terrarium + 3DEP worlds load)  
-**Status:** Procedure fleshed 2026-08-11 — **needs human in Brickadia**  
+**Status:** Procedure + fixtures ready 2026-08-11 — **needs human eyes in Brickadia**  
 **Game:** Steam APPID **2199420** (Proton)
+
+### Pre-staged for you (this host)
+
+| World | Location | Purpose |
+|-------|----------|---------|
+| **`flats-cal-1b`** | `…/Saved/Worlds/flats-cal-1b.brdb` | 16×16 plateau at UI **1b** height (h=12 @ vscale 1) |
+| **`exit-terrarium`** | Worlds/ (if copy succeeded) or `builds/smoke-terrarium.brdb` | Terrarium load smoke |
+
+Regenerate flats fixture:
+
+```bash
+cargo test --lib write_flats_calibration_world -- --ignored --nocapture
+```
 
 ---
 

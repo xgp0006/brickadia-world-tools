@@ -119,6 +119,7 @@ fn options_from_matches(matches: &ArgMatches) -> GenOptions {
         // CLI never omits columns (skip_floor is off); the threshold is inert.
         omit_below_h: 0,
         max_brick_units: heightmap::opt::MAX_BRICK_UNITS,
+            streaming_mesh: false,
     }
 }
 

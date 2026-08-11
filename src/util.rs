@@ -53,6 +53,11 @@ pub struct GenOptions {
     /// is user-tunable in the sculpt export (lower until holes vanish; the mesher
     /// makes a range of sizes up to it). Defaults to [`crate::opt::MAX_BRICK_UNITS`].
     pub max_brick_units: u16,
+    /// Greedy path: mesh in vertical strips (F3 streaming) so peak RAM does not
+    /// scale with unique (height,color) planes over the full width. Default
+    /// **false** keeps legacy single-pass greedy **byte-identical**. When true,
+    /// brick count may rise slightly at strip seams (see F3-STREAMING-MESHER).
+    pub streaming_mesh: bool,
 }
 
 impl GenOptions {

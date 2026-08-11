@@ -76,6 +76,9 @@ pub struct DemBuildRequest {
     pub omit_below_m: f32,
     #[serde(default)]
     pub floor_level_m: f32,
+    /// Force F3 strip meshing. `None` = auto (on when predicted cells > 150k).
+    #[serde(default)]
+    pub streaming_mesh: Option<bool>,
 }
 
 /// Progress snapshot (phase labels match egui `BuildStage::label`).
@@ -271,6 +274,7 @@ mod tests {
                 no_collision: false,
                 omit_below_m: 0.0,
                 floor_level_m: 0.0,
+                streaming_mesh: None,
             },
             |_| {},
             || false,

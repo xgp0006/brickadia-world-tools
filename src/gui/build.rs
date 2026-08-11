@@ -1134,6 +1134,12 @@ pub(crate) fn generate_bricks_skip_floor(
         // User-tunable max brick footprint (units). Caps greedy merges so no brick
         // exceeds Brickadia's in-game render limit (oversized bricks → holes).
         max_brick_units,
+        // F3: strip-stream large DEMs so unique-color plane RAM stays bounded.
+        // Small maps keep global greedy (byte-stable vs historical path).
+        streaming_mesh: {
+            let (dw, dh) = heightmap.size();
+            u64::from(dw) * u64::from(dh) > 150_000
+        },
     };
     let cancel_check = move |f: f32| -> bool {
         progress(BuildStage::GeneratingBricks, f);
@@ -1726,6 +1732,7 @@ mod tests {
             skip_floor: false,
             omit_below_h: 0,
             max_brick_units: crate::opt::MAX_BRICK_UNITS,
+            streaming_mesh: false,
         };
         let bricks =
             crate::opt::gen_opt_heightmap(&heightmap, &cm, options, None, None, |_| true).expect("gen");
