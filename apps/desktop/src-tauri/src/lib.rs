@@ -221,6 +221,21 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // MapLibre attribution / any <a href="https://…"> must not navigate the
+        // WebView away from the app — open in the system browser instead.
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("external-links")
+                .on_navigation(|_webview, url| {
+                    let scheme = url.scheme();
+                    if scheme == "http" || scheme == "https" || scheme == "mailto" {
+                        let _ = tauri_plugin_opener::open_url(url.as_str(), None::<&str>);
+                        return false;
+                    }
+                    // Allow app assets, tauri, and Vite dev server.
+                    true
+                })
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             core_version,
             builds_dir,

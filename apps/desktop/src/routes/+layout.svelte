@@ -1,9 +1,33 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { page } from "$app/stores";
+  import { openUrl } from "@tauri-apps/plugin-opener";
 
   let { children } = $props();
 
   const path = $derived($page.url.pathname);
+
+  // MapLibre attribution + any external <a> must not navigate the WebView.
+  onMount(() => {
+    const onClick = (e: MouseEvent) => {
+      const t = e.target;
+      if (!(t instanceof Element)) return;
+      const a = t.closest("a");
+      if (!a) return;
+      const href = a.getAttribute("href");
+      if (!href) return;
+      if (/^https?:\/\//i.test(href) || href.startsWith("mailto:")) {
+        e.preventDefault();
+        e.stopPropagation();
+        void openUrl(href).catch(() => {
+          // Fallback if opener fails (non-Tauri browser dev).
+          window.open(href, "_blank", "noopener,noreferrer");
+        });
+      }
+    };
+    document.addEventListener("click", onClick, true);
+    return () => document.removeEventListener("click", onClick, true);
+  });
 </script>
 
 <div class="shell">
