@@ -19,8 +19,8 @@
 | **0** | egui baseline + fidelity P0 | [phases/PHASE-0.md](./phases/PHASE-0.md) | **Done** |
 | **1** | API seam + workspace + Tauri scaffold | [phases/PHASE-1.md](./phases/PHASE-1.md) | **Done** |
 | **2** | Tauri Convert polished (dialog, progress, install) | [phases/PHASE-2.md](./phases/PHASE-2.md) | **Done** (exit BWT-2.7 human sign-off optional) |
-| **3** | Tauri Map (MapLibre + predict + fetch/build/install) | [phases/PHASE-3.md](./phases/PHASE-3.md) | **In progress** (3.1–3.7 dem_fetch_build; 3.8 grid / 3.9 exit pending) |
-| **4** | Tauri Sculpt MVP → parity | [phases/PHASE-4.md](./phases/PHASE-4.md) | **Not started** |
+| **3** | Tauri Map (MapLibre + predict + fetch/build/install) | [phases/PHASE-3.md](./phases/PHASE-3.md) | **Core done** (3.8 Grid deferred; 3.9 user in-game) |
+| **4** | Tauri Sculpt MVP → parity | [phases/PHASE-4.md](./phases/PHASE-4.md) | **Next** |
 | **5** | Launcher cutover + archive egui | [phases/PHASE-5.md](./phases/PHASE-5.md) | **Not started** |
 
 ## Parallel fidelity track (backend; does not wait for shell)

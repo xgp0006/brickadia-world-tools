@@ -1,6 +1,6 @@
 # Phase 3 — Tauri Map (MapLibre + DEM pipeline)
 
-**Status:** In progress (BWT-3.1–3.7 map shell + dem_fetch_build done; 3.8 grid stub; 3.9 exit proof pending)  
+**Status:** Core done 2026-08-11 (BWT-3.1–3.7). Grid (3.8) deferred to egui/later; 3.9 user in-game. Live Terrarium smoke: `smoke-terrarium.brdb` (~15k bricks).  
 **Tickets:** BWT-3.1–3.9  
 **Depends on:** Phase 2 exit (install path recommended before Map install)
 

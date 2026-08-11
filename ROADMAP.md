@@ -19,9 +19,9 @@
 |-------|--------|-----|
 | 0 House + egui baseline | **Done** | [PHASE-0](./docs/program/phases/PHASE-0.md) |
 | 1 API + Tauri scaffold | **Done** | [PHASE-1](./docs/program/phases/PHASE-1.md) |
-| 2 Convert polish + install | **In progress** | [PHASE-2](./docs/program/phases/PHASE-2.md) |
-| 3 MapLibre Map + dem_fetch_build | Next | [PHASE-3](./docs/program/phases/PHASE-3.md) |
-| 4 Sculpt Tauri | Planned | [PHASE-4](./docs/program/phases/PHASE-4.md) |
+| 2 Convert polish + install | **Done** | [PHASE-2](./docs/program/phases/PHASE-2.md) |
+| 3 MapLibre Map + dem_fetch_build | **Core done** (Grid deferred) | [PHASE-3](./docs/program/phases/PHASE-3.md) |
+| 4 Sculpt Tauri | **Next** | [PHASE-4](./docs/program/phases/PHASE-4.md) |
 | 5 Launcher cutover | Planned | [PHASE-5](./docs/program/phases/PHASE-5.md) |
 
 ## Fidelity track
