@@ -1,58 +1,67 @@
-# Heightmap2BRZ
+# Brickadia World Tools
 
-[Download here](https://github.com/Meshiest/heightmap2brz/releases)
+**User-facing name:** Brickadia World Tools  
+**Crate / binaries (internal):** `heightmap` · `heightmap_gui` · `heightmap` (CLI)
 
-![Example output](https://i.imgur.com/QdPLN09.png)
-![GTAV Map](https://i.imgur.com/J9XpmT3.png)
-![Gui](https://i.imgur.com/8v9MXnl.png)
+Fork of [Meshiest/heightmap2brz](https://github.com/Meshiest/heightmap2brz), heavily extended for real-world DEM → Brickadia terrain.
 
-### Compiling
+| | |
+|--|--|
+| **Repo** | https://github.com/xgp0006/brickadia-world-tools |
+| **Upstream** | https://github.com/Meshiest/heightmap2brz (`upstream` remote) |
+| **Host path** | `~/Projects/brickadia/heightmap2brz` (desktop) |
 
-You need [rust](https://www.rust-lang.org/).
+## What it does
 
-Run `cargo build` for the CLI, `cargo build --bin heightmap_gui --features gui` for the gui.
+- **Map tab** — fetch DEM (AWS Terrarium, Mapbox Terrain-RGB, OpenTopography SRTMGL1), imagery, bbox, brick type, density, scale, generate `.brdb`/`.brz`, install into Brickadia’s Proton prefix (APPID `2199420`).
+- **Convert tab** — heightmap PNG (+ optional colormap) → save.
+- **Sculpt tab** — brushes, stamps, splat paint, terrace, freedraw omit/include zones, free-angle rotation (baked into export), **export layers** (box-selected multi-save), heightmap PNG export.
 
-### Usage
+## Launch
 
-Compile or download from releases.
+```bash
+brickadia-world-tools-gui    # preferred symlink
+# or
+heightmap2brz-gui
+```
 
-`heightmap.exe --help` for usage instructions:
+After code changes (release binary is what the launcher runs):
 
-    USAGE:
-        heightmap.exe [FLAGS] [OPTIONS] <INPUT>...
+```bash
+cargo build --release --features gui
+```
 
-    FLAGS:
-            --cull         Automatically remove bottom level bricks and fully transparent bricks
-            --glow         Make the heightmap glow at 0 intensity
-            --greedy       Use greedy optimization
-        -h, --help         Prints help information
-            --hdmap        Using a high detail rgb color encoded heightmap
-        -i, --img          Make the heightmap flat and render an image
-            --lrgb         Use linear rgb input color instead of sRGB
-            --micro        Render bricks as micro bricks
-            --nocollide    Disable brick collision
-            --snap         Snap bricks to the brick grid
-            --stud         Render bricks as stud cubes
-            --tile         Render bricks as tiles
-        -V, --version      Prints version information
+CLI Stage-2 only:
 
-    OPTIONS:
-        -c, --colormap <colormap>    Input colormap image (PNG/JPG)
-        -o, --output <output>        Output file (BRDB, BRZ)
-        -s, --size <size>            Brick stud size (default 1)
-        -v, --vertical <vertical>    Vertical scale multiplier (default 1)
+```bash
+cargo build --release --bin heightmap   # if bin exists without gui feature
+heightmap2brz --help
+```
 
-    ARGS:
-        <INPUT>...    Input heightmap image files (PNG/JPG)
+Legacy full GeoTIFF pipeline (parent tree): `brickadia-map` → `../legacy/geotiff2heightmap/`.
 
-###  Examples
+## Develop
 
-An example command for generating the GTA V map would be:
+```bash
+cargo test --lib
+cargo clippy --all-targets --all-features -- -D warnings   # preferred gate
+```
 
-`heightmap example_maps/gta5_fixed2_height.png -c example_maps/gta5_fixed2_color.png -s 4 -v 20 --tile -o gta5.brz`
+Requires Rust **1.88+**, edition **2024**.
 
-To use stacked heightmap for increased resolution, simply provide more input files. See the `stacked_N.png` files in the `example_maps` directory for example stacked heightmaps.
+Config / API keys: `~/.config/heightmap2brz/config.toml` (mode 600).
 
-`heightmap ./example_maps/stacked_1.png ./example_maps/stacked_2.png ./example_maps/stacked_3.png ./example_maps/stacked_4.png --tile`
+## Docs
 
-To generate HD heightmaps for the `--hdmap` flag, check out [Kmschr's GeoTIFF2Heightmap tool](https://github.com/Kmschr/GeoTIFF2Heightmap).
+| Path | |
+|------|--|
+| [ROADMAP.md](./ROADMAP.md) | Status + next work |
+| [docs/IN_GAME_TEST.md](./docs/IN_GAME_TEST.md) | Manual Brickadia checklist |
+| [docs/superpowers/specs/](./docs/superpowers/specs/) | Feature design specs |
+| [CHANGELOG.md](./CHANGELOG.md) | Notable changes |
+
+Vault (desktop): `brickadia-world-tools` project · `brickadia-heightmap-toolkit` reference.
+
+## License / attribution
+
+Upstream authorship retained in history (`Meshiest` / heightmap2brz). See upstream README for original license terms; keep attribution when redistributing.

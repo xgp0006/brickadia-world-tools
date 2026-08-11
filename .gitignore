@@ -6,3 +6,8 @@
 maps
 
 
+
+# local artifacts
+/builds/
+*.brdb
+*.brz
