@@ -8,9 +8,9 @@ Fidelity has **four independent axes**. Raising one without the others feels “
 
 | Axis | What it is | Ceiling in our code | Notes |
 |------|------------|---------------------|--------|
-| **A. DEM source ground pitch** | Real metres per elevation sample | AWS Terrarium / Mapbox RGB: **z15** (~4–5 m/cell mid-lat). OpenTopo SRTMGL1: **~30 m**. USGS 3DEP: **1 m** (US) — **picker only, not wired** | You cannot invent metres the DEM never had. |
-| **B. Fetch zoom / cell budget** | How many DEM cells we keep for a bbox | `pick_zoom` + `MAX_DEM_CELLS = 200_000` + `MAX_TILES_PER_FETCH = 64` (`src/gui/tiles.rs`) | Larger bbox → auto lower zoom → coarser. By design (mesher RAM). |
-| **C. Density knob** | Post-fetch grid size | `density_factor` 1–8 = **downsample** (`build::downsample`) | **Larger density = less detail.** Misnamed for “increase fidelity.” 1 = full. |
+| **A. DEM source ground pitch** | Real metres per elevation sample | AWS Terrarium / Mapbox RGB: **z15** (~4–5 m/cell mid-lat). OpenTopo SRTMGL1: **~30 m**. USGS 3DEP: **~1 m** (US) — **wired** via National Map ImageServer | You cannot invent metres the DEM never had. |
+| **B. Fetch zoom / cell budget** | How many DEM cells we keep for a bbox | `pick_zoom` + `MAX_DEM_CELLS = 400_000` + `MAX_TILES_PER_FETCH = 64` (`src/gui/tiles.rs`) | Larger bbox → auto lower zoom → coarser. By design (mesher RAM). |
+| **C. Downsample knob** | Post-fetch grid size | `density_factor` 1–8 = **downsample** (`build::downsample`) | **Larger = less detail.** Label is “Downsample”; 1 = full. |
 | **D. Brick playable size** | Studs per real metre | `studs_per_meter` + micro | Free map size at **same** cell count — does **not** add DEM detail. |
 
 ### Mesher memory (the hard wall)
@@ -45,7 +45,7 @@ Label: “Density (terrain resolution)” + tooltip correctly says downsample, b
 | Finest free global DEM | AWS Terrarium, **density 1**, small box, watch status `~m/cell` |
 | Playable big map, same detail | Raise **studs/m** (or micro), not density |
 | Large area, keep detail | **Grid Build** / tile — not one giant box |
-| US ultra-detail | Need 3DEP wired (or offline GeoTIFF → Convert/Sculpt) |
+| US ultra-detail | USGS 3DEP in Map tab, small box, Downsample=1 (or offline GeoTIFF → Convert) |
 
 ## 3. Upstream (Meshiest) — what still applies
 

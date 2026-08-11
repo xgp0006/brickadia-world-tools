@@ -1,52 +1,40 @@
 # Roadmap — Brickadia World Tools
 
-## Done (on `master`, 2026-08-11)
+**Program board (phases + tickets):** [docs/program/PROGRAM.md](./docs/program/PROGRAM.md) · [docs/program/TICKETS.md](./docs/program/TICKETS.md)
 
-- [x] Map-tab DEM pipeline (Terrarium / Mapbox / OpenTopo)
-- [x] Horizontal scale + predicted output size
+## Done (on `master`)
+
+- [x] Map-tab DEM pipeline (Terrarium / Mapbox / OpenTopo / **USGS 3DEP**)
+- [x] Horizontal scale + predicted output size; downsample clarity
 - [x] Grid / tiled large-world generation + `.brz` prefabs
 - [x] Sculpt terrain editor + export tooling
-- [x] Freedraw omit/include zones (Phase 1a)
-- [x] Shape stamps, splat paint (color), terrace
-- [x] Free-angle rotation baked into export; bricks+flats height UI
-- [x] Export **layers** (box selection + claim pass + multi-save) — MVP
-- [x] GitHub: `xgp0006/brickadia-world-tools` (upstream = Meshiest)
-- [x] Merge feature train → `master`; tidy parent `legacy/`
+- [x] Freedraw zones Phase 1a; stamps; splat paint; terrace; rotation bake; layers MVP
+- [x] GitHub `xgp0006/brickadia-world-tools`; feature train on `master`
+- [x] Fidelity P0 (window, tooltips); MAX_DEM_CELLS 400k
+- [x] Tauri Phase 1–2 start: `api::convert` + `dem_predict`; Deno shell; dialogs + progress
 
-## Next (feature PRDs)
+## Phase order (shell)
 
-Full analysis: [docs/FIDELITY_AND_PRODUCT_PLAN.md](./docs/FIDELITY_AND_PRODUCT_PLAN.md).
+| Phase | Status | PRD |
+|-------|--------|-----|
+| 0 House + egui baseline | **Done** | [PHASE-0](./docs/program/phases/PHASE-0.md) |
+| 1 API + Tauri scaffold | **Done** | [PHASE-1](./docs/program/phases/PHASE-1.md) |
+| 2 Convert polish + install | **In progress** | [PHASE-2](./docs/program/phases/PHASE-2.md) |
+| 3 MapLibre Map + dem_fetch_build | Next | [PHASE-3](./docs/program/phases/PHASE-3.md) |
+| 4 Sculpt Tauri | Planned | [PHASE-4](./docs/program/phases/PHASE-4.md) |
+| 5 Launcher cutover | Planned | [PHASE-5](./docs/program/phases/PHASE-5.md) |
 
-| Priority | Item | Notes |
-|----------|------|--------|
-| P0 | **Fidelity clarity + window + tooltips** | **Done** 2026-08-11 |
-| P1 | **Higher DEM fidelity** | **USGS 3DEP wired** (National Map ImageServer); MAX_DEM_CELLS 400k; Grid still for large high-res |
-| P1 | **Layers Phase 2+** | Lasso regions, per-layer settings, resolution multiplier (see sculpt-layers-design) |
-| P1 | **Project save** `.h2bproj` | Phase 1b zones/sculpt state — specs under freedraw-zones |
-| P2 | Streaming/columnar mesher | Lifts `MAX_DEM_CELLS` honestly (`opt/generate.rs`) |
-| P2 | Upstream harvest | `hdmap` verify, optional wedge surface — **not** full merge |
-| P2 | Per-cell **material** paint | Widen greedy `(height,color)` key in `opt/generate.rs` |
-| P2 | Heightmap PNG **scale metadata** | Avoid studs/m loss on re-import |
-| P3 | Live brick preview (optional GPU) | Preview only; meshing stays CPU |
-| P3 | Prefab scatter / WorldPainter-style layers | Roadmap #3 from design era |
-| — | **Tauri + Svelte** | Deferred — rewrite cost ≫ gain while egui pipeline works |
+## Fidelity track
 
-## Housekeeping backlog
+| | Status |
+|--|--------|
+| F0 clarity | Done |
+| F1 3DEP + cell budget | Done |
+| F2 OpenTopo COP30 | Planned |
+| F3 streaming mesher | Planned |
+| F4 upstream harvest | Planned |
+| F5 in-game FLATS | User |
 
-- [ ] In-game confirm **1 brick = 3 flats** (`FLATS_PER_BRICK`)
-- [ ] Clippy `-D warnings` clean on CI
-- [ ] Optional: rename user-facing desktop file only (crate names stay `heightmap*`)
+## Spec index (sculpt/grid era)
 
-## Spec index
-
-| Spec | Topic |
-|------|--------|
-| `docs/superpowers/specs/2026-06-24-grid-tiled-world-generation.md` | Grid / tiles |
-| `docs/superpowers/specs/2026-06-24-sculpt-terrain-editor-design.md` | Sculpt MVP |
-| `docs/superpowers/specs/2026-06-24-sculpt-export-tooling-design.md` | Export tooling |
-| `docs/superpowers/specs/2026-06-25-freedraw-zones-design.md` | Zones |
-| `docs/superpowers/plans/2026-06-25-freedraw-zones-phase1a-plan.md` | Zones plan |
-| `docs/superpowers/specs/2026-06-29-sculpt-player-facing-ux-design.md` | UX / rotation |
-| `docs/superpowers/specs/2026-06-30-sculpt-layers-design.md` | Layers |
-
-Superseded claims live in git history + vault `[[brickadia-heightmap-toolkit]]` changelog sections.
+See `docs/superpowers/specs/`.
