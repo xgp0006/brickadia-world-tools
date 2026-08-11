@@ -106,17 +106,15 @@
 
 <main class="wrap">
   <header>
-    <h1>Brickadia World Tools</h1>
+    <h1>Convert</h1>
     <p class="sub">
-      Tauri + Deno · Convert · core <code>heightmap {coreVersion}</code>
+      Heightmap PNG → <code>.brdb</code> · core <code>heightmap {coreVersion}</code>
     </p>
   </header>
 
   <section class="card">
-    <h2>Convert</h2>
     <p class="hint">
-      Heightmap PNG → <code>.brdb</code> / <code>.brz</code>. Same Rust path as the egui Convert
-      tab. Install into Brickadia Worlds is Map-tab only for now.
+      Same Rust path as the egui Convert tab. Install into Brickadia Worlds is Map-tab only for now.
     </p>
 
     <form onsubmit={runConvert}>
@@ -207,20 +205,16 @@
 </main>
 
 <style>
-  :root {
-    font-family: "IBM Plex Sans", system-ui, sans-serif;
-    color: #e8e6e3;
-    background: #12141a;
-    line-height: 1.45;
-  }
   .wrap {
     max-width: 42rem;
     margin: 0 auto;
-    padding: 2rem 1.25rem 3rem;
+    padding: 1.5rem 1.25rem 3rem;
+    width: 100%;
+    box-sizing: border-box;
   }
   h1 {
     margin: 0;
-    font-size: 1.75rem;
+    font-size: 1.5rem;
     letter-spacing: -0.02em;
   }
   .sub {
@@ -229,15 +223,11 @@
     font-size: 0.9rem;
   }
   .card {
-    margin-top: 1.75rem;
+    margin-top: 1.25rem;
     padding: 1.25rem 1.35rem 1.5rem;
     background: #1a1d26;
     border: 1px solid #2c3140;
     border-radius: 8px;
-  }
-  h2 {
-    margin: 0 0 0.35rem;
-    font-size: 1.15rem;
   }
   .hint {
     margin: 0 0 1rem;
@@ -351,10 +341,6 @@
     margin-top: 2rem;
     color: #6a6660;
     font-size: 0.8rem;
-  }
-  code {
-    font-family: "IBM Plex Mono", ui-monospace, monospace;
-    font-size: 0.9em;
   }
   @media (max-width: 560px) {
     .row {

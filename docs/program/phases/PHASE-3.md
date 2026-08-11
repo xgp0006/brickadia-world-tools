@@ -1,6 +1,6 @@
 # Phase 3 — Tauri Map (MapLibre + DEM pipeline)
 
-**Status:** Not started  
+**Status:** In progress (BWT-3.1–3.3 map shell done; 3.4+ DEM fetch pending)  
 **Tickets:** BWT-3.1–3.9  
 **Depends on:** Phase 2 exit (install path recommended before Map install)
 

@@ -40,9 +40,9 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 
 | ID | Title | Status |
 |----|-------|--------|
-| BWT-3.1 | MapLibre GL (or Leaflet) basemap in Svelte | todo |
-| BWT-3.2 | Bbox draw + edit + lat/lon readout | todo |
-| BWT-3.3 | Live `dem_predict` panel (m/cell, cells, notes) | todo |
+| BWT-3.1 | MapLibre GL (or Leaflet) basemap in Svelte | done |
+| BWT-3.2 | Bbox draw + edit + lat/lon readout | done |
+| BWT-3.3 | Live `dem_predict` panel (m/cell, cells, notes) | done |
 | BWT-3.4 | Feature `dem` / expose fetch+build without full egui | todo |
 | BWT-3.5 | `dem_fetch_build` command + `build:progress` events | todo |
 | BWT-3.6 | DEM source picker (Terrarium/Mapbox/OpenTopo/3DEP) + keys | todo |
