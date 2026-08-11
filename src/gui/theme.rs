@@ -26,40 +26,40 @@ pub fn install_theme(ctx: &egui::Context) {
     visuals.extreme_bg_color = SURFACE_BG;
     visuals.faint_bg_color = SURFACE_RAISED;
     visuals.code_bg_color = SURFACE_BG;
-    visuals.window_stroke = Stroke::new(1.0, STROKE_DIM);
+    visuals.window_stroke = Stroke::new(1.0_f32, STROKE_DIM);
     visuals.window_corner_radius = CornerRadius::same(6);
     visuals.menu_corner_radius = CornerRadius::same(4);
 
     visuals.widgets.noninteractive.bg_fill = SURFACE_PANEL;
     visuals.widgets.noninteractive.weak_bg_fill = SURFACE_PANEL;
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, STROKE_DIM);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, STROKE_DIM);
 
     visuals.widgets.inactive.bg_fill = SURFACE_RAISED;
     visuals.widgets.inactive.weak_bg_fill = SURFACE_RAISED;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, STROKE_DIM);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, STROKE_DIM);
 
     visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
     visuals.widgets.hovered.weak_bg_fill = SURFACE_HOVER;
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, ACCENT_EMBER);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_EMBER_DIM);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, ACCENT_EMBER);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_EMBER_DIM);
 
     visuals.widgets.active.bg_fill = ACCENT_EMBER_DIM;
     visuals.widgets.active.weak_bg_fill = ACCENT_EMBER_DIM;
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_EMBER);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT_EMBER);
 
     visuals.widgets.open.bg_fill = SURFACE_RAISED;
     visuals.widgets.open.weak_bg_fill = SURFACE_RAISED;
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0, ACCENT_EMBER);
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT_EMBER_DIM);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, ACCENT_EMBER);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, ACCENT_EMBER_DIM);
 
     // Selected widgets (selectable_label/value): a SOLID bright-ember fill with
     // near-white text. egui paints a selected label's text in `selection.stroke`,
     // so the old ember-on-dim-ember was unreadable — this is the contrast fix.
     visuals.selection.bg_fill = ACCENT_EMBER;
-    visuals.selection.stroke = Stroke::new(1.0, TEXT_SELECTED);
+    visuals.selection.stroke = Stroke::new(1.0_f32, TEXT_SELECTED);
     visuals.hyperlink_color = ACCENT_EMBER;
     visuals.warn_fg_color = Color32::from_rgb(0xE6, 0xB7, 0x4F);
     visuals.error_fg_color = Color32::from_rgb(0xE6, 0x6E, 0x52);

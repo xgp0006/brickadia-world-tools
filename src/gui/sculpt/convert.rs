@@ -21,13 +21,14 @@ use crate::gui::build::{
     ProgressFn, build_heightmap, builds_dir, enforce_cell_budget, generate_bricks_skip_floor,
     install_save, sanitize_name,
 };
-use crate::gui::grid::tile_world_offset;
+use crate::gui::grid::{offset_fits_chunk_index, tile_world_offset};
 use crate::gui::map_tab::derive_scale;
 use crate::gui::zones::{self, Zone};
 use crate::map::Colormap;
 use crate::util::{bricks_to_save, write_save_world};
 
 use super::heightfield::{terrace_height, HeightField};
+use super::layers::LayerStack;
 use super::paint::{PaintColormap, PaintLayer};
 
 /// What the sculpt convert writes and where. Mirrors the single-box output
@@ -440,6 +441,260 @@ pub(crate) fn convert_heightfield_tiled(
         elevation_min_m,
         elevation_max_m,
     })
+}
+
+// ── Layer export: one pre-positioned save per layer (MVP, single resolution) ──
+//
+// Each visible, non-empty layer exports as its OWN save whose bricks sit at TRUE
+// absolute world coordinates on the shared base lattice, so loading every part in
+// Brickadia auto-assembles one world. `LayerStack::claim` makes the parts a strict
+// partition (top layer wins), so no two parts place a brick in the same cell —
+// watertight, no coincident bricks across parts. The pitch is held UNIFORM (the
+// single-resolution MVP), so this reuses the exact integer-offset alignment that
+// fixed the tiling seams; the per-layer integer resolution multiplier is Phase 1.
+
+/// One planned export part: a layer's claimed-cell bounding box, the keep-mask
+/// over that box, and the world offset that lands every cell on the shared global
+/// lattice. Field-cell space; `bbox` is half-open `[x0,x1) × [y0,y1)`.
+pub(crate) struct PartPlan {
+    pub layer_name: String,
+    pub bbox: (u32, u32, u32, u32),
+    /// Row-major keep-mask over the bbox (len `(x1-x0)·(y1-y0)`): a cell is kept
+    /// iff THIS layer owns it after the claim pass.
+    pub keep_local: Vec<bool>,
+    pub offset: (i32, i32),
+}
+
+/// Plan the export parts for a layer stack over `field`, on a shared base pitch
+/// `size_base`. Runs the claim pass, derives each visible non-empty layer's
+/// owned-cell bbox + local keep-mask + world offset, and hard-gates every part
+/// against Brickadia's world-extent limit (a promoted-from-debug check: a
+/// pre-positioned part that exceeded it would be silently clamped off-lattice).
+/// Empty/hidden layers produce no part.
+pub(crate) fn plan_layer_parts(
+    stack: &LayerStack,
+    field: &HeightField,
+    size_base: u16,
+) -> Result<Vec<PartPlan>, BuildError> {
+    let (fw, fh) = (field.width, field.height);
+    let claimed = stack.claim(fw, fh);
+    let mut parts = Vec::new();
+    for layer in &stack.layers {
+        if !layer.visible {
+            continue;
+        }
+        // A layer's selection mask must match the CURRENT field (set_field resets
+        // the stack on a field swap). Catch a desync loudly rather than silently
+        // producing a truncated partition.
+        debug_assert_eq!(
+            layer.box_mask.len(),
+            (fw as usize) * (fh as usize),
+            "layer '{}' box_mask ({}) must match field dims {fw}×{fh}",
+            layer.name,
+            layer.box_mask.len(),
+        );
+        // Bounding box of the cells this layer OWNS post-claim (not merely selects).
+        let (mut x0, mut y0, mut x1, mut y1) = (fw, fh, 0u32, 0u32);
+        let mut any = false;
+        for y in 0..fh {
+            for x in 0..fw {
+                if claimed[(y * fw + x) as usize] == Some(layer.id) {
+                    any = true;
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x + 1);
+                    y1 = y1.max(y + 1);
+                }
+            }
+        }
+        if !any {
+            continue;
+        }
+        let (bw, bh) = (x1 - x0, y1 - y0);
+        let mut keep_local = Vec::with_capacity((bw * bh) as usize);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                keep_local.push(claimed[(y * fw + x) as usize] == Some(layer.id));
+            }
+        }
+        // World-extent gate (spec §5.6): a pre-positioned part is far likelier to
+        // exceed the i16 ChunkIndex bound than a single centered field. Check the
+        // would-be offset against the bound BEFORE `tile_world_offset` (whose
+        // debug-assert would mask the release path) and refuse rather than clamp.
+        if !offset_fits_chunk_index(part_axis_offset(x0, fw, size_base), fw, size_base)
+            || !offset_fits_chunk_index(part_axis_offset(y0, fh, size_base), fh, size_base)
+        {
+            return Err(BuildError::BrdbWrite(format!(
+                "layer '{}' places a part outside Brickadia's world extent — coarsen \
+                 background detail or shrink the world",
+                layer.name,
+            )));
+        }
+        let offset = tile_world_offset(x0, y0, fw, fh, size_base);
+        parts.push(PartPlan {
+            layer_name: layer.name.clone(),
+            bbox: (x0, y0, x1, y1),
+            keep_local,
+            offset,
+        });
+    }
+    Ok(parts)
+}
+
+/// The per-axis world offset of a part whose NW cell index is `nw_cells`, on a
+/// field `global_cells` wide at pitch `size`. Mirrors `tile_world_offset`'s axis
+/// formula (`2·size·nw − global_cells·size`) in i64 so the world-extent gate can
+/// be evaluated WITHOUT tripping `tile_world_offset`'s debug-assert, then saturate
+/// to i32 (the gate rejects anything that would actually saturate).
+fn part_axis_offset(nw_cells: u32, global_cells: u32, size: u16) -> i32 {
+    let off = i64::from(nw_cells) * 2 * i64::from(size) - i64::from(global_cells) * i64::from(size);
+    off.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Mesh one planned part into bricks at its absolute world offset. Meshes the
+/// bbox sub-field with the part's keep-mask, so only the layer's owned cells emit
+/// — every emitted cell lands at the same absolute world slot a single full-field
+/// mesh would place it (shared pitch + shared global offset).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_part_bricks(
+    plan: &PartPlan,
+    field: &HeightField,
+    style: BrickStyle,
+    vertical_scale: f32,
+    base_h: u32,
+    h_omit: u32,
+    skip_floor: bool,
+    max_brick_units: u16,
+    progress: ProgressFn,
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<brdb::Brick>, BuildError> {
+    let (x0, y0, x1, y1) = plan.bbox;
+    let sub = field.sub_field(x0, y0, x1, y1);
+    let raster = sub.to_dem_raster();
+    let heightmap = build_heightmap(&raster, vertical_scale, 0.0);
+    let flat = build::FlatColormap::sculpt_default(sub.width, sub.height);
+    generate_bricks_skip_floor(
+        &heightmap,
+        &flat,
+        style,
+        Some(base_h),
+        plan.offset,
+        skip_floor,
+        h_omit,
+        max_brick_units,
+        progress,
+        cancel,
+        Some(&plan.keep_local),
+    )
+}
+
+/// What one exported part wrote: the source layer, its brick count, and the
+/// primary save path (+ install destination / non-fatal warning).
+pub(crate) struct PartOutcome {
+    pub layer_name: String,
+    pub brick_count: usize,
+    pub primary_path: PathBuf,
+    pub installed_path: Option<PathBuf>,
+    pub install_warning: Option<String>,
+}
+
+/// Export every visible, non-empty layer as its own pre-positioned save. ONE
+/// shared `derive_scale` over the field's meta drives every part (uniform pitch =
+/// watertight overlay). Each part writes via the SAME `write_and_install` the
+/// single/tiled paths use, stem `{source}_{layer}` (disambiguated on collision).
+///
+/// MVP scope: parts are GEOMETRY-ONLY — the per-layer paint / freedraw-zone /
+/// terrace knobs the single-export path applies are NOT yet plumbed per part
+/// (Phase 5). The Layers panel therefore exports terrain shape + the global
+/// floor/omit only; paint & terrace stay on the single Convert path until then.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn export_layer_parts(
+    stack: &LayerStack,
+    field: &HeightField,
+    out: OutputOptions,
+    floor_level_m: f32,
+    omit_below_m: f32,
+    max_brick_units: u16,
+    progress: ProgressFn,
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<PartOutcome>, BuildError> {
+    if !out.brdb && !out.brz {
+        return Err(BuildError::BrdbWrite(
+            "select at least one output format (.brdb or .brz)".to_owned(),
+        ));
+    }
+    let (horizontal_scale, vertical_scale) = derive_scale(
+        field.meta.cell_m,
+        field.meta.studs_per_meter,
+        field.meta.vertical_exaggeration,
+        field.meta.micro,
+    );
+    let block_type = if field.meta.micro { BlockType::Micro } else { BlockType::SmoothTile };
+    let style = BrickStyle::new(block_type, horizontal_scale, false, false);
+    let size_base = build::cell_size_units(horizontal_scale, field.meta.micro);
+    let base_h = (floor_level_m * vertical_scale).max(0.0).round() as u32;
+    let h_omit = (omit_below_m * vertical_scale).max(0.0).round() as u32;
+
+    let plans = plan_layer_parts(stack, field, size_base)?;
+    if plans.is_empty() {
+        return Err(BuildError::BrdbWrite(
+            "no layer has a selection to export — pick some boxes first".to_owned(),
+        ));
+    }
+
+    let mut outcomes = Vec::with_capacity(plans.len());
+    let mut seen_stems = std::collections::HashSet::new();
+    let total = plans.len() as f32;
+    for (i, plan) in plans.iter().enumerate() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(BuildError::Cancelled);
+        }
+        progress(BuildStage::GeneratingBricks, i as f32 / total.max(1.0));
+        let tile_progress: ProgressFn = Arc::new(|_, _| {});
+        let bricks = build_part_bricks(
+            plan,
+            field,
+            style,
+            vertical_scale,
+            base_h,
+            h_omit,
+            out.skip_floor,
+            max_brick_units,
+            tile_progress,
+            Arc::clone(&cancel),
+        )?;
+        let brick_count = bricks.len();
+        // An all-floor / fully-omitted part meshes to nothing — skip it rather than
+        // write a junk empty save (mirrors the "empty layer won't export" rule).
+        if brick_count == 0 {
+            continue;
+        }
+        if brick_count > MAX_GRID_BRICKS {
+            return Err(BuildError::TooManyBricks { count: brick_count, max: MAX_GRID_BRICKS });
+        }
+        let world = bricks_to_save(bricks);
+        // Stem `{source}_{layer}`, disambiguated by index if two layers sanitize to
+        // the same name (e.g. after a Phase-3 rename) so one part can't clobber another.
+        let mut stem = format!("{}_{}", field.meta.source_name, plan.layer_name);
+        if !seen_stems.insert(sanitize_name(&stem)) {
+            stem = format!("{}_{}_{}", field.meta.source_name, i + 1, plan.layer_name);
+            seen_stems.insert(sanitize_name(&stem));
+        }
+        let written = write_and_install(&world, &stem, out)?;
+        let primary_path = written
+            .brdb_path
+            .or_else(|| written.extra_paths.into_iter().next())
+            .unwrap_or_default();
+        outcomes.push(PartOutcome {
+            layer_name: plan.layer_name.clone(),
+            brick_count,
+            primary_path,
+            installed_path: written.installed_path,
+            install_warning: written.install_warning,
+        });
+    }
+    progress(BuildStage::WritingSave, 1.0);
+    Ok(outcomes)
 }
 
 /// Result of staging + installing the selected formats: the `.brdb` path (if
@@ -1822,5 +2077,204 @@ mod tests {
         assert_eq!(masked_a, masked_b, "repeated masked convert is deterministic");
         assert!(masked_a < no_zone, "the omit zone must actually drop bricks ({masked_a} < {no_zone})");
         assert!(masked_a > 0, "the omit leaves the rest of the hill intact");
+    }
+
+    // ── Layer export (MVP, single resolution) ────────────────────────────────
+
+    use super::super::layers::LayerStack;
+
+    /// A LayerStack over an `fw×fh` field at `div` box divisions, assigning whole
+    /// boxes to layers: each `((bi,bj), li)` paints box `(bi,bj)` into layer index
+    /// `li` (layer 0 = the auto-created Base; higher indices are added in order).
+    fn stack_with_boxes(
+        fw: u32,
+        fh: u32,
+        div: (u32, u32),
+        assignments: &[((u32, u32), usize)],
+    ) -> LayerStack {
+        let mut s = LayerStack::new(fw, fh);
+        s.grid_div = div;
+        let max_layer = assignments.iter().map(|&(_, l)| l).max().unwrap_or(0);
+        for _ in 1..=max_layer {
+            s.add_layer(fw, fh); // inserts above active and activates → indices 1..=max in order
+        }
+        for &((bi, bj), li) in assignments {
+            s.active = li;
+            s.paint_box(fw, fh, bi, bj, true);
+        }
+        s
+    }
+
+    /// Mesh a planned part with the convert defaults (skip_floor, base 0, omit 0),
+    /// at the field's derived scale — the per-part building block `export_layer_parts`
+    /// uses, returning bricks for inspection.
+    fn build_part(field: &HeightField, plan: &super::PartPlan) -> Vec<brdb::Brick> {
+        let (hscale, vscale) = derive_scale(
+            field.meta.cell_m,
+            field.meta.studs_per_meter,
+            field.meta.vertical_exaggeration,
+            field.meta.micro,
+        );
+        let style = BrickStyle::new(BlockType::SmoothTile, hscale, false, false);
+        super::build_part_bricks(
+            plan, field, style, vscale, 0, 0, true, crate::opt::MAX_BRICK_UNITS,
+            noop_progress(), Arc::new(AtomicBool::new(false)),
+        )
+        .expect("part mesh must succeed")
+    }
+
+    /// INV-REGRESSION: one layer covering the WHOLE field exports a part that is
+    /// brick-identical (as a geometry multiset) to convert's single full-field
+    /// mesh. The no-layers baseline must never drift.
+    #[test]
+    fn inv_regression_full_layer_equals_single_mesh() {
+        let field = hill_field(20, 16);
+        let (hscale, _v) = derive_scale(30.0, 4.0, 1.0, false);
+        let size_base = crate::gui::build::cell_size_units(hscale, false);
+
+        let mut s = LayerStack::new(20, 16);
+        s.grid_div = (1, 1);
+        s.paint_box(20, 16, 0, 0, true); // whole field → Base
+
+        let plans = plan_layer_parts(&s, &field, size_base).expect("plan");
+        assert_eq!(plans.len(), 1, "one non-empty layer → exactly one part");
+        assert_eq!(plans[0].bbox, (0, 0, 20, 16), "a full selection spans the whole field");
+
+        let part = build_part(&field, &plans[0]);
+        let single = mesh_field(&field, true);
+        assert_eq!(
+            geom_multiset(&part),
+            geom_multiset(&single),
+            "a full-field layer part must equal the single mesh (INV-REGRESSION)",
+        );
+    }
+
+    /// INV-POSITION: a part covering a SUBSET places its bricks at the SAME
+    /// absolute positions the single full-field mesh uses for those cells. Uses a
+    /// distinct-per-cell ramp so no greedy merge spans the bbox edge (which would
+    /// legitimately differ) — every part brick must then exist in the single mesh.
+    #[test]
+    fn inv_position_subset_part_matches_single_mesh_cells() {
+        let field = ramp_field(16, 16);
+        let (hscale, _v) = derive_scale(30.0, 4.0, 1.0, false);
+        let size_base = crate::gui::build::cell_size_units(hscale, false);
+
+        // 2×1 grid: Base owns the left half (box (0,0) → cols 0..8).
+        let s = stack_with_boxes(16, 16, (2, 1), &[((0, 0), 0)]);
+        let plans = plan_layer_parts(&s, &field, size_base).expect("plan");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].bbox, (0, 0, 8, 16), "left-half selection → left-half bbox");
+
+        let part = build_part(&field, &plans[0]);
+        let single = mesh_field(&field, true);
+        let single_set = geom_multiset(&single);
+        assert!(!part.is_empty(), "the part must emit bricks");
+        for b in &part {
+            let (p, sz) = brick_geom(b);
+            let key = (p.x, p.y, p.z, sz.x, sz.y, sz.z);
+            assert!(
+                single_set.contains_key(&key),
+                "part brick {key:?} is absent from the single mesh — positions diverged",
+            );
+        }
+    }
+
+    /// INV-NOCOINCIDE + INV-COVERAGE: two layers partitioning the field export
+    /// parts that (a) never place two bricks in one cell, and (b) reassemble the
+    /// full field exactly. Distinct-per-cell ramp → no greedy merge, so the union
+    /// is brick-exact.
+    #[test]
+    fn inv_nocoincide_and_coverage_two_layer_partition() {
+        let field = ramp_field(16, 16);
+        let (hscale, _v) = derive_scale(30.0, 4.0, 1.0, false);
+        let size_base = crate::gui::build::cell_size_units(hscale, false);
+
+        // 2×1 grid: Base owns the left box, Layer 1 owns the right box.
+        let s = stack_with_boxes(16, 16, (2, 1), &[((0, 0), 0), ((1, 0), 1)]);
+        let plans = plan_layer_parts(&s, &field, size_base).expect("plan");
+        assert_eq!(plans.len(), 2, "two non-empty layers → two parts");
+
+        let mut all = Vec::new();
+        for plan in &plans {
+            all.extend(build_part(&field, plan));
+        }
+        assert_eq!(
+            coincident_brick_count(&all),
+            0,
+            "partitioned parts must place no two bricks in one cell (INV-NOCOINCIDE)",
+        );
+        let single = mesh_field(&field, true);
+        assert_eq!(
+            geom_multiset(&all),
+            geom_multiset(&single),
+            "two partitioned parts must reassemble the full field exactly (INV-COVERAGE)",
+        );
+    }
+
+    /// INV-DETERMINISM: the same stack + field produce byte-identical part
+    /// geometry across runs (stable part order, stable claim).
+    #[test]
+    fn inv_determinism_same_stack_same_bricks() {
+        let field = ramp_field(12, 12);
+        let (hscale, _v) = derive_scale(30.0, 4.0, 1.0, false);
+        let size_base = crate::gui::build::cell_size_units(hscale, false);
+        let s = stack_with_boxes(12, 12, (2, 2), &[((0, 0), 0), ((1, 1), 1), ((0, 1), 1)]);
+
+        let run = || {
+            let plans = plan_layer_parts(&s, &field, size_base).expect("plan");
+            plans.iter().map(|p| build_part(&field, p)).collect::<Vec<_>>()
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(a.len(), b.len(), "same part count");
+        for (pa, pb) in a.iter().zip(&b) {
+            assert_eq!(geom_multiset(pa), geom_multiset(pb), "each part is deterministic");
+        }
+    }
+
+    /// INV-EXTENT: the world-extent predicate the planner gates on rejects an
+    /// offset that would exceed Brickadia's i16 ChunkIndex bound (so a
+    /// pre-positioned part is refused, never silently clamped off-lattice). A
+    /// normal centered field fits.
+    #[test]
+    fn inv_extent_predicate_rejects_over_extent_offset() {
+        let size = crate::gui::build::cell_size_units(1, false); // 5 units/cell
+        assert!(
+            offset_fits_chunk_index(part_axis_offset(0, 64, size), 64, size),
+            "a small centered world fits the world-extent bound",
+        );
+        // A pathological pitch pushes |offset| past the bound — must be rejected.
+        let huge = u16::MAX;
+        assert!(
+            !offset_fits_chunk_index(part_axis_offset(0, 4096, huge), 4096, huge),
+            "an over-extent offset must be rejected (the gate refuses, never clamps)",
+        );
+    }
+
+    /// End-to-end: `export_layer_parts` writes ONE save PER visible non-empty
+    /// layer (brz-only, no-install) and reports each part's brick count. Cleans up.
+    #[test]
+    fn export_layer_parts_writes_one_save_per_layer() {
+        let field = hill_field(24, 18);
+        let s = stack_with_boxes(24, 18, (2, 1), &[((0, 0), 0), ((1, 0), 1)]);
+        let out = OutputOptions {
+            brdb: false,
+            brz: true,
+            install_to_brickadia: false,
+            overwrite: true,
+            skip_floor: true,
+        };
+        let parts = export_layer_parts(
+            &s, &field, out, 0.0, 0.0, crate::opt::MAX_BRICK_UNITS,
+            noop_progress(), Arc::new(AtomicBool::new(false)),
+        )
+        .expect("layer export must succeed");
+        assert_eq!(parts.len(), 2, "two non-empty layers → two saves");
+        for p in &parts {
+            assert!(p.brick_count > 0, "each part must emit bricks");
+            if !p.primary_path.as_os_str().is_empty() {
+                let _ = std::fs::remove_file(&p.primary_path);
+            }
+        }
     }
 }

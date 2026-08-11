@@ -514,7 +514,7 @@ const MAX_CHUNK_INDEX_UNITS: i64 = CHUNK_SIZE_UNITS * (i16::MAX as i64);
 /// extent (the far edge of the mosaic on this axis) must stay within
 /// ±[`MAX_CHUNK_INDEX_UNITS`]. Computed in i64 so the bound check itself cannot
 /// overflow even for an over-extent mosaic (the thing it is guarding against).
-fn offset_fits_chunk_index(offset: i32, global_cells: u32, size: u16) -> bool {
+pub(crate) fn offset_fits_chunk_index(offset: i32, global_cells: u32, size: u16) -> bool {
     let extent = i64::from(global_cells) * i64::from(size) * 2;
     let far_edge = i64::from(offset) + extent;
     i64::from(offset).abs() <= MAX_CHUNK_INDEX_UNITS && far_edge.abs() <= MAX_CHUNK_INDEX_UNITS

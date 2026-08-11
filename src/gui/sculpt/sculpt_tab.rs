@@ -27,7 +27,8 @@ use crate::gui::theme::{STATUS_ERROR_FG, STATUS_WARN_FG};
 use crate::gui::zones::{Zone, ZoneMode};
 
 use super::brush::{shape_distance, Brush, BrushShape, Falloff};
-use super::convert::{convert_heightfield, convert_heightfield_tiled, OutputOptions};
+use super::convert::{convert_heightfield, convert_heightfield_tiled, export_layer_parts, OutputOptions};
+use super::layers;
 use super::paint::{
     default_palette, gradient_palette, splatmap_to_indices, PaintGrid, PaintLayer, GRADIENT_BANDS,
     MAX_SWATCHES,
@@ -176,6 +177,8 @@ enum SculptTool {
     Paint,
     /// Freedraw omit/include zones — not a brush; it draws loops, not heights.
     Zone,
+    /// Export-layer selection — not a brush; it picks grid boxes into layers.
+    Layers,
 }
 
 /// How a zone loop is captured on the canvas.
@@ -199,6 +202,8 @@ enum SculptMode {
     Paint,
     /// Freedraw omit/include zones.
     Zone,
+    /// Export layers: carve the map into parts that export separately and overlay.
+    Layers,
 }
 
 /// The paint method inside Paint mode: freehand brush vs flood-fill bucket.
@@ -236,7 +241,7 @@ impl PickTarget {
 }
 
 impl SculptMode {
-    const ALL: [SculptMode; 4] = [Self::Shape, Self::Stamp, Self::Paint, Self::Zone];
+    const ALL: [SculptMode; 5] = [Self::Shape, Self::Stamp, Self::Paint, Self::Zone, Self::Layers];
 
     // DISPLAY names live in `help()` (each starts with the name, e.g. "Sculpt —
     // …"). The variant names `Shape`/`Zone` stay internal — `Zone` collides with
@@ -250,6 +255,7 @@ impl SculptMode {
             Self::Stamp => ph::STAMP,
             Self::Paint => ph::PAINT_BRUSH,
             Self::Zone => ph::SELECTION,
+            Self::Layers => ph::STACK,
         }
     }
 
@@ -272,6 +278,10 @@ impl SculptMode {
                 "Mask — draw regions that limit the export: Omit cuts holes, Include keeps only \
                  what's inside. Heights are untouched; it only decides which bricks are written."
             }
+            Self::Layers => {
+                "Layers — carve the map into parts that export as separate saves and snap back \
+                 together in-game, so you can build worlds too big for one save."
+            }
         }
     }
 }
@@ -288,6 +298,7 @@ impl SculptTool {
             Self::Stamp => SculptMode::Stamp,
             Self::Paint => SculptMode::Paint,
             Self::Zone => SculptMode::Zone,
+            Self::Layers => SculptMode::Layers,
         }
     }
 
@@ -303,6 +314,7 @@ impl SculptTool {
             Self::Stamp => ph::STAMP,
             Self::Paint => ph::PAINT_BRUSH,
             Self::Zone => ph::SELECTION,
+            Self::Layers => ph::STACK,
         }
     }
 
@@ -332,6 +344,7 @@ impl SculptTool {
             Self::Stamp => "Stamp — drop a parametric landform in one click (see Stamp mode).",
             Self::Paint => "Paint — color cells with the active swatch (see Paint mode).",
             Self::Zone => "Mask — draw omit/include regions for export (see Mask mode).",
+            Self::Layers => "Layers — pick grid boxes into export parts (see Layers mode).",
         }
     }
 
@@ -366,10 +379,10 @@ impl SculptTool {
                 angle: stamp.angle_deg.to_radians(),
             }
             .apply(field, brush, center),
-            // Paint and Zone are not height brushes; the canvas routes them to
-            // `handle_paint_input` / `handle_zone_input` before any dab dispatch,
-            // so these arms are never reached.
-            Self::Paint | Self::Zone => {}
+            // Paint, Zone, and Layers are not height brushes; the canvas routes
+            // them to their own handlers before any dab dispatch, so these arms are
+            // never reached.
+            Self::Paint | Self::Zone | Self::Layers => {}
         }
     }
 }
@@ -472,6 +485,12 @@ pub(crate) struct SculptState {
     /// hovered cell's height into this field and disarms (one-shot). `None` = off.
     /// Independent of the hold-E eyedropper (see [`PickTarget`]).
     armed_pick: Option<PickTarget>,
+    /// Export layers (Layers mode): the box-grid selection stack. Reset on a field
+    /// swap (cell-space, like zones/paint). MVP: box selections, single resolution.
+    layers: layers::LayerStack,
+    /// Last "Export All Parts" result line (parts written / error), shown in the
+    /// Layers panel.
+    layer_status: Option<String>,
     /// Parameters for the Stamp primitive tool (cone/mesa/crater/ramp).
     stamp: StampParams,
     /// Per-cell splat-paint palette indices, parallel to the height field (same
@@ -636,6 +655,8 @@ impl Default for SculptState {
             },
             target_height: 20.0,
             armed_pick: None,
+            layers: layers::LayerStack::new(0, 0),
+            layer_status: None,
             stamp: StampParams::default(),
             // No field yet → a 0×0 grid; `set_field` re-blanks it to the field dims.
             paint: PaintGrid::blank(0, 0),
@@ -713,6 +734,10 @@ impl SculptState {
         // dims would misindex it, so re-blank to the incoming dims (like zones +
         // undo, which also drop on a field swap).
         self.paint = PaintGrid::blank(field.width, field.height);
+        // Export layers are cell-space; a new field of different dims would
+        // misindex them, so reset to one empty Base layer (like zones/paint).
+        self.layers = layers::LayerStack::new(field.width, field.height);
+        self.layer_status = None;
         self.field = Some(field);
         self.dirty = true;
         // A new field invalidates the cached extent and any partial dirty rect:
@@ -948,6 +973,7 @@ fn draw_controls(state: &mut SculptState, ui: &mut Ui) {
             draw_paint_section(state, ui);
         }
         SculptMode::Zone => draw_zone_section(state, ui),
+        SculptMode::Layers => draw_layers_section(state, ui),
     }
     ui.add_space(8.0);
     draw_history_section(state, ui);
@@ -1065,6 +1091,7 @@ fn draw_mode_bar(state: &mut SculptState, ui: &mut Ui) {
                     SculptMode::Stamp => SculptTool::Stamp,
                     SculptMode::Paint => SculptTool::Paint,
                     SculptMode::Zone => SculptTool::Zone,
+                    SculptMode::Layers => SculptTool::Layers,
                 };
             }
         }
@@ -2082,6 +2109,12 @@ fn draw_canvas(state: &mut SculptState, ctx: &egui::Context, ui: &mut Ui) {
     if state.tool == SculptTool::Zone {
         // Zone tool: the primary button draws loops (no dabs, no brush ring).
         handle_zone_input(state, &response, rect);
+    } else if state.tool == SculptTool::Layers {
+        // Layers tool: a primary click toggles the grid box under the pointer into
+        // the active layer (no dabs, no brush ring). The overlay draws the grid +
+        // each layer's owned boxes in its color.
+        handle_layers_input(state, &response, fw, fh);
+        paint_layers_overlay(state, ui, &response, rect);
     } else {
         // Apply sculpt dabs from a primary-button drag.
         handle_sculpt_input(state, &response, fw, fh);
@@ -2105,6 +2138,200 @@ fn draw_canvas(state: &mut SculptState, ctx: &egui::Context, ui: &mut Ui) {
 /// Capture freedraw zones on the canvas (spec §"Capture UX"). Lasso records a
 /// decimated drag; polygon collects clicked vertices. Esc cancels an in-progress
 /// polygon before it is committed (so it never enters undo history).
+/// Layers-mode canvas input: a primary click toggles the grid box under the
+/// pointer into/out of the ACTIVE layer (a fully-owned box clears, otherwise it's
+/// added). Box ranges come from `grid_div`; the pointer maps to a cell via
+/// `screen_to_cell` (so it's correct at any zoom/pan/rotation).
+fn handle_layers_input(state: &mut SculptState, response: &egui::Response, fw: u32, fh: u32) {
+    if !response.clicked_by(egui::PointerButton::Primary) {
+        return;
+    }
+    let Some(ptr) = response.interact_pointer_pos() else { return };
+    let (cxf, cyf) = screen_to_cell(state, ptr);
+    if cxf < 0.0 || cyf < 0.0 {
+        return;
+    }
+    let (cx, cy) = (cxf as u32, cyf as u32);
+    if cx >= fw || cy >= fh {
+        return;
+    }
+    let (cols, rows) = (state.layers.grid_div.0.max(1), state.layers.grid_div.1.max(1));
+    let bi = (cx * cols / fw).min(cols - 1);
+    let bj = (cy * rows / fh).min(rows - 1);
+    let on = !state.layers.box_full_in_active(fw, fh, bi, bj);
+    state.layers.paint_box(fw, fh, bi, bj, on);
+}
+
+/// Draw the box-grid overlay for Layers mode: grid lines + each visible layer's
+/// owned boxes tinted in its color (the active layer brighter). All corners go
+/// through `cell_to_screen`, so the overlay tracks zoom/pan/view-rotation exactly.
+fn paint_layers_overlay(state: &SculptState, ui: &Ui, _response: &egui::Response, rect: Rect) {
+    let Some(field) = state.field.as_ref() else { return };
+    let (fw, fh) = (field.width, field.height);
+    let (cols, rows) = (state.layers.grid_div.0.max(1), state.layers.grid_div.1.max(1));
+    let painter = ui.painter_at(rect);
+
+    // Owned-box tints (bottom layer first so the active/top color reads on top).
+    for (li, layer) in state.layers.layers.iter().enumerate() {
+        if !layer.visible {
+            continue;
+        }
+        let [r, g, b, _] = layer.color;
+        let alpha = if li == state.layers.active { 0x55 } else { 0x26 };
+        let fill = Color32::from_rgba_unmultiplied(r, g, b, alpha);
+        for bj in 0..rows {
+            for bi in 0..cols {
+                let (x0, y0, x1, y1) = state.layers.box_cell_range(fw, fh, bi, bj);
+                if x0 >= x1 || y0 >= y1 {
+                    continue;
+                }
+                // MVP picks whole boxes, so the NW cell's bit == the whole box.
+                if !layer.box_mask.get((y0 * fw + x0) as usize).copied().unwrap_or(false) {
+                    continue;
+                }
+                let quad = vec![
+                    cell_to_screen(state, x0 as f32, y0 as f32),
+                    cell_to_screen(state, x1 as f32, y0 as f32),
+                    cell_to_screen(state, x1 as f32, y1 as f32),
+                    cell_to_screen(state, x0 as f32, y1 as f32),
+                ];
+                painter.add(egui::Shape::convex_polygon(quad, fill, Stroke::NONE));
+            }
+        }
+    }
+
+    // Grid lines on top.
+    let grid_stroke = Stroke::new(1.0, crate::gui::theme::ACCENT.gamma_multiply(0.35));
+    for i in 0..=cols {
+        let x = (i * fw / cols) as f32;
+        painter.line_segment(
+            [cell_to_screen(state, x, 0.0), cell_to_screen(state, x, fh as f32)],
+            grid_stroke,
+        );
+    }
+    for j in 0..=rows {
+        let y = (j * fh / rows) as f32;
+        painter.line_segment(
+            [cell_to_screen(state, 0.0, y), cell_to_screen(state, fw as f32, y)],
+            grid_stroke,
+        );
+    }
+}
+
+/// Run "Export All Parts" synchronously (MVP): mesh + write one pre-positioned
+/// save per visible, non-empty layer, then report the count. Synchronous is fine
+/// for the MVP; a worker thread (like `start_convert`) is a follow-up for very
+/// large mosaics. View-rotation is NOT baked here yet (Phase 2) — layers export
+/// at the stored 0° orientation.
+fn export_all_parts(state: &mut SculptState) {
+    let Some(field) = state.field.clone() else { return };
+    let mut field = field;
+    field.meta.source_name = state.output_name.clone();
+    field.meta.studs_per_meter = state.studs_per_meter;
+    field.meta.vertical_exaggeration = state.vertical_exaggeration;
+    field.meta.micro = state.micro;
+
+    let progress: build::ProgressFn = Arc::new(|_, _| {});
+    let cancel = Arc::new(AtomicBool::new(false));
+    match export_layer_parts(
+        &state.layers,
+        &field,
+        state.out,
+        state.floor_level_m,
+        state.omit_below_m,
+        state.max_brick_units,
+        progress,
+        cancel,
+    ) {
+        Ok(parts) => {
+            let total: usize = parts.iter().map(|p| p.brick_count).sum();
+            let installed = parts.iter().filter(|p| p.installed_path.is_some()).count();
+            let warns = parts.iter().filter(|p| p.install_warning.is_some()).count();
+            let mut msg = format!(
+                "✔ {} part(s) · {total} bricks · {installed} installed",
+                parts.len(),
+            );
+            // Show where the saves landed (the staging dir) + a sample part name.
+            if let Some(p) = parts.first() {
+                if let Some(dir) = p.primary_path.parent() {
+                    msg.push_str(&format!(" → {}", dir.display()));
+                }
+                msg.push_str(&format!("  (e.g. “{}”)", p.layer_name));
+            }
+            if warns > 0 {
+                msg.push_str(&format!(" · {warns} install warning(s)"));
+            }
+            state.layer_status = Some(msg);
+            state.last_error = None;
+        }
+        Err(e) => state.layer_status = Some(format!("✗ {e}")),
+    }
+}
+
+/// Layers panel (Layers mode): the layer list (+ add), the box grid divisions, and
+/// "Export All Parts". MVP: box selection + single resolution. Color/eye/recolor
+/// (Phase 3), lasso-in-layer (Phase 2), and per-layer resolution (Phase 1) extend
+/// this panel without changing the export contract.
+fn draw_layers_section(state: &mut SculptState, ui: &mut Ui) {
+    section_header(ui, "Layers");
+    let active = state.layers.active;
+    let mut select: Option<usize> = None;
+    for (i, layer) in state.layers.layers.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+            let [r, g, b, _] = layer.color;
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(3), Color32::from_rgb(r, g, b));
+            if ui.selectable_label(i == active, &layer.name).clicked() {
+                select = Some(i);
+            }
+        });
+    }
+    if let Some(i) = select {
+        state.layers.active = i;
+    }
+    if ui.button("+ Add layer").clicked()
+        && let Some(f) = state.field.as_ref()
+    {
+        let (fw, fh) = (f.width, f.height);
+        state.layers.add_layer(fw, fh);
+    }
+
+    ui.separator();
+    section_header(ui, "Grid");
+    ui.horizontal(|ui| {
+        ui.label("Columns");
+        let mut c = state.layers.grid_div.0;
+        if ui.add(egui::DragValue::new(&mut c).range(1..=64)).changed() {
+            state.layers.grid_div.0 = c;
+        }
+        ui.label("Rows");
+        let mut r = state.layers.grid_div.1;
+        if ui.add(egui::DragValue::new(&mut r).range(1..=64)).changed() {
+            state.layers.grid_div.1 = r;
+        }
+    });
+    ui.small("Click boxes on the map to add them to the selected layer.");
+
+    ui.separator();
+    let has_field = state.field.is_some();
+    if ui
+        .add_enabled(
+            has_field,
+            egui::Button::new("⬛  Export All Parts").min_size(Vec2::new(220.0, 28.0)),
+        )
+        .on_hover_text(
+            "Export each layer as its own save, written at true world coordinates — load them all \
+             in Brickadia and they snap together into one world.",
+        )
+        .clicked()
+    {
+        export_all_parts(state);
+    }
+    if let Some(msg) = &state.layer_status {
+        ui.colored_label(STATUS_WARN_FG, msg);
+    }
+}
+
 fn handle_zone_input(state: &mut SculptState, response: &egui::Response, _rect: Rect) {
     match state.zone_style {
         ZoneStyle::Lasso => handle_zone_lasso(state, response),
