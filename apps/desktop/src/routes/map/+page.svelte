@@ -53,6 +53,12 @@
   let predictError = $state("");
   let predicting = $state(false);
   let drawMode = $state(false);
+  /** Basemap: day = CARTO Voyager (light), night = CARTO dark_all. */
+  let basemapMode = $state<"day" | "night">(
+    (typeof localStorage !== "undefined" &&
+      (localStorage.getItem("bwt-basemap") as "day" | "night" | null)) ||
+      "day",
+  );
   let mapReady = $state(false);
   let building = $state(false);
   let buildProgress = $state<BuildProgress | null>(null);
@@ -96,6 +102,89 @@
   const BBOX_SRC = "bbox-src";
   const BBOX_FILL = "bbox-fill";
   const BBOX_LINE = "bbox-line";
+
+  function basemapStyle(mode: "day" | "night"): maplibregl.StyleSpecification {
+    // Free CARTO basemaps (no token). Voyager = readable day; dark_all = night.
+    const tiles =
+      mode === "night"
+        ? "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png"
+        : "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png";
+    return {
+      version: 8,
+      sources: {
+        carto: {
+          type: "raster",
+          tiles: [tiles],
+          tileSize: 256,
+          attribution:
+            '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+        },
+      },
+      layers: [
+        {
+          id: "carto",
+          type: "raster",
+          source: "carto",
+          minzoom: 0,
+          maxzoom: 20,
+        },
+      ],
+    };
+  }
+
+  function ensureBboxLayers() {
+    if (!map) return;
+    if (!map.getSource(BBOX_SRC)) {
+      map.addSource(BBOX_SRC, {
+        type: "geojson",
+        data: {
+          type: "FeatureCollection",
+          features: [bboxFeature(north, south, east, west)],
+        },
+      });
+      map.addLayer({
+        id: BBOX_FILL,
+        type: "fill",
+        source: BBOX_SRC,
+        paint: {
+          "fill-color": "#3d7ea6",
+          "fill-opacity": 0.22,
+        },
+      });
+      map.addLayer({
+        id: BBOX_LINE,
+        type: "line",
+        source: BBOX_SRC,
+        paint: {
+          "line-color": "#5eb0e0",
+          "line-width": 2,
+        },
+      });
+    } else {
+      setBboxOnMap(north, south, east, west);
+    }
+  }
+
+  function setBasemapMode(mode: "day" | "night") {
+    basemapMode = mode;
+    try {
+      localStorage.setItem("bwt-basemap", mode);
+    } catch {
+      /* private mode */
+    }
+    if (!map) return;
+    const center = map.getCenter();
+    const zoom = map.getZoom();
+    mapReady = false;
+    map.setStyle(basemapStyle(mode));
+    map.once("style.load", () => {
+      if (!map) return;
+      map.setCenter(center);
+      map.setZoom(zoom);
+      ensureBboxLayers();
+      mapReady = true;
+    });
+  }
 
   function clampBbox() {
     // Ensure north > south, east >= west after field edits
@@ -221,29 +310,7 @@
 
     map = new maplibregl.Map({
       container: mapEl,
-      style: {
-        version: 8,
-        sources: {
-          carto: {
-            type: "raster",
-            tiles: [
-              "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png",
-            ],
-            tileSize: 256,
-            attribution:
-              '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
-          },
-        },
-        layers: [
-          {
-            id: "carto",
-            type: "raster",
-            source: "carto",
-            minzoom: 0,
-            maxzoom: 20,
-          },
-        ],
-      },
+      style: basemapStyle(basemapMode),
       center: [(west + east) / 2, (north + south) / 2],
       zoom: 10,
       attributionControl: { compact: true },
@@ -254,31 +321,7 @@
 
     map.on("load", () => {
       if (!map) return;
-      map.addSource(BBOX_SRC, {
-        type: "geojson",
-        data: {
-          type: "FeatureCollection",
-          features: [bboxFeature(north, south, east, west)],
-        },
-      });
-      map.addLayer({
-        id: BBOX_FILL,
-        type: "fill",
-        source: BBOX_SRC,
-        paint: {
-          "fill-color": "#3d7ea6",
-          "fill-opacity": 0.22,
-        },
-      });
-      map.addLayer({
-        id: BBOX_LINE,
-        type: "line",
-        source: BBOX_SRC,
-        paint: {
-          "line-color": "#5eb0e0",
-          "line-width": 2,
-        },
-      });
+      ensureBboxLayers();
       map.fitBounds(
         [
           [west, south],
@@ -511,6 +554,26 @@
       >
         {drawMode ? "Drawing…" : "Draw box"}
       </button>
+      <div class="basemap-toggle" role="group" aria-label="Basemap day or night">
+        <button
+          type="button"
+          class="sec"
+          class:on={basemapMode === "day"}
+          onclick={() => setBasemapMode("day")}
+          title="Light basemap (CARTO Voyager)"
+        >
+          Day
+        </button>
+        <button
+          type="button"
+          class="sec"
+          class:on={basemapMode === "night"}
+          onclick={() => setBasemapMode("night")}
+          title="Dark basemap (CARTO dark)"
+        >
+          Night
+        </button>
+      </div>
     </div>
 
     <div class="grid2">
@@ -792,7 +855,18 @@
   }
   .actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.45rem;
+    align-items: center;
+  }
+  .basemap-toggle {
+    display: flex;
+    gap: 0.25rem;
+    margin-left: auto;
+  }
+  .basemap-toggle .sec {
+    padding: 0.4rem 0.65rem;
+    min-width: 3.2rem;
   }
   .grid2 {
     display: grid;
