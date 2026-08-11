@@ -26,18 +26,17 @@ Ticket BWT-F2.
 
 ## F3 — Streaming / columnar mesher
 
-**Goal:** Lift cell budget honestly by removing per-(height,color) plane explosion in `opt/generate.rs`.
+**Full spec + implementation plan:** [F3-STREAMING-MESHER.md](./F3-STREAMING-MESHER.md)
 
-**Acceptance:** same visual for small maps; ≥1M cells path without OOM on 32 GB; tests for byte-identity on small fixture optional.
-
-Ticket BWT-F3. Design first (spec), then impl.
+Strip/column streaming first (`GenOptions.streaming_mesh`); flag off = byte-identical; then Auto + raise `MAX_DEM_CELLS`. Ticket BWT-F3.
 
 ## F4 — Upstream harvest
 
-Selective: verify HD Map end-to-end docs; optional wedge surface behind flag. **No** full Meshiest merge.
+[F4-UPSTREAM-HARVEST.md](./F4-UPSTREAM-HARVEST.md) — HD Map already wired; no full merge.
 
-Ticket BWT-F4.
+## F5 — In-game FLATS + Phase 3 exit
 
-## F5 — In-game FLATS
-
-User confirms 1 brick = 3 flats per `docs/IN_GAME_TEST.md`. Ticket BWT-F5.
+**Full procedure:** [F5-FLATS-AND-IN-GAME.md](./F5-FLATS-AND-IN-GAME.md)  
+**Constants:** `src/brick_units.rs`  
+**Short checklist:** `docs/IN_GAME_TEST.md`  
+Tickets BWT-F5 + BWT-3.9 — human measurement required.

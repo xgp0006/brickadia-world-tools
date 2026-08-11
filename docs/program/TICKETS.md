@@ -48,7 +48,7 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 | BWT-3.6 | DEM source picker (Terrarium/Mapbox/OpenTopo/3DEP) + keys | done |
 | BWT-3.7 | Install + overwrite + output name | done |
 | BWT-3.8 | Grid/tile path (or link “use Grid in egui until…”) | done |
-| BWT-3.9 | Phase 3 exit: one US 3DEP + one Terrarium world installed | doing |
+| BWT-3.9 | Phase 3 exit: one US 3DEP + one Terrarium world installed | ready (see F5-FLATS-AND-IN-GAME.md §3) |
 
 ## Phase 4 — Sculpt
 
@@ -76,9 +76,9 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 | BWT-F0 | Downsample rename + window + tooltips | done |
 | BWT-F1 | MAX_DEM_CELLS 400k + USGS 3DEP wire | done |
 | BWT-F2 | OpenTopo COP30 (or extra demtype) | done |
-| BWT-F3 | Streaming/columnar mesher design + impl | doing |
+| BWT-F3 | Streaming/columnar mesher design + impl | design complete — impl pending (F3-STREAMING-MESHER.md) |
 | BWT-F4 | Upstream wedge/hdmap selective harvest | done |
-| BWT-F5 | In-game FLATS_PER_BRICK confirm | todo |
+| BWT-F5 | In-game FLATS_PER_BRICK confirm | ready (F5-FLATS-AND-IN-GAME.md §4 + brick_units) |
 
 ## House / process
 

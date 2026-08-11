@@ -8,6 +8,8 @@
 | [program/TICKETS.md](./program/TICKETS.md) | Ticket IDs BWT-* for agents |
 | [program/phases/](./program/phases/) | Phase 0–5 PRDs (exit gates) |
 | [program/fidelity/FIDELITY-PRDS.md](./program/fidelity/FIDELITY-PRDS.md) | Fidelity track F0–F5 |
+| [program/fidelity/F3-STREAMING-MESHER.md](./program/fidelity/F3-STREAMING-MESHER.md) | Streaming mesher full spec + agent handoff |
+| [program/fidelity/F5-FLATS-AND-IN-GAME.md](./program/fidelity/F5-FLATS-AND-IN-GAME.md) | In-game exit + FLATS calibration procedure |
 | [TAURI_MIGRATION.md](./TAURI_MIGRATION.md) | Shell migration architecture |
 | [superpowers/specs/](./superpowers/specs/) | Feature design specs (source of truth for shipped design) |
 | [superpowers/plans/](./superpowers/plans/) | Implementation plans (phased) |

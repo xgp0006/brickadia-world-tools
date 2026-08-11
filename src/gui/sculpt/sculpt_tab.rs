@@ -1165,82 +1165,14 @@ fn studs_per_cell(meta: &FieldMeta) -> f32 {
 
 // --- Brickadia vertical parity: heights in BRICKS + FLATS (plates) ---
 //
-// The export emits procedural bricks whose smallest vertical step (parity 2 →
-// `BrickSize.z = 2`) is one FLAT/plate, and `z` steps by `brick_height·2`
-// (`opt/generate.rs::emit_column_bricks`), so ONE FLAT = 4 units of the heightmap
-// height `h = round(m · vertical_scale)`. Derived from our source — solid.
-// A standard BRICK = 3 flats (LEGO/Brickadia ratio) — the ONE value NOT in our
-// code; confirm against the live game (matches the user's "based off LEGO heights").
-const H_UNITS_PER_FLAT: f32 = 4.0;
-const FLATS_PER_BRICK: i64 = 3;
+// Vertical UI units: single source of truth in `crate::brick_units` (BWT-F5).
+use crate::brick_units::{
+    flats_to_meters, fmt_bricks_flats, meters_to_flats, parse_bricks_flats,
+};
 
 /// Heightmap units per meter at the current scale (the vertical leg of `derive_scale`).
 fn vertical_units_per_meter(meta: &FieldMeta) -> f32 {
     build_derive_scale(meta.cell_m, meta.studs_per_meter, meta.vertical_exaggeration, meta.micro).1
-}
-fn meters_to_flats(m: f32, vscale: f32) -> f32 {
-    m * vscale / H_UNITS_PER_FLAT
-}
-fn flats_to_meters(flats: f32, vscale: f32) -> f32 {
-    if vscale > 0.0 { flats * H_UNITS_PER_FLAT / vscale } else { 0.0 }
-}
-/// Render a flat count as Brickadia "Nb Mf" (bricks + flats). Sign-aware so a
-/// negative height (e.g. a Stamp peak that digs a crater) reads "-2b 1f".
-fn fmt_bricks_flats(flats: f32) -> String {
-    let signed = flats.round() as i64;
-    let sign = if signed < 0 { "-" } else { "" };
-    let total = signed.abs();
-    let (b, f) = (total / FLATS_PER_BRICK, total % FLATS_PER_BRICK);
-    match (b, f) {
-        (0, f) => format!("{sign}{f}f"),
-        (b, 0) => format!("{sign}{b}b"),
-        (b, f) => format!("{sign}{b}b {f}f"),
-    }
-}
-/// Parse "3b 1f" / "3b1f" / "3b" / "1f" / a bare flat count → flats. Tolerates a
-/// space between the brick and flat parts or none (char-scan, not whitespace-split).
-fn parse_bricks_flats(s: &str) -> Option<f64> {
-    let s = s.trim().to_lowercase();
-    if s.is_empty() {
-        return None;
-    }
-    // A leading '-' negates the WHOLE expression (matches the formatter, which
-    // prints the sign once: -5 flats → "-1b 2f"). Strip it, parse the magnitude
-    // as positive, negate at the end so fmt↔parse round-trip on negatives.
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest.trim_start()),
-        None => (false, s.as_str()),
-    };
-    if body.is_empty() {
-        return None;
-    }
-    let signed = |v: f64| if neg { -v } else { v };
-    if let Ok(n) = body.parse::<f64>() {
-        return Some(signed(n)); // a bare number = flats
-    }
-    let mut flats = 0.0;
-    let mut num = String::new();
-    let mut saw_unit = false;
-    for ch in body.chars() {
-        if ch.is_ascii_digit() || ch == '.' {
-            num.push(ch);
-        } else if ch == 'b' || ch == 'f' {
-            let v: f64 = num.trim().parse().ok()?;
-            num.clear();
-            flats += if ch == 'b' { v * FLATS_PER_BRICK as f64 } else { v };
-            saw_unit = true;
-        } else if ch.is_whitespace() {
-            if !num.is_empty() {
-                return None; // a number with no unit before a space
-            }
-        } else {
-            return None; // junk
-        }
-    }
-    if !num.is_empty() {
-        return None; // trailing number with no unit
-    }
-    saw_unit.then(|| signed(flats))
 }
 /// A height control edited in Brickadia bricks+flats, stored in meters. `vscale`
 /// is [`vertical_units_per_meter`] for the live field. `signed` allows negative

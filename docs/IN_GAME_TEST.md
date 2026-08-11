@@ -1,57 +1,79 @@
 # In-game test checklist (Brickadia)
 
-Run after `cargo build --release --features gui`. Game: Steam **2199420** (Proton).
+**Full procedures:**  
+- Phase 3 exit + FLATS calibration → [`program/fidelity/F5-FLATS-AND-IN-GAME.md`](./program/fidelity/F5-FLATS-AND-IN-GAME.md)  
+- Streaming mesher plan → [`program/fidelity/F3-STREAMING-MESHER.md`](./program/fidelity/F3-STREAMING-MESHER.md)
 
-Install path (typical):  
-`~/.steam/steam/steamapps/compatdata/2199420/pfx/drive_c/users/steamuser/AppData/Local/Brickadia/Saved/Worlds/`  
-Prefabs: `…/Saved/Prefabs/`
+Run after `cargo build --release --features gui` (or Tauri Map build).  
+Game: Steam **2199420** (Proton).
 
-## Smoke (every release) — BWT-3.9 / BWT-F5
+**Worlds:**  
+`~/.steam/steam/steamapps/compatdata/2199420/pfx/drive_c/users/steamuser/AppData/Local/Brickadia/Saved/Worlds/`
 
-**Agent/tooling smoke (no game):** Terrarium write  
-`~/.local/share/heightmap2brz/builds/smoke-terrarium.brdb` (2026-08-11, ~15k bricks).
+---
 
-**Your eyes (required for ticket close):**
+## BWT-3.9 — Phase 3 exit (load worlds)
 
-- [ ] Map (egui or Tauri): AWS Terrarium + small bbox → generate → **Overwrite** if re-testing same name
-- [ ] World loads; terrain visible (not “only spawn”)
-- [ ] Walkable surface; spawn above peak
-- [ ] Convert: `example_maps/gradient.png` → loads in-game
-- [ ] **USGS 3DEP** (US box only): finer relief than Terrarium for same km² when budget allows
-- [ ] **Confirm FLATS_PER_BRICK:** plateau of known height vs Brickadia UI  
-  - Code: **1 brick = 3 flats**, **1 flat = 4 height units** after vscale  
-  - Result: ________ (date/build)
+Tooling smoke (no game): `~/.local/share/heightmap2brz/builds/smoke-terrarium.brdb`.
 
-## Smoke (continued)
+| # | Check | ☐ |
+|---|--------|---|
+| 3A | Terrarium small box → install → load; terrain not “only spawn” | |
+| 3B | USGS 3DEP CONUS small box → load; looks finer than Terrarium (or N/A) | |
+| 3C | Convert `example_maps/gradient.png` → load | |
 
-- [ ] Map tab: AWS Terrarium + default bbox → generate → **Overwrite** if re-testing same name
-- [ ] World loads; terrain visible (not “only spawn”)
-- [ ] Walkable surface; spawn above peak
-- [ ] Convert tab: sample PNG from `example_maps/` → loads in-game
+**Signed:** date ________  commit ________  shell egui/Tauri ________
 
-## Scale / units
+---
 
-- [ ] Horizontal scale 1 vs 4: world size changes as expected (studs readout)
-- [ ] **Micro** mode: same physical span as normal at matched settings (post-2026-06-25)
-- [ ] **Confirm FLATS_PER_BRICK:** measure a known height (e.g. set plateau) vs Brickadia UI  
-  - Code assumes **1 brick = 3 flats**, **1 flat = 4 height units** after `vscale`  
-  - Record result here / vault if different
+## BWT-F5 — FLATS_PER_BRICK
+
+Code contract (`src/brick_units.rs`):
+
+- **1 flat** = 4 heightmap units of `h` (mesh-derived)  
+- **1 brick (UI)** = **3 flats** (game convention — measure this)
+
+Pre-flight:
+
+```bash
+cargo test --lib brick_units -- --nocapture
+```
+
+| UI | Expected plates if ratio=3 | Observed | ☐ |
+|----|----------------------------|----------|---|
+| `1f` | 1 | | |
+| `1b` | 3 | | |
+| `1b 1f` | 4 | | |
+| `2b` | 6 | | |
+
+**Verdict:** ☐ confirmed 3 · ☐ other: ____ → change `FLATS_PER_BRICK` only in `brick_units.rs`
+
+Full step-by-step: **F5-FLATS-AND-IN-GAME.md** §4.
+
+---
+
+## Smoke (every release)
+
+- [ ] Map: Terrarium + overwrite → walkable  
+- [ ] Convert sample PNG  
+- [ ] Scale 1 vs 4 studs/m changes world size  
+- [ ] Micro matches normal physical span  
 
 ## Sculpt
 
-- [ ] Brush raise/lower; undo/redo
-- [ ] Zone omit: hole through tall terrain; zone include: only island kept
-- [ ] Rotation 45° then export: ridge orientation matches preview (no mirror)
-- [ ] Splat paint colors visible on bricks
-- [ ] Layers: two layers → two saves → both load and assemble
+- [ ] Raise/lower; undo  
+- [ ] Zone omit/include  
+- [ ] Rotation export orientation  
+- [ ] Splat colors  
+- [ ] Layers multi-save  
 
-## Tiled export
+## Grid / tiles
 
-- [ ] Force tile / large bbox: multiple `.brdb` or stitched; no seam holes at joins
-- [ ] Max brick size slider: flat plains don’t vanish (lower max if holes)
+- [ ] Grid 2×2 or large bbox: no seam holes  
+- [ ] Max brick size: plains don’t vanish  
 
 ## Gotchas
 
-- Stale world: enable **Overwrite existing world** or open the newest name (`-2`, `-3`…)
-- Map preview is always OSM — DEM/imagery pickers do not recolor the basemap
-- PNG heightmap re-import loses studs/m metadata — re-set panel values after import
+- Overwrite or open `-2`/`-3`  
+- Map basemap ≠ DEM colors  
+- PNG re-import loses studs/m metadata  

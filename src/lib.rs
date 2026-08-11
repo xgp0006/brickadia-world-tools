@@ -1,4 +1,5 @@
 pub mod api;
+pub mod brick_units;
 pub mod map;
 pub mod opt;
 pub mod util;
