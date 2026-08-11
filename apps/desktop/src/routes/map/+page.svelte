@@ -59,6 +59,15 @@
       (localStorage.getItem("bwt-basemap") as "day" | "night" | null)) ||
       "day",
   );
+  /**
+   * Relief: free AWS Terrarium DEM tiles (same source as Map DEM default).
+   * hillshade = 2D shaded relief; terrain3d = MapLibre mesh + pitch.
+   */
+  let reliefMode = $state<"off" | "hillshade" | "terrain3d">(
+    (typeof localStorage !== "undefined" &&
+      (localStorage.getItem("bwt-relief") as "off" | "hillshade" | "terrain3d" | null)) ||
+      "hillshade",
+  );
   let mapReady = $state(false);
   let building = $state(false);
   let buildProgress = $state<BuildProgress | null>(null);
@@ -102,6 +111,11 @@
   const BBOX_SRC = "bbox-src";
   const BBOX_FILL = "bbox-fill";
   const BBOX_LINE = "bbox-line";
+  const DEM_SRC = "terrarium-dem";
+  const HILLSHADE_LAYER = "terrarium-hillshade";
+  // Free public Terrarium pyramid (Mapzen/AWS) — max z15 real data.
+  const TERRARIUM_TILES =
+    "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
 
   function basemapStyle(mode: "day" | "night"): maplibregl.StyleSpecification {
     // Free CARTO basemaps (no token). Voyager = readable day; dark_all = night.
@@ -130,6 +144,19 @@
         },
       ],
     };
+  }
+
+  function ensureDemSource() {
+    if (!map || map.getSource(DEM_SRC)) return;
+    map.addSource(DEM_SRC, {
+      type: "raster-dem",
+      tiles: [TERRARIUM_TILES],
+      encoding: "terrarium",
+      tileSize: 256,
+      maxzoom: 15,
+      attribution:
+        'Elevation <a href="https://github.com/tilezen/joerd">AWS Terrarium / Mapzen</a>',
+    });
   }
 
   function ensureBboxLayers() {
@@ -165,6 +192,67 @@
     }
   }
 
+  /** Hillshade + optional 3D terrain mesh (MapLibre). Bbox stays on top. */
+  function applyReliefMode(mode: "off" | "hillshade" | "terrain3d") {
+    if (!map || !map.isStyleLoaded()) return;
+
+    // Clear previous relief layers / terrain.
+    if (map.getLayer(HILLSHADE_LAYER)) {
+      map.removeLayer(HILLSHADE_LAYER);
+    }
+    try {
+      map.setTerrain(null);
+    } catch {
+      /* no terrain */
+    }
+
+    if (mode === "off") {
+      map.easeTo({ pitch: 0, bearing: 0, duration: 400 });
+      return;
+    }
+
+    ensureDemSource();
+
+    // Insert hillshade under bbox so selection stays readable.
+    const beforeId = map.getLayer(BBOX_FILL) ? BBOX_FILL : undefined;
+    if (!map.getLayer(HILLSHADE_LAYER)) {
+      map.addLayer(
+        {
+          id: HILLSHADE_LAYER,
+          type: "hillshade",
+          source: DEM_SRC,
+          maxzoom: 18,
+          paint: {
+            "hillshade-exaggeration": mode === "terrain3d" ? 0.45 : 0.65,
+            "hillshade-shadow-color": "#0a0a12",
+            "hillshade-highlight-color": "#ffffff",
+            "hillshade-accent-color": "#4a5568",
+            "hillshade-illumination-direction": 315,
+            "hillshade-illumination-anchor": "viewport",
+          },
+        },
+        beforeId,
+      );
+    }
+
+    if (mode === "terrain3d") {
+      map.setTerrain({ source: DEM_SRC, exaggeration: 1.6 });
+      map.easeTo({ pitch: 55, bearing: map.getBearing() || -18, duration: 500 });
+    } else {
+      map.easeTo({ pitch: 0, bearing: 0, duration: 400 });
+    }
+  }
+
+  function setReliefMode(mode: "off" | "hillshade" | "terrain3d") {
+    reliefMode = mode;
+    try {
+      localStorage.setItem("bwt-relief", mode);
+    } catch {
+      /* private mode */
+    }
+    applyReliefMode(mode);
+  }
+
   function setBasemapMode(mode: "day" | "night") {
     basemapMode = mode;
     try {
@@ -175,6 +263,8 @@
     if (!map) return;
     const center = map.getCenter();
     const zoom = map.getZoom();
+    const pitch = map.getPitch();
+    const bearing = map.getBearing();
     mapReady = false;
     map.setStyle(basemapStyle(mode));
     map.once("style.load", () => {
@@ -182,6 +272,11 @@
       map.setCenter(center);
       map.setZoom(zoom);
       ensureBboxLayers();
+      applyReliefMode(reliefMode);
+      if (reliefMode === "terrain3d") {
+        map.setPitch(pitch || 55);
+        map.setBearing(bearing);
+      }
       mapReady = true;
     });
   }
@@ -316,12 +411,16 @@
       attributionControl: { compact: true },
     });
 
-    map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-left");
+    map.addControl(
+      new maplibregl.NavigationControl({ showCompass: true, visualizePitch: true }),
+      "top-left",
+    );
     map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
 
     map.on("load", () => {
       if (!map) return;
       ensureBboxLayers();
+      applyReliefMode(reliefMode);
       map.fitBounds(
         [
           [west, south],
@@ -575,6 +674,40 @@
         </button>
       </div>
     </div>
+
+    <div class="basemap-toggle relief-toggle" role="group" aria-label="Terrain relief">
+      <button
+        type="button"
+        class="sec"
+        class:on={reliefMode === "off"}
+        onclick={() => setReliefMode("off")}
+        title="Flat basemap only"
+      >
+        Flat
+      </button>
+      <button
+        type="button"
+        class="sec"
+        class:on={reliefMode === "hillshade"}
+        onclick={() => setReliefMode("hillshade")}
+        title="2D hillshade from free AWS Terrarium DEM"
+      >
+        Relief
+      </button>
+      <button
+        type="button"
+        class="sec"
+        class:on={reliefMode === "terrain3d"}
+        onclick={() => setReliefMode("terrain3d")}
+        title="3D terrain mesh (drag with right mouse / touch to orbit)"
+      >
+        3D
+      </button>
+    </div>
+    <p class="hint small">
+      Relief/3D uses free Terrarium elevation tiles (preview only — build still uses DEM source
+      below).
+    </p>
 
     <div class="grid2">
       <label>
@@ -867,6 +1000,18 @@
   .basemap-toggle .sec {
     padding: 0.4rem 0.65rem;
     min-width: 3.2rem;
+  }
+  .relief-toggle {
+    margin-left: 0;
+    width: 100%;
+  }
+  .relief-toggle .sec {
+    flex: 1;
+  }
+  .hint.small {
+    font-size: 0.72rem;
+    margin: -0.25rem 0 0;
+    opacity: 0.85;
   }
   .grid2 {
     display: grid;
