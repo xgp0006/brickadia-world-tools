@@ -78,6 +78,12 @@ pub struct ConvertRequest {
     pub lrgb: bool,
     #[serde(default)]
     pub snap: bool,
+    /// After a successful write, copy into Brickadia Worlds/Prefabs (soft-fail).
+    #[serde(default)]
+    pub install: bool,
+    /// When installing, overwrite `<stem>.<ext>` instead of suffixing `-2`, …
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 fn default_horizontal_size() -> u16 {
@@ -101,6 +107,12 @@ pub struct ConvertProgress {
 pub struct ConvertResult {
     pub out_file: PathBuf,
     pub absolute_path: PathBuf,
+    /// Present when `install` succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_path: Option<PathBuf>,
+    /// Soft-fail message when convert wrote but install did not (e.g. no Proton prefix).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_warning: Option<String>,
 }
 
 impl ConvertRequest {
@@ -146,11 +158,18 @@ pub fn convert_heightmap(
     progress: impl Fn(ConvertProgress),
     is_cancelled: impl Fn() -> bool,
 ) -> Result<ConvertResult, String> {
-    let out_str = request
-        .out_file
+    let out_file = resolve_out_file(&request)?;
+    let out_str = out_file
         .to_str()
         .ok_or_else(|| "out_file path is not valid UTF-8".to_string())?
         .to_string();
+
+    if let Some(parent) = out_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create output directory {}: {e}", parent.display()))?;
+        }
+    }
 
     let progress = RefCell::new(progress);
     let report = |phase: &str, frac: f32| {
@@ -196,17 +215,57 @@ pub fn convert_heightmap(
         return Err("cancelled".into());
     }
 
-    let absolute_path = request
-        .out_file
+    let absolute_path = out_file
         .canonicalize()
-        .unwrap_or_else(|_| request.out_file.clone());
+        .unwrap_or_else(|_| out_file.clone());
+
+    let mut installed_path = None;
+    let mut install_warning = None;
+    if request.install {
+        report("Installing", 0.98);
+        match crate::api::install::install_save(&absolute_path, request.overwrite) {
+            Ok(dest) => installed_path = Some(dest),
+            Err(e) => {
+                // Soft-fail: .brdb/.brz is already on disk.
+                install_warning = Some(if crate::api::install::is_prefix_missing(&e) {
+                    format!(
+                        "{e} — import {} manually",
+                        absolute_path.display()
+                    )
+                } else {
+                    format!(
+                        "install into Brickadia failed ({e}) — the save was still written to {}; import it manually",
+                        absolute_path.display()
+                    )
+                });
+            }
+        }
+    }
 
     report("Finished", 1.0);
 
     Ok(ConvertResult {
-        out_file: request.out_file,
+        out_file,
         absolute_path,
+        installed_path,
+        install_warning,
     })
+}
+
+/// Empty `out_file` → `builds_dir/<heightmap-stem>.brdb` (or `world.brdb`).
+fn resolve_out_file(request: &ConvertRequest) -> Result<PathBuf, String> {
+    if !request.out_file.as_os_str().is_empty() {
+        return Ok(request.out_file.clone());
+    }
+    let stem = request
+        .heightmaps
+        .first()
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("world");
+    let dir = crate::api::install::builds_dir()?;
+    Ok(dir.join(format!("{stem}.brdb")))
 }
 
 #[cfg(test)]
@@ -240,10 +299,14 @@ mod tests {
             hdmap: false,
             lrgb: false,
             snap: false,
+            install: false,
+            overwrite: false,
         };
 
         let result = convert_heightmap(req, |_| {}, || false).expect("convert");
         assert!(result.out_file.is_file() || out.is_file());
+        assert!(result.installed_path.is_none());
+        assert!(result.install_warning.is_none());
         let meta = std::fs::metadata(&out).expect("output exists");
         assert!(meta.len() > 100, "brdb should be non-trivial, got {} bytes", meta.len());
         let _ = std::fs::remove_file(&out);
@@ -266,6 +329,8 @@ mod tests {
             hdmap: false,
             lrgb: false,
             snap: false,
+            install: false,
+            overwrite: false,
         };
         assert_eq!(req.to_gen_options().size, 2);
         let req2 = ConvertRequest {
@@ -274,5 +339,29 @@ mod tests {
             ..req
         };
         assert_eq!(req2.to_gen_options().size, 10);
+    }
+
+    #[test]
+    fn empty_out_file_defaults_under_builds_dir() {
+        let req = ConvertRequest {
+            heightmaps: vec!["/tmp/gradient.png".into()],
+            colormap: None,
+            out_file: PathBuf::new(),
+            brick_mode: BrickModeDto::Tile,
+            horizontal_size: 1,
+            vertical_scale: 1,
+            greedy: false,
+            quadtree: false,
+            cull: false,
+            nocollide: false,
+            glow: false,
+            hdmap: false,
+            lrgb: false,
+            snap: false,
+            install: false,
+            overwrite: false,
+        };
+        let out = resolve_out_file(&req).expect("resolve");
+        assert!(out.ends_with("gradient.brdb"), "{}", out.display());
     }
 }

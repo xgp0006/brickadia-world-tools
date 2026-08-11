@@ -30,10 +30,10 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 |----|-------|--------|
 | BWT-2.1 | File dialogs (open/save) | done |
 | BWT-2.2 | `convert:progress` events + UI bar | done |
-| BWT-2.3 | **Install to Brickadia Worlds** from Tauri Convert | todo |
-| BWT-2.4 | `api::install_save` extracted (shared egui/Tauri) | todo |
-| BWT-2.5 | Convert UX: defaults, HD Map tip, error mapping | todo |
-| BWT-2.6 | Smoke: example_maps → .brdb via Tauri command test/CLI | todo |
+| BWT-2.3 | **Install to Brickadia Worlds** from Tauri Convert | done |
+| BWT-2.4 | `api::install_save` extracted (shared egui/Tauri) | done |
+| BWT-2.5 | Convert UX: defaults, HD Map tip, error mapping | done |
+| BWT-2.6 | Smoke: example_maps → .brdb via Tauri command test/CLI | done |
 | BWT-2.7 | Phase 2 exit checklist in PRD signed off | todo |
 
 ## Phase 3 — Map (Tauri)

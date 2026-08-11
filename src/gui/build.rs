@@ -26,8 +26,6 @@ use super::dem_sources::{
 use super::imagery_sources::{ImagerySource, tile_source_for as imagery_tile_source_for};
 use super::tiles::{BBoxLatLon, TileFetchError, fetch_bbox};
 
-/// Brickadia Proton-prefix App ID for the Worlds/ install path lookup.
-const BRICKADIA_APP_ID: u32 = 2199420;
 /// Default brick color used by the flat colormap when no imagery source is
 /// selected. A warm slate-green that reads well against the OSM basemap. Also the
 /// sculpt paint palette's unpainted slot 0, so an unpainted grid is byte-identical.
@@ -1194,90 +1192,46 @@ fn write_brdb(name: &str, bricks: Vec<brdb::Brick>) -> Result<PathBuf, BuildErro
     Ok(brdb_path)
 }
 
-/// Copy a written save into Brickadia's Saved tree under the subdir for `ext`,
-/// returning the installed path. `.brdb` → `Worlds/`, `.brz` → `Prefabs/` (both
-/// paths confirmed against a live install). `overwrite`
-/// writes `<stem>.<ext>` in place so a re-run updates the world already open
-/// in-game; default-off suffixes `-2`, `-3`, … so a hand-authored world is
-/// never clobbered. Mirrors the previous `install_to_worlds` for `.brdb`.
+/// Copy a written save into Brickadia's Saved tree (shared [`crate::api::install`]).
+/// `.brdb` → `Worlds/`, `.brz` → `Prefabs/`. Soft-map prefix-missing to
+/// [`BuildError::NoBrickadiaPrefix`] so Map/Grid soft-fail paths keep working.
 pub(crate) fn install_save(path: &Path, ext: &str, overwrite: bool) -> Result<PathBuf, BuildError> {
-    let dir = saved_subdir(ext)?;
-    std::fs::create_dir_all(&dir).map_err(|e| BuildError::Io {
-        stage: BuildStage::Installing,
-        source: e,
-    })?;
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| BuildError::BrdbWrite("output path has no file name".to_owned()))?;
-    let dest = if overwrite {
-        dir.join(format!("{stem}.{ext}"))
-    } else {
-        unique_save_path(&dir, stem, ext)?
-    };
-    std::fs::copy(path, &dest).map_err(|e| BuildError::Io {
-        stage: BuildStage::Installing,
-        source: e,
-    })?;
-    Ok(dest)
+    crate::api::install::install_save_ext(path, ext, overwrite).map_err(map_install_err)
 }
 
 /// First non-colliding `<stem>.<ext>` / `<stem>-N.<ext>` path in `dir`.
-/// Bounded loop (Rule 2): up to 1000 attempts. On exhaustion returns a checked
-/// error — never an existing path, or a caller's `fs::copy` would silently
-/// break the "never overwrite" guarantee.
 pub(crate) fn unique_save_path(dir: &Path, stem: &str, ext: &str) -> Result<PathBuf, BuildError> {
-    let first = dir.join(format!("{stem}.{ext}"));
-    if !first.exists() {
-        return Ok(first);
-    }
-    for n in 2..=1000 {
-        let candidate = dir.join(format!("{stem}-{n}.{ext}"));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(BuildError::WorldNameExhausted { stem: stem.to_owned() })
+    crate::api::install::unique_save_path(dir, stem, ext).map_err(map_install_err)
 }
 
-/// Staging directory for generated saves, in the XDG data dir
-/// (`~/.local/share/heightmap2brz/builds`) — not a hardcoded project path.
-/// The GUI auto-installs `.brdb` into Brickadia's Worlds/, so this is just a
-/// copy the user can re-import later (and the sole home for `.brz` prefabs).
+/// Staging directory for generated saves (`~/.local/share/heightmap2brz/builds`).
 pub(crate) fn builds_dir() -> Result<PathBuf, BuildError> {
-    let base = dirs::data_dir().ok_or_else(|| BuildError::Io {
+    crate::api::install::builds_dir().map_err(|e| BuildError::Io {
         stage: BuildStage::WritingSave,
-        source: std::io::Error::other("no XDG data directory"),
-    })?;
-    Ok(base.join("heightmap2brz").join("builds"))
+        source: std::io::Error::other(e),
+    })
 }
 
-/// Root of Brickadia's `Saved` tree inside the Steam Proton prefix. Errors
-/// `NoBrickadiaPrefix` if the prefix has never been created (game not yet run).
-fn brickadia_saved_dir() -> Result<PathBuf, BuildError> {
-    let home = dirs::home_dir().ok_or_else(|| BuildError::NoBrickadiaPrefix(PathBuf::new()))?;
-    let prefix = home
-        .join(".steam/steam/steamapps/compatdata")
-        .join(BRICKADIA_APP_ID.to_string())
-        .join("pfx/drive_c/users/steamuser/AppData/Local/Brickadia/Saved");
-    if !prefix.exists() {
-        return Err(BuildError::NoBrickadiaPrefix(prefix));
+fn map_install_err(e: String) -> BuildError {
+    if crate::api::install::is_prefix_missing(&e) {
+        // Recover the path when present: "… not found at <path> — …"
+        let prefix = e
+            .split(" not found at ")
+            .nth(1)
+            .and_then(|rest| rest.split(" — ").next())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        return BuildError::NoBrickadiaPrefix(prefix);
     }
-    Ok(prefix)
-}
-
-/// Per-extension install subdir under `Saved`. `.brdb` → `Worlds/` (loaded as a
-/// world); `.brz` → `Prefabs/` (loaded as a build/prefab). Both paths confirmed
-/// against a live install: `Saved/Prefabs/*.brz` is exactly where the in-game
-/// prefab browser reads from (resolves spec correction #8's open question).
-fn saved_subdir(ext: &str) -> Result<PathBuf, BuildError> {
-    match ext {
-        "brdb" => Ok(brickadia_saved_dir()?.join("Worlds")),
-        "brz" => Ok(brickadia_saved_dir()?.join("Prefabs")),
-        other => Err(BuildError::BrdbWrite(format!(
-            "no Brickadia install path for .{other} saves (only .brdb→Worlds/, .brz→Prefabs/)"
-        ))),
+    if let Some(stem) = e
+        .strip_prefix("too many worlds named '")
+        .and_then(|r| r.split('\'').next())
+    {
+        return BuildError::WorldNameExhausted {
+            stem: stem.to_owned(),
+        };
     }
+    BuildError::BrdbWrite(e)
 }
 
 fn require_token_if_needed(

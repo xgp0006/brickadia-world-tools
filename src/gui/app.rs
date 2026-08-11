@@ -74,6 +74,7 @@ fn convert_worker(
                 "Reading" => "Reading",
                 "Generating" => "Generating",
                 "Writing" => "Writing",
+                "Installing" => "Writing",
                 "Finished" => "Finished",
                 _ => "Working",
             };
@@ -214,6 +215,9 @@ impl HeightmapApp {
             hdmap: self.opt_hdmap,
             lrgb: self.opt_lrgb,
             snap: self.opt_snap,
+            // Convert tab writes only; Map/Sculpt own install UX.
+            install: false,
+            overwrite: false,
         }
     }
 

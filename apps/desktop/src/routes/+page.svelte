@@ -7,6 +7,13 @@
 
   type Progress = { phase: string; frac: number };
 
+  type ConvertResult = {
+    out_file: string;
+    absolute_path: string;
+    installed_path?: string | null;
+    install_warning?: string | null;
+  };
+
   let coreVersion = $state("…");
   let heightmapPath = $state("");
   let colormapPath = $state("");
@@ -16,14 +23,21 @@
   let verticalScale = $state(1);
   let greedy = $state(true);
   let hdmap = $state(false);
+  let install = $state(true);
+  let overwrite = $state(false);
   let status = $state("");
   let progress = $state<Progress | null>(null);
   let busy = $state(false);
+  let buildsDirHint = $state("");
 
   $effect(() => {
     invoke<string>("core_version")
       .then((v) => (coreVersion = v))
       .catch((e) => (coreVersion = `error: ${e}`));
+
+    invoke<string>("builds_dir")
+      .then((d) => (buildsDirHint = d))
+      .catch(() => (buildsDirHint = ""));
 
     let unlisten: (() => void) | undefined;
     listen<Progress>("convert:progress", (e) => {
@@ -51,9 +65,17 @@
   }
 
   async function pickOut() {
+    const stem =
+      heightmapPath
+        .split(/[/\\]/)
+        .pop()
+        ?.replace(/\.[^.]+$/, "") || "world";
+    const defaultPath = buildsDirHint
+      ? `${buildsDirHint}/${stem}.brdb`
+      : `${stem}.brdb`;
     const path = await save({
       filters: [{ name: "Brickadia save", extensions: ["brdb", "brz"] }],
-      defaultPath: "world.brdb",
+      defaultPath,
     });
     if (typeof path === "string") outFile = path;
   }
@@ -64,18 +86,11 @@
       status = "Heightmap path required.";
       return;
     }
-    if (!outFile.trim()) {
-      status = "Output path required — use Browse or type a path.";
-      return;
-    }
     busy = true;
     status = "Converting…";
     progress = { phase: "Reading", frac: 0 };
     try {
-      const result = await invoke<{
-        out_file: string;
-        absolute_path: string;
-      }>("convert_build", {
+      const result = await invoke<ConvertResult>("convert_build", {
         request: {
           heightmaps: [heightmapPath.trim()],
           colormap: colormapPath.trim() || null,
@@ -91,9 +106,21 @@
           hdmap,
           lrgb: false,
           snap: false,
+          install,
+          overwrite,
         },
       });
-      status = `OK → ${result.absolute_path ?? result.out_file}`;
+      const written = result.absolute_path ?? result.out_file;
+      if (!outFile.trim() && result.out_file) {
+        outFile = result.out_file;
+      }
+      let msg = `OK → ${written}`;
+      if (result.installed_path) {
+        msg += `\nInstalled → ${result.installed_path}`;
+      } else if (result.install_warning) {
+        msg += `\n⚠ ${result.install_warning}`;
+      }
+      status = msg;
       progress = { phase: "Finished", frac: 1 };
     } catch (e) {
       status = `Error: ${e}`;
@@ -106,15 +133,19 @@
 
 <main class="wrap">
   <header>
-    <h1>Convert</h1>
+    <h1>Brickadia World Tools</h1>
     <p class="sub">
-      Heightmap PNG → <code>.brdb</code> · core <code>heightmap {coreVersion}</code>
+      Tauri + Deno · Convert · core <code>heightmap {coreVersion}</code>
     </p>
   </header>
 
   <section class="card">
+    <h2>Convert</h2>
     <p class="hint">
-      Same Rust path as the egui Convert tab. Install into Brickadia Worlds is Map-tab only for now.
+      Heightmap PNG → <code>.brdb</code> / <code>.brz</code>. Same Rust path as the egui Convert
+      tab. Empty output defaults to
+      <code>{buildsDirHint || "~/.local/share/heightmap2brz/builds"}/&lt;name&gt;.brdb</code>.
+      In-game: load from Worlds (Proton APPID 2199420).
     </p>
 
     <form onsubmit={runConvert}>
@@ -145,7 +176,14 @@
       <label>
         Output
         <div class="path-row">
-          <input type="text" bind:value={outFile} placeholder="world.brdb" disabled={busy} />
+          <input
+            type="text"
+            bind:value={outFile}
+            placeholder={buildsDirHint
+              ? `${buildsDirHint}/<heightmap>.brdb`
+              : "empty → builds dir"}
+            disabled={busy}
+          />
           <button type="button" class="sec" onclick={pickOut} disabled={busy}>Browse</button>
         </div>
       </label>
@@ -176,7 +214,25 @@
           ><input type="checkbox" bind:checked={greedy} disabled={busy} /> Greedy mesh</label
         >
         <label class="check"
-          ><input type="checkbox" bind:checked={hdmap} disabled={busy} /> HD Map (RGB height)</label
+          ><input type="checkbox" bind:checked={hdmap} disabled={busy} /> HD Map (Stage-1 RGBA
+          height)</label
+        >
+      </div>
+      {#if hdmap}
+        <p class="tip">
+          HD Map: RGB-encoded high-detail height (sculpt / Stage-1 export PNGs). Leave off for
+          ordinary grayscale heightmaps.
+        </p>
+      {/if}
+
+      <div class="checks">
+        <label class="check"
+          ><input type="checkbox" bind:checked={install} disabled={busy} /> Install into Brickadia
+          Worlds</label
+        >
+        <label class="check"
+          ><input type="checkbox" bind:checked={overwrite} disabled={busy || !install} /> Overwrite
+          existing</label
         >
       </div>
 
@@ -195,7 +251,13 @@
     </form>
 
     {#if status}
-      <p class="status" class:err={status.startsWith("Error")}>{status}</p>
+      <p
+        class="status"
+        class:err={status.startsWith("Error")}
+        class:warn={status.includes("⚠") && !status.startsWith("Error")}
+      >
+        {status}
+      </p>
     {/if}
   </section>
 
@@ -205,16 +267,20 @@
 </main>
 
 <style>
+  :root {
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    color: #e8e6e3;
+    background: #12141a;
+    line-height: 1.45;
+  }
   .wrap {
     max-width: 42rem;
     margin: 0 auto;
-    padding: 1.5rem 1.25rem 3rem;
-    width: 100%;
-    box-sizing: border-box;
+    padding: 2rem 1.25rem 3rem;
   }
   h1 {
     margin: 0;
-    font-size: 1.5rem;
+    font-size: 1.75rem;
     letter-spacing: -0.02em;
   }
   .sub {
@@ -223,16 +289,25 @@
     font-size: 0.9rem;
   }
   .card {
-    margin-top: 1.25rem;
+    margin-top: 1.75rem;
     padding: 1.25rem 1.35rem 1.5rem;
     background: #1a1d26;
     border: 1px solid #2c3140;
     border-radius: 8px;
   }
+  h2 {
+    margin: 0 0 0.35rem;
+    font-size: 1.15rem;
+  }
   .hint {
     margin: 0 0 1rem;
     color: #9a9690;
     font-size: 0.85rem;
+  }
+  .tip {
+    margin: -0.35rem 0 0;
+    color: #8a9bb0;
+    font-size: 0.8rem;
   }
   form {
     display: flex;
@@ -332,15 +407,24 @@
     border: 1px solid #2a4a35;
     font-size: 0.85rem;
     word-break: break-all;
+    white-space: pre-wrap;
   }
   .status.err {
     background: #2a1515;
     border-color: #5a2a2a;
   }
+  .status.warn {
+    background: #2a2415;
+    border-color: #5a4a2a;
+  }
   footer {
     margin-top: 2rem;
     color: #6a6660;
     font-size: 0.8rem;
+  }
+  code {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.9em;
   }
   @media (max-width: 560px) {
     .row {
