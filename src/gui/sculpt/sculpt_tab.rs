@@ -318,33 +318,48 @@ impl SculptTool {
         }
     }
 
-    /// Full tooltip: the tool's purpose AND how its strength behaves, so the one
-    /// shared strength slider reads sensibly per tool.
+    /// Full tooltip: purpose + strength + Brickadia effect.
     fn help(self) -> &'static str {
         match self {
             Self::Raise => {
-                "Raise — pushes terrain up under the brush. Strength is meters added per pass; \
-                 hold and drag to build height."
+                "Raise — adds real metres under the brush (strength = m per pass).\n\
+                 In-game: taller brick stacks (height in flats; 1 brick ≈ 3 flats). \
+                 Hold-drag to build hills."
             }
             Self::Lower => {
-                "Lower — digs terrain down under the brush. Strength is meters removed per pass."
+                "Lower — removes metres under the brush (strength = m per pass).\n\
+                 In-game: shorter stacks; can open to native Brickadia floor if you dig to 0 \
+                 with skip-floor export."
             }
             Self::Smooth => {
-                "Smooth — averages neighbouring heights to soften ridges, steps, and noise. \
-                 Strength is the blend amount (0–1) per pass."
+                "Smooth — blends neighbour heights (strength 0–1 blend per pass).\n\
+                 In-game: fewer jagged steps; greedy mesher merges larger quads on soft slopes."
             }
             Self::Flatten => {
-                "Flatten — eases terrain toward the “Set to” height, leaving a level shelf. \
-                 Strength is the blend amount (0–1); set the target height first."
+                "Flatten — eases toward “Set to” height (strength 0–1).\n\
+                 In-game: plateaus / build pads at a chosen brick height. Set target first \
+                 (E sample or eyedropper)."
             }
             Self::Set => {
-                "Set height — stamps terrain straight to the “Set to” value (no build-up). \
-                 Sample a height first by holding E, or arm the “Set to” eyedropper, then click."
+                "Set height — hard-stamps “Set to” (no blend).\n\
+                 In-game: flat shelves at exact flats/bricks. Hold E to sample, then click."
             }
-            Self::Stamp => "Stamp — drop a parametric landform in one click (see Stamp mode).",
-            Self::Paint => "Paint — color cells with the active swatch (see Paint mode).",
-            Self::Zone => "Mask — draw omit/include regions for export (see Mask mode).",
-            Self::Layers => "Layers — pick grid boxes into export parts (see Layers mode).",
+            Self::Stamp => {
+                "Stamp — one-click landform (cone/mesa/crater/ramp).\n\
+                 In-game: same as sculpted height — becomes brick columns on export."
+            }
+            Self::Paint => {
+                "Paint — splatmap color only (not material, not height).\n\
+                 In-game: brick color; blank paint → default brick color."
+            }
+            Self::Zone => {
+                "Mask — omit/include loops on export (heights unchanged).\n\
+                 In-game: holes or cookie-cut pieces; orthogonal to omit-below water."
+            }
+            Self::Layers => {
+                "Layers — box-select regions → separate .brdb/.brz that snap together.\n\
+                 In-game: load each part (or prefabs) to beat single-save size limits."
+            }
         }
     }
 

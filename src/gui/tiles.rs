@@ -23,17 +23,21 @@ pub(crate) const TILE_SIZE_PX: u32 = 256;
 /// backstop in build.rs. The greedy+imagery mesher allocates one `Vec<u128>`
 /// BitMask per image column per UNIQUE (height,color) pair (opt/generate.rs
 /// build_planes); with per-pixel-unique satellite colors that is ~one plane per
-/// cell, so peak mesh memory scales ~`cells^1.5 * 40 B` — ~3.6 GB theoretical
-/// floor at this value, ~5 GB real once glibc per-allocation overhead on the
-/// ~90 M tiny Vecs is counted (safe on a 16 GB+ host; this box has 60 GB).
+/// cell, so peak mesh memory scales ~`cells^1.5 * 40 B`.
+///
+/// Raised 200k → 400k (2026-08-11) for small-area max-detail: lets more boxes
+/// stay at provider max zoom (Terrarium/Mapbox z15) before step-down. Rough
+/// peak ~10–15 GB with dense satellite colors — OK on 32 GB+ hosts (desktop
+/// has 60 GB). Larger areas still auto-coarsen or use Grid Build.
+///
 /// Bounding cells keeps that in check: a real-world area larger than this budget
 /// is served at coarser resolution (a lower zoom) instead of OOMing, and the
-/// user can raise Density to cover a bigger area at fewer cells.
+/// user can raise Downsample to cover a bigger area at fewer cells.
 /// ponytail: a streaming/columnar mesher would lift this — it's the lazy guard,
 /// the upgrade path is reworking opt/generate.rs's per-(height,color)-plane model.
 /// `pub(crate)` so build.rs can backstop the OpenTopography single-shot GeoTIFF
 /// path, which bypasses `pick_zoom`.
-pub(crate) const MAX_DEM_CELLS: u64 = 200_000;
+pub(crate) const MAX_DEM_CELLS: u64 = 400_000;
 const MIN_ZOOM: u32 = 1;
 const MAX_ZOOM: u32 = 18;
 /// Web Mercator latitude limit — the slippy-map tile grid is undefined beyond it.

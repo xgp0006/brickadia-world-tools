@@ -11,11 +11,13 @@ fn main() -> Result<(), eframe::Error> {
         NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("Brickadia-World-Tools")
-                .with_always_on_top()
+                // Always-on-top is opt-in via the header checkbox (app state starts
+                // false). Defaulting it on here desynced the checkbox and stuck the
+                // window above every other app on multi-monitor / scaled desktops.
                 .with_decorations(true)
                 .with_drag_and_drop(true)
-                .with_inner_size([960.0, 720.0])
-                .with_min_inner_size([720.0, 540.0])
+                .with_inner_size([1280.0, 800.0])
+                .with_min_inner_size([800.0, 560.0])
                 .with_resizable(true),
             ..Default::default()
         },

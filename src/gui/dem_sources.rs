@@ -56,20 +56,25 @@ impl DemSource {
     pub(crate) const fn tooltip(self) -> &'static str {
         match self {
             Self::AwsTerrarium => {
-                "Public S3 tile pyramid, RGB-encoded heights. \
-                 No signup. Recommended default."
+                "Does: free global DEM tiles (~5 m/cell at max z15). No signup.\n\
+                 In-game: finest free global source for small boxes — hills keep shape.\n\
+                 Pair with: Downsample=1; status bar m/cell. Prefer over OpenTopo for <100 km²."
             }
             Self::MapboxTerrainRgb => {
-                "Higher quality than AWS Terrarium. \
-                 Needs a free Mapbox account token (set in Settings)."
+                "Does: Mapbox Terrain-RGB tiles (often cleaner than AWS; still ~z15 / ~5 m).\n\
+                 In-game: similar brick density to Terrarium; needs token (Settings).\n\
+                 Pair with: Mapbox satellite imagery for matching colors."
             }
             Self::OpenTopography => {
-                "SRTMGL1 (~30 m) GeoTIFF from portal.opentopography.org. \
-                 Free API key required (set in Settings). 450,000 km² cap per request."
+                "Does: SRTMGL1 GeoTIFF ~30 m/cell (coarser). Free API key (Settings). \
+                 450,000 km² per request.\n\
+                 In-game: good for huge regions; small boxes look blocky vs Terrarium.\n\
+                 Pair with: larger studs/m if you need walkable size from few cells."
             }
             Self::Usgs3Dep => {
-                "1m LiDAR-derived DEM, US contiguous only. \
-                 No signup, but bbox must be within US territory."
+                "Does: 1 m LiDAR DEM (US only) — highest fidelity target.\n\
+                 In-game: not wired yet (picker disabled). Offline: load a 3DEP GeoTIFF \
+                 via Convert/Sculpt as HD Map heightmap until fetch lands."
             }
         }
     }

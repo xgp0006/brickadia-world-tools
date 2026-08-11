@@ -597,7 +597,7 @@ pub(crate) struct GridEstimate {
     /// brick/cell) would exceed the per-tile `MAX_BRICKS` cap (spec §6). Distinct
     /// from `over_cell_budget`: that gates the mesh-input cell budget
     /// (`MAX_DEM_CELLS`), this gates the per-tile OUTPUT brick count. Because
-    /// `MAX_DEM_CELLS` (200 k) < `MAX_BRICKS` (2 M) a budget-passing tile can
+    /// `MAX_DEM_CELLS` (400 k) < `MAX_BRICKS` (2 M) a budget-passing tile can
     /// never trip this — it stays honest to its spec meaning rather than aliasing
     /// the cell-budget predicate (spec correction #5).
     pub(crate) over_brick_cap: bool,

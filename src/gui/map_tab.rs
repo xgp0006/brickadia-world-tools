@@ -699,28 +699,35 @@ fn draw_brick_options(state: &mut MapTabState, ui: &mut Ui) {
     }
 
     ui.add_space(4.0);
-    ui.label("Density (terrain resolution)");
+    // "Density" was misread as "more detail" — this knob only COARSENS the grid.
+    ui.label("Downsample (1 = max DEM detail)");
     ui.add(
         egui::DragValue::new(&mut state.density_factor)
             .range(1..=8)
             .speed(0.1),
     )
     .on_hover_text(
-        "Downsamples the elevation grid. Larger = fewer, coarser bricks \
-         (real count reduction, ~1/factor²); 1 = full detail.",
+        "Does: averages the elevation grid by this factor before meshing \
+         (~1/factor² fewer cells and bricks).\n\
+         In-game: larger values = blockier hills, fewer bricks, faster load. \
+         Does NOT add detail — 1 is the finest this DEM zoom can deliver.\n\
+         Pair with: DEM source + box size (status bar m/cell). For a bigger playable \
+         map at the same detail, raise studs/m — not this.",
     );
 
     ui.add_space(4.0);
-    ui.label("Scale (studs per real meter)");
+    ui.label("Studs per real meter (world size)");
     ui.add(
         egui::DragValue::new(&mut state.studs_per_meter)
             .range(STUDS_PER_METER_MIN..=STUDS_PER_METER_MAX)
             .speed(0.1),
     )
     .on_hover_text(
-        "True-to-life horizontal scale: this many studs reproduce one real meter. \
-         Higher = a bigger world at the SAME brick count (free). Vertical height \
-         auto-matches for faithful 1:1 relief — see the predicted size below.",
+        "Does: how many Brickadia studs represent one real-world metre \
+         (1 stud = 5 internal units; micro uses 1 unit/stud).\n\
+         In-game: higher = larger walkable world at the SAME brick count \
+         (free size). Does not fetch more DEM samples.\n\
+         Pair with: predicted size below + vertical exaggeration (1× = true relief).",
     );
 
     ui.add_space(4.0);
@@ -731,8 +738,10 @@ fn draw_brick_options(state: &mut MapTabState, ui: &mut Ui) {
             .text("×"),
     )
     .on_hover_text(
-        "1× = faithful 1:1 relief (height matched to the true ground at the chosen \
-         scale). Raise it to exaggerate hills; lower it to flatten.",
+        "Does: multiplies real elevation before brick height (flats/bricks).\n\
+         In-game: 1× = faithful hills at the chosen studs/m; >1 dramatizes relief; \
+         <1 flattens. Affects brick stack height, not map width.\n\
+         Pair with: studs/m and omit-below (water).",
     );
 
     ui.add_space(4.0);

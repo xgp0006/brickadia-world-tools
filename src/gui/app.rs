@@ -292,9 +292,10 @@ impl HeightmapApp {
                 }
             });
         });
-        ui.hyperlink("https://github.com/brickadia-community/heightmap2brz");
+        ui.hyperlink("https://github.com/xgp0006/brickadia-world-tools");
         ui.label(
-            "Converts heightmap images (PNG/JPG) to Brickadia save files, also works as img2brick",
+            "Convert / Map / Sculpt — DEM or heightmap PNG → Brickadia .brdb / .brz worlds. \
+             Install lands in the game Worlds folder (Proton APPID 2199420).",
         );
         egui::warn_if_debug_build(ui);
     }
@@ -395,7 +396,11 @@ impl HeightmapApp {
             ui.checkbox(&mut self.opt_glow, "Glow")
                 .on_hover_text("Glow bricks at lowest intensity");
             ui.checkbox(&mut self.opt_hdmap, "HD Map")
-                .on_hover_text("Using a high detail rgb color encoded heightmap");
+                .on_hover_text(
+                    "Input is RGB-encoded high-detail height (not greyscale). \
+                     Required for Stage-1 geotiff2heightmap / sculpt-export PNGs \
+                     (metres×100 packed in RGBA). Wrong setting = crushed terrain.",
+                );
         });
         ui.end_row();
     }
