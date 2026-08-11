@@ -21,6 +21,14 @@ cargo check -p brickadia-world-tools   # from repo root
 
 ```bash
 deno task tauri:build
+# binary under apps/desktop/src-tauri/target/release/ (see tauri product name)
 ```
 
-Core convert API: `heightmap::api::convert_heightmap` (shared with egui).
+## Dual-run with egui
+
+| | |
+|--|--|
+| **egui (full)** | `brickadia-world-tools-gui` — default app-grid entry |
+| **Tauri** | `deno task tauri:dev` — Convert `/` · Map `/map` · Sculpt `/sculpt` |
+
+Program phases: `docs/program/PROGRAM.md`. Core APIs: `heightmap::api::{convert, install, dem_predict, dem_fetch_build, sculpt}`.

@@ -1,8 +1,17 @@
 # Phase 5 — Launcher cutover
 
-**Status:** Not started  
+**Status:** Dual-run era (2026-08-11). Default launcher still **egui** (full sculpt parity). Tauri is installable via Deno build.  
 **Tickets:** BWT-5.1–5.4  
 **Depends on:** Phase 3 complete; Phase 4 MVP or explicit “Sculpt stays egui” decision
+
+### Dual-run (now)
+
+| Shell | How | Coverage |
+|-------|-----|----------|
+| **egui** (default) | `brickadia-world-tools-gui` / `.desktop` | Full Map/Convert/Sculpt + Grid |
+| **Tauri** | `cd apps/desktop && deno task tauri:dev` or `tauri:build` | Convert + Map + Sculpt MVP |
+
+Do **not** repoint `.desktop` until BWT-4.5 parity or user accepts MVP sculpt + Grid-in-egui.
 
 ## Goal
 
