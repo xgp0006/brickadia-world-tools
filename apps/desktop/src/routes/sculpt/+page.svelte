@@ -129,6 +129,30 @@
     }).then((fn) => {
       unlisten = fn;
     });
+
+    // Map "Send to Sculpt" parks session id here.
+    void (async () => {
+      try {
+        const raw = sessionStorage.getItem("bwt-sculpt-session");
+        if (!raw) return;
+        sessionStorage.removeItem("bwt-sculpt-session");
+        const sessionId = Number(raw);
+        if (!Number.isFinite(sessionId) || sessionId <= 0) return;
+        const info = await invoke<SessionInfo>("sculpt_info", { sessionId });
+        session = info;
+        status = `Loaded from Map: ${info.source_name} (${info.width}×${info.height})`;
+        error = "";
+        // Canvas mounts after session is set — paint on next frame.
+        requestAnimationFrame(() => {
+          schedulePreview();
+          void refreshLayers();
+        });
+      } catch (e) {
+        error = String(e);
+        status = "Could not attach Map handoff session.";
+      }
+    })();
+
     return () => {
       unlisten?.();
       if (session) {

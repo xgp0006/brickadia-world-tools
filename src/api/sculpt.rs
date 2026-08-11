@@ -13,10 +13,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::api::dem_predict::{predict_dem_cells, DemPredictRequest, DemSourceDto};
 use crate::gui::build::{
-    BlockType, BrickStyle, BuildStage, FlatColormap, ProgressFn, build_heightmap, cell_size_units,
-    generate_bricks_skip_floor, sanitize_name,
+    self, BlockType, BrickStyle, BuildRequest, BuildStage, FlatColormap, ProgressFn,
+    build_heightmap, cell_size_units, generate_bricks_skip_floor, sanitize_name,
 };
+use crate::gui::dem_sources::DemSource;
+use crate::gui::imagery_sources::ImagerySource;
+use crate::gui::tiles::BBoxLatLon;
 use crate::gui::grid::{offset_fits_chunk_index, tile_world_offset};
 use crate::gui::sculpt::{
     default_palette, shape_distance, Brush, BrushShape, Falloff, FieldMeta, Flatten, HeightField,
@@ -120,6 +124,35 @@ pub struct SculptLoadPngRequest {
     /// Override stem; empty → file stem.
     #[serde(default)]
     pub source_name: Option<String>,
+}
+
+/// Fetch DEM for a Map bbox and open it as a sculpt session (egui "Send to Sculpt").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SculptFromDemRequest {
+    pub north: f64,
+    pub south: f64,
+    pub east: f64,
+    pub west: f64,
+    #[serde(default)]
+    pub dem_source: DemSourceDto,
+    #[serde(default = "default_density")]
+    pub density_factor: u16,
+    #[serde(default = "default_studs")]
+    pub studs_per_meter: f32,
+    #[serde(default = "default_exag")]
+    pub vertical_exaggeration: f32,
+    #[serde(default)]
+    pub micro: bool,
+    #[serde(default = "default_name")]
+    pub source_name: String,
+    #[serde(default)]
+    pub mapbox_token: Option<String>,
+    #[serde(default)]
+    pub opentopo_key: Option<String>,
+}
+
+fn default_density() -> u16 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,6 +535,144 @@ pub fn sculpt_load_png(req: SculptLoadPngRequest) -> Result<SculptSessionInfo, S
         HeightField::from_image(&dynimg.to_luma8(), meta)
     };
     with_store(|s| Ok(insert_session(s, field)))
+}
+
+fn map_dem_source(s: DemSourceDto) -> DemSource {
+    match s {
+        DemSourceDto::AwsTerrarium => DemSource::AwsTerrarium,
+        DemSourceDto::MapboxTerrainRgb => DemSource::MapboxTerrainRgb,
+        DemSourceDto::OpenTopography => DemSource::OpenTopography,
+        DemSourceDto::OpenTopographyCop30 => DemSource::OpenTopographyCop30,
+        DemSourceDto::Usgs3Dep => DemSource::Usgs3Dep,
+    }
+}
+
+fn nonempty_token(s: Option<String>) -> Option<String> {
+    s.and_then(|t| {
+        let t = t.trim().to_owned();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    })
+}
+
+/// Fetch DEM for a bbox (same pipeline as Map build) and open a sculpt session.
+///
+/// Progress phases mirror Map fetch (`Fetching elevation tiles…`, etc.).
+pub fn sculpt_from_dem(
+    req: SculptFromDemRequest,
+    progress: impl Fn(SculptProgress) + Send + Sync + 'static,
+    cancel: impl Fn() -> bool + Send + Sync + 'static,
+) -> Result<SculptSessionInfo, String> {
+    if !(req.north > req.south && req.east >= req.west) {
+        return Err("bbox must have north>south and east>=west".into());
+    }
+
+    let density = req.density_factor.max(1);
+    let pred = predict_dem_cells(DemPredictRequest {
+        north: req.north,
+        south: req.south,
+        east: req.east,
+        west: req.west,
+        dem_source: req.dem_source,
+        density_factor: density,
+    })?;
+    let cell_m_eff = pred.cell_m_eff.max(1e-6);
+
+    let mut mapbox = nonempty_token(req.mapbox_token);
+    let mut opentopo = nonempty_token(req.opentopo_key);
+    if mapbox.is_none() || opentopo.is_none() {
+        if let Ok(cfg) = crate::gui::config::Config::load() {
+            if mapbox.is_none() {
+                mapbox = nonempty_token(cfg.mapbox_token);
+            }
+            if opentopo.is_none() {
+                opentopo = nonempty_token(cfg.opentopo_api_key);
+            }
+        }
+    }
+
+    let dem_source = map_dem_source(req.dem_source);
+    let build_req = BuildRequest {
+        bbox: BBoxLatLon {
+            north: req.north,
+            south: req.south,
+            east: req.east,
+            west: req.west,
+        },
+        name: req.source_name.clone(),
+        dem_source,
+        imagery_source: ImagerySource::None,
+        mapbox_token: mapbox,
+        opentopo_key: opentopo,
+        vertical_scale: 1.0,
+        density_factor: density,
+        horizontal_scale: 1,
+        block_type: BlockType::SmoothTile,
+        glow: false,
+        no_collision: false,
+        install_to_brickadia: false,
+        overwrite_world: false,
+        omit_below_m: 0.0,
+        floor_level_m: 0.0,
+    };
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancel_cb = Arc::new(cancel);
+    let progress_cb = Arc::new(progress);
+    let cf = Arc::clone(&cancel_flag);
+    let progress_for_fetch = Arc::clone(&progress_cb);
+    let progress_fn: ProgressFn = Arc::new(move |stage: BuildStage, frac: f32| {
+        if cancel_cb() {
+            cf.store(true, Ordering::Relaxed);
+        }
+        progress_for_fetch(SculptProgress {
+            phase: stage.label().to_string(),
+            frac: (frac * 0.9).clamp(0.0, 0.9),
+        });
+    });
+
+    progress_cb(SculptProgress {
+        phase: "Fetching elevation…".into(),
+        frac: 0.0,
+    });
+
+    let raster = build::fetch_and_decode_dem(&build_req, progress_fn, Arc::clone(&cancel_flag))
+        .map_err(|e| e.to_string())?;
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    let raster = build::downsample(&raster, u32::from(density));
+    build::enforce_cell_budget(raster.width, raster.height).map_err(|e| e.to_string())?;
+    check_dims(raster.width, raster.height)?;
+
+    let centroid_lat = (req.north + req.south) * 0.5;
+    let meta = FieldMeta {
+        cell_m: cell_m_eff,
+        studs_per_meter: req.studs_per_meter.clamp(0.5, 32.0),
+        vertical_exaggeration: req.vertical_exaggeration.clamp(0.25, 8.0),
+        micro: req.micro,
+        centroid_lat,
+        source_name: if req.source_name.trim().is_empty() {
+            "sculpt".into()
+        } else {
+            req.source_name
+        },
+    };
+
+    progress_cb(SculptProgress {
+        phase: "Opening in Sculpt…".into(),
+        frac: 0.95,
+    });
+    let field = HeightField::from_dem(&raster, meta);
+    let info = with_store(|s| Ok(insert_session(s, field)))?;
+    progress_cb(SculptProgress {
+        phase: "Ready".into(),
+        frac: 1.0,
+    });
+    Ok(info)
 }
 
 /// Drop a session (optional; process exit also clears).

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import maplibregl from "maplibre-gl";
@@ -73,6 +74,7 @@
   let buildProgress = $state<BuildProgress | null>(null);
   let buildError = $state("");
   let buildResult = $state<DemBuildResult | null>(null);
+  let sendingSculpt = $state(false);
 
   // Grid (BWT-3.8)
   let gridMode = $state(false);
@@ -584,6 +586,49 @@
     }
   }
 
+  /** Fetch bbox DEM into a sculpt session and open the Sculpt tab. */
+  async function sendToSculpt() {
+    clampBbox();
+    sendingSculpt = true;
+    buildError = "";
+    buildProgress = { phase: "Fetching for Sculpt…", frac: 0 };
+    try {
+      const info = await invoke<{
+        session_id: number;
+        width: number;
+        height: number;
+        source_name: string;
+      }>("sculpt_from_dem", {
+        request: {
+          north,
+          south,
+          east,
+          west,
+          dem_source: demSource,
+          density_factor: densityFactor,
+          studs_per_meter: studsPerMeter,
+          vertical_exaggeration: verticalExaggeration,
+          micro: false,
+          source_name: outputName.trim() || "sculpt",
+          mapbox_token: mapboxToken.trim() || null,
+          opentopo_key: opentopoKey.trim() || null,
+        },
+      });
+      try {
+        sessionStorage.setItem("bwt-sculpt-session", String(info.session_id));
+      } catch {
+        /* private mode */
+      }
+      buildProgress = { phase: "Opening Sculpt…", frac: 1 };
+      await goto("/sculpt");
+    } catch (e) {
+      buildError = String(e);
+      buildProgress = null;
+    } finally {
+      sendingSculpt = false;
+    }
+  }
+
   $effect(() => {
     let unlisten: (() => void) | undefined;
     listen<BuildProgress>("build:progress", (e) => {
@@ -872,13 +917,24 @@
     <button
       type="button"
       class="build"
-      disabled={building || !mapReady}
+      disabled={building || sendingSculpt || !mapReady}
       onclick={() => void runBuild()}
     >
       {building ? "Building…" : "Build world"}
     </button>
+    <button
+      type="button"
+      class="sec build-secondary"
+      disabled={building || sendingSculpt || !mapReady || gridMode}
+      title={gridMode
+        ? "Send to Sculpt works on single-box selection (turn off Grid)"
+        : "Fetch this DEM area and open it in Sculpt to brush by hand"}
+      onclick={() => void sendToSculpt()}
+    >
+      {sendingSculpt ? "Fetching for Sculpt…" : "✎ Send to Sculpt"}
+    </button>
 
-    {#if buildProgress && (building || buildResult)}
+    {#if buildProgress && (building || sendingSculpt || buildResult)}
       <div class="progress card-inner">
         <div class="progress-label">{buildProgress.phase}</div>
         <div class="bar">
@@ -1033,6 +1089,16 @@
     background: #0e1016;
     color: #e8e6e3;
     font: inherit;
+  }
+  button.build-secondary {
+    width: 100%;
+    margin-top: 0.35rem;
+    background: #2c3140;
+    color: #e8e6e3;
+    font-weight: 600;
+  }
+  button.build-secondary:hover:not(:disabled) {
+    background: #3a4050;
   }
   button {
     padding: 0.55rem 0.85rem;

@@ -5,9 +5,9 @@ use heightmap::api::{
     self, ConvertProgress, ConvertRequest, ConvertResult, DemBuildProgress, DemBuildRequest,
     DemBuildResult, DemPredictRequest, DemPredictResult, GridBuildProgress, GridBuildRequest,
     GridBuildResult, GridEstimateDto, SculptCreateBlankRequest, SculptExportRequest,
-    SculptExportResult, SculptLayerBoxRequest, SculptLayersExportResult, SculptLayersInfo,
-    SculptLoadPngRequest, SculptPaletteInfo, SculptPreview, SculptProgress, SculptSessionInfo,
-    SculptStrokeRequest, SculptZoneAddRectRequest, SculptZonesInfo,
+    SculptExportResult, SculptFromDemRequest, SculptLayerBoxRequest, SculptLayersExportResult,
+    SculptLayersInfo, SculptLoadPngRequest, SculptPaletteInfo, SculptPreview, SculptProgress,
+    SculptSessionInfo, SculptStrokeRequest, SculptZoneAddRectRequest, SculptZonesInfo,
 };
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
@@ -102,6 +102,26 @@ async fn grid_fetch_build(
 }
 
 // ── Sculpt (Phase 4 MVP) ────────────────────────────────────────────────────
+
+/// Fetch Map bbox DEM → new sculpt session (egui "Send to Sculpt").
+/// Emits `sculpt:progress` while fetching.
+#[tauri::command]
+async fn sculpt_from_dem(
+    app: AppHandle,
+    request: SculptFromDemRequest,
+) -> Result<SculptSessionInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        api::sculpt_from_dem(
+            request,
+            move |p: SculptProgress| {
+                let _ = app.emit("sculpt:progress", &p);
+            },
+            || false,
+        )
+    })
+    .await
+    .map_err(|e| format!("sculpt_from_dem task failed: {e}"))?
+}
 
 #[tauri::command]
 fn sculpt_create_blank(request: SculptCreateBlankRequest) -> Result<SculptSessionInfo, String> {
@@ -245,6 +265,7 @@ pub fn run() {
             grid_estimate,
             grid_fetch_build,
             install_save,
+            sculpt_from_dem,
             sculpt_create_blank,
             sculpt_load_png,
             sculpt_close,
