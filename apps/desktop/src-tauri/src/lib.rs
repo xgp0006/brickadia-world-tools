@@ -3,9 +3,10 @@
 
 use heightmap::api::{
     self, ConvertProgress, ConvertRequest, ConvertResult, DemBuildProgress, DemBuildRequest,
-    DemBuildResult, DemPredictRequest, DemPredictResult, SculptCreateBlankRequest,
-    SculptExportRequest, SculptExportResult, SculptLoadPngRequest, SculptPreview, SculptProgress,
-    SculptSessionInfo, SculptStrokeRequest,
+    DemBuildResult, DemPredictRequest, DemPredictResult, GridBuildProgress, GridBuildRequest,
+    GridBuildResult, GridEstimateDto, SculptCreateBlankRequest, SculptExportRequest,
+    SculptExportResult, SculptLoadPngRequest, SculptPreview, SculptProgress, SculptSessionInfo,
+    SculptStrokeRequest,
 };
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
@@ -72,6 +73,31 @@ async fn dem_fetch_build(
 fn install_save(path: String, overwrite: bool) -> Result<String, String> {
     api::install_save(PathBuf::from(path).as_path(), overwrite)
         .map(|p| p.display().to_string())
+}
+
+/// Pre-commit grid estimate (no network).
+#[tauri::command]
+fn grid_estimate(request: GridBuildRequest) -> Result<GridEstimateDto, String> {
+    api::grid_estimate(request)
+}
+
+/// Tiled DEM fetch + mesh + write. Emits `grid:progress`.
+#[tauri::command]
+async fn grid_fetch_build(
+    app: AppHandle,
+    request: GridBuildRequest,
+) -> Result<GridBuildResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        api::grid_fetch_build(
+            request,
+            move |p: GridBuildProgress| {
+                let _ = app.emit("grid:progress", &p);
+            },
+            || false,
+        )
+    })
+    .await
+    .map_err(|e| format!("grid build task failed: {e}"))?
 }
 
 // ── Sculpt (Phase 4 MVP) ────────────────────────────────────────────────────
@@ -141,6 +167,8 @@ pub fn run() {
             convert_build,
             dem_predict,
             dem_fetch_build,
+            grid_estimate,
+            grid_fetch_build,
             install_save,
             sculpt_create_blank,
             sculpt_load_png,

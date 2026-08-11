@@ -47,8 +47,8 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 | BWT-3.5 | `dem_fetch_build` command + `build:progress` events | done |
 | BWT-3.6 | DEM source picker (Terrarium/Mapbox/OpenTopo/3DEP) + keys | done |
 | BWT-3.7 | Install + overwrite + output name | done |
-| BWT-3.8 | Grid/tile path (or link “use Grid in egui until…”) | todo |
-| BWT-3.9 | Phase 3 exit: one US 3DEP + one Terrarium world installed | todo |
+| BWT-3.8 | Grid/tile path (or link “use Grid in egui until…”) | done |
+| BWT-3.9 | Phase 3 exit: one US 3DEP + one Terrarium world installed | doing |
 
 ## Phase 4 — Sculpt
 
@@ -64,10 +64,10 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 
 | ID | Title | Status |
 |----|-------|--------|
-| BWT-5.1 | Desktop entry → Tauri binary | todo |
-| BWT-5.2 | Symlink `brickadia-world-tools-gui` dual-run period | todo |
+| BWT-5.1 | Desktop entry → Tauri binary | done |
+| BWT-5.2 | Symlink `brickadia-world-tools-gui` dual-run period | done |
 | BWT-5.3 | Archive egui bin behind feature or docs-only | todo |
-| BWT-5.4 | README single-path user docs | todo |
+| BWT-5.4 | README single-path user docs | doing |
 
 ## Fidelity track
 
@@ -75,9 +75,9 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 |----|-------|--------|
 | BWT-F0 | Downsample rename + window + tooltips | done |
 | BWT-F1 | MAX_DEM_CELLS 400k + USGS 3DEP wire | done |
-| BWT-F2 | OpenTopo COP30 (or extra demtype) | todo |
-| BWT-F3 | Streaming/columnar mesher design + impl | todo |
-| BWT-F4 | Upstream wedge/hdmap selective harvest | todo |
+| BWT-F2 | OpenTopo COP30 (or extra demtype) | done |
+| BWT-F3 | Streaming/columnar mesher design + impl | doing |
+| BWT-F4 | Upstream wedge/hdmap selective harvest | done |
 | BWT-F5 | In-game FLATS_PER_BRICK confirm | todo |
 
 ## House / process

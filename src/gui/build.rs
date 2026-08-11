@@ -482,12 +482,12 @@ pub(crate) fn fetch_and_decode_dem(
         dem_source_label(request.dem_source),
     )?;
     // Single-shot GeoTIFF REST paths (not XYZ tile pyramids).
-    if request.dem_source == DemSource::OpenTopography {
+    if let Some(demtype) = request.dem_source.opentopo_demtype() {
         let key = token.ok_or(BuildError::TokenMissing {
             source_label: dem_source_label(request.dem_source),
             key_name: "OpenTopography API key",
         })?;
-        return fetch_opentopo_dem(request.bbox, key, &progress, &cancel);
+        return fetch_opentopo_dem(request.bbox, key, demtype, &progress, &cancel);
     }
     if request.dem_source == DemSource::Usgs3Dep {
         return fetch_usgs_3dep_dem(request.bbox, &progress, &cancel);
@@ -518,14 +518,8 @@ pub(crate) fn fetch_and_decode_dem(
     Ok(raster)
 }
 
-/// OpenTopography global DEM type. SRTMGL1 is 1 arc-second (~30 m) global SRTM,
-/// the best free global resolution OpenTopography serves without an academic
-/// account.
-const OPENTOPO_DEMTYPE: &str = "SRTMGL1";
-/// OpenTopography per-request area cap for SRTMGL1. Their API docs
-/// (portal.opentopography.org/apidocs) state: "Requests are limited to …
-/// 450,000 km² for all other data" — SRTMGL1 falls in "all other data".
-/// Exceeding it returns an HTTP 400; we reject earlier with a clear message.
+/// OpenTopography per-request area cap for SRTMGL1 / COP30 ("all other data"
+/// tier). Docs: portal.opentopography.org/apidocs — 450,000 km².
 pub(crate) const OPENTOPO_MAX_AREA_KM2: f64 = 450_000.0;
 const OPENTOPO_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard cap on the OpenTopography response body. A 450,000 km² SRTMGL1
@@ -574,6 +568,7 @@ fn validate_dem_dims(w: u32, h: u32) -> Result<(), BuildError> {
 fn fetch_opentopo_dem(
     bbox: BBoxLatLon,
     key: &str,
+    demtype: &str,
     progress: &ProgressFn,
     cancel: &AtomicBool,
 ) -> Result<DemRaster, BuildError> {
@@ -585,7 +580,8 @@ fn fetch_opentopo_dem(
     let area = bbox_area_km2(&bbox);
     if area > OPENTOPO_MAX_AREA_KM2 {
         return Err(BuildError::DemApi(format!(
-            "selected area is {area:.0} km², over OpenTopography's {OPENTOPO_MAX_AREA_KM2:.0} km² per-request limit for SRTMGL1 — draw a smaller box or use AWS Terrarium / Mapbox"
+            "selected area is {area:.0} km², over OpenTopography's {OPENTOPO_MAX_AREA_KM2:.0} km² \
+             per-request limit for {demtype} — draw a smaller box or use AWS Terrarium / Mapbox"
         )));
     }
     progress(BuildStage::FetchingTiles, 0.0);
@@ -595,7 +591,7 @@ fn fetch_opentopo_dem(
         .build();
     let resp = agent
         .get("https://portal.opentopography.org/API/globaldem")
-        .query("demtype", OPENTOPO_DEMTYPE)
+        .query("demtype", demtype)
         .query("south", &bbox.south.to_string())
         .query("north", &bbox.north.to_string())
         .query("west", &bbox.west.to_string())
@@ -1254,7 +1250,8 @@ fn dem_source_label(source: DemSource) -> &'static str {
     match source {
         DemSource::AwsTerrarium => "AWS Terrarium DEM",
         DemSource::MapboxTerrainRgb => "Mapbox Terrain-RGB DEM",
-        DemSource::OpenTopography => "OpenTopography DEM",
+        DemSource::OpenTopography => "OpenTopography SRTMGL1 DEM",
+        DemSource::OpenTopographyCop30 => "OpenTopography COP30 DEM",
         DemSource::Usgs3Dep => "USGS 3DEP DEM",
     }
 }
@@ -1987,7 +1984,7 @@ mod tests {
         );
         let progress: ProgressFn = Arc::new(|_, _| {});
         let cancel = AtomicBool::new(false);
-        let err = fetch_opentopo_dem(huge, "dummy-key", &progress, &cancel)
+        let err = fetch_opentopo_dem(huge, "dummy-key", "SRTMGL1", &progress, &cancel)
             .expect_err("over-cap bbox must be rejected before any network call");
         match err {
             BuildError::DemApi(msg) => assert!(

@@ -23,6 +23,11 @@ pub(crate) mod dem_sources;
 pub(crate) mod imagery_sources;
 #[cfg(feature = "dem")]
 pub(crate) mod tiles;
+#[cfg(feature = "dem")]
+pub(crate) mod scale;
+// Pure grid planner/orchestrator (no egui) — Tauri Map Grid mode.
+#[cfg(feature = "dem")]
+pub(crate) mod grid;
 
 // --- gui feature: egui shell ---
 #[cfg(feature = "gui")]
@@ -38,8 +43,6 @@ pub use app::*;
 mod coords;
 #[cfg(feature = "gui")]
 mod geocode;
-#[cfg(feature = "gui")]
-mod grid;
 #[cfg(feature = "gui")]
 mod grid_ui;
 #[cfg(feature = "gui")]

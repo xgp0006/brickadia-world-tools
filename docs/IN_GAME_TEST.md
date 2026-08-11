@@ -6,7 +6,23 @@ Install path (typical):
 `~/.steam/steam/steamapps/compatdata/2199420/pfx/drive_c/users/steamuser/AppData/Local/Brickadia/Saved/Worlds/`  
 Prefabs: `…/Saved/Prefabs/`
 
-## Smoke (every release)
+## Smoke (every release) — BWT-3.9 / BWT-F5
+
+**Agent/tooling smoke (no game):** Terrarium write  
+`~/.local/share/heightmap2brz/builds/smoke-terrarium.brdb` (2026-08-11, ~15k bricks).
+
+**Your eyes (required for ticket close):**
+
+- [ ] Map (egui or Tauri): AWS Terrarium + small bbox → generate → **Overwrite** if re-testing same name
+- [ ] World loads; terrain visible (not “only spawn”)
+- [ ] Walkable surface; spawn above peak
+- [ ] Convert: `example_maps/gradient.png` → loads in-game
+- [ ] **USGS 3DEP** (US box only): finer relief than Terrarium for same km² when budget allows
+- [ ] **Confirm FLATS_PER_BRICK:** plateau of known height vs Brickadia UI  
+  - Code: **1 brick = 3 flats**, **1 flat = 4 height units** after vscale  
+  - Result: ________ (date/build)
+
+## Smoke (continued)
 
 - [ ] Map tab: AWS Terrarium + default bbox → generate → **Overwrite** if re-testing same name
 - [ ] World loads; terrain visible (not “only spawn”)

@@ -10,6 +10,8 @@ pub(crate) enum DemSource {
     AwsTerrarium,
     MapboxTerrainRgb,
     OpenTopography,
+    /// Copernicus GLO-30 via OpenTopography (`demtype=COP30`) — ~30 m global.
+    OpenTopographyCop30,
     Usgs3Dep,
 }
 
@@ -18,6 +20,7 @@ impl DemSource {
         Self::AwsTerrarium,
         Self::MapboxTerrainRgb,
         Self::OpenTopography,
+        Self::OpenTopographyCop30,
         Self::Usgs3Dep,
     ];
 
@@ -35,6 +38,7 @@ impl DemSource {
             Self::AwsTerrarium => "AWS Terrarium (free, global, 30m)",
             Self::MapboxTerrainRgb => "Mapbox Terrain-RGB (token, 30m)",
             Self::OpenTopography => "OpenTopography SRTM (free key, 30m)",
+            Self::OpenTopographyCop30 => "OpenTopography COP30 (free key, ~30m)",
             Self::Usgs3Dep => "USGS 3DEP (free, US only, 1m LiDAR)",
         }
     }
@@ -43,14 +47,26 @@ impl DemSource {
         match self {
             Self::AwsTerrarium | Self::Usgs3Dep => None,
             Self::MapboxTerrainRgb => Some(RequiredKey::MapboxToken),
-            Self::OpenTopography => Some(RequiredKey::OpenTopoApiKey),
+            Self::OpenTopography | Self::OpenTopographyCop30 => Some(RequiredKey::OpenTopoApiKey),
         }
     }
 
     pub(crate) const fn coverage(self) -> Coverage {
         match self {
-            Self::AwsTerrarium | Self::MapboxTerrainRgb | Self::OpenTopography => Coverage::Global,
+            Self::AwsTerrarium
+            | Self::MapboxTerrainRgb
+            | Self::OpenTopography
+            | Self::OpenTopographyCop30 => Coverage::Global,
             Self::Usgs3Dep => Coverage::UnitedStates,
+        }
+    }
+
+    /// OpenTopography `demtype` query value, if this source uses the OpenTopo REST API.
+    pub(crate) const fn opentopo_demtype(self) -> Option<&'static str> {
+        match self {
+            Self::OpenTopography => Some("SRTMGL1"),
+            Self::OpenTopographyCop30 => Some("COP30"),
+            _ => None,
         }
     }
 
@@ -71,6 +87,12 @@ impl DemSource {
                  450,000 km² per request.\n\
                  In-game: good for huge regions; small boxes look blocky vs Terrarium.\n\
                  Pair with: larger studs/m if you need walkable size from few cells."
+            }
+            Self::OpenTopographyCop30 => {
+                "Does: Copernicus GLO-30 via OpenTopography (demtype=COP30), ~30 m global. \
+                 Free API key (Settings).\n\
+                 In-game: often cleaner than SRTM in some regions; still ~30 m, not LiDAR.\n\
+                 Pair with: small areas still prefer Terrarium/3DEP for brick detail."
             }
             Self::Usgs3Dep => {
                 "Does: USGS 3DEP via National Map ImageServer (CONUS/US). \
@@ -200,7 +222,9 @@ pub(crate) fn tile_source_for(
             }
             Some(Box::new(MapboxTerrainRgbTiles { token: t.to_owned() }))
         }
-        DemSource::OpenTopography | DemSource::Usgs3Dep => None,
+        DemSource::OpenTopography
+        | DemSource::OpenTopographyCop30
+        | DemSource::Usgs3Dep => None,
     }
 }
 
@@ -214,7 +238,9 @@ pub(crate) fn decode_pixel_for(source: DemSource, rgba: [u8; 4]) -> Option<f32> 
         DemSource::MapboxTerrainRgb => Some(decode_mapbox_terrain_rgb_pixel([
             rgba[0], rgba[1], rgba[2],
         ])),
-        DemSource::OpenTopography | DemSource::Usgs3Dep => None,
+        DemSource::OpenTopography
+        | DemSource::OpenTopographyCop30
+        | DemSource::Usgs3Dep => None,
     }
 }
 
@@ -296,8 +322,12 @@ mod tests {
         // is_fetchable() must agree with whether a real fetch path exists, so the
         // picker greys EXACTLY dead sources — none today (USGS 3DEP is wired).
         for &s in DemSource::ALL {
-            let has_path = matches!(s, DemSource::OpenTopography | DemSource::Usgs3Dep)
-                || tile_source_for(s, Some("pk.token")).is_some();
+            let has_path = matches!(
+                s,
+                DemSource::OpenTopography
+                    | DemSource::OpenTopographyCop30
+                    | DemSource::Usgs3Dep
+            ) || tile_source_for(s, Some("pk.token")).is_some();
             assert_eq!(
                 s.is_fetchable(),
                 has_path,

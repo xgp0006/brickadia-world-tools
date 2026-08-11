@@ -39,7 +39,7 @@ use super::build::{
 };
 use super::dem_sources::DemSource;
 use super::imagery_sources::ImagerySource;
-use super::map_tab::{derive_scale, ground_resolution_m};
+use super::scale::{derive_scale, ground_resolution_m};
 use super::tiles::{BBoxLatLon, MAX_DEM_CELLS, MERCATOR_LAT_LIMIT, approx_cell_count, lat_lon_to_world_px, pick_zoom};
 
 /// Bounded-parallel FETCH workers (Phase A). I/O-bound, so a small fixed pool
@@ -257,7 +257,7 @@ fn prefix_sum(v: &[u32]) -> Vec<u32> {
 /// `map_tab::predicted_cell_m` (grid mode warns against it — spec §9).
 fn cell_m_at(dem_source: DemSource, center_lat: f64, zoom: u32) -> f64 {
     match dem_source {
-        DemSource::OpenTopography => {
+        DemSource::OpenTopography | DemSource::OpenTopographyCop30 => {
             let cos_lat = center_lat.to_radians().cos().max(0.01);
             SRTMGL1_NS_M * cos_lat.sqrt()
         }

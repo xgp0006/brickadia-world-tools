@@ -10,6 +10,8 @@ pub mod install;
 #[cfg(feature = "dem")]
 pub mod dem_build;
 #[cfg(feature = "dem")]
+pub mod grid_build;
+#[cfg(feature = "dem")]
 pub mod sculpt;
 
 pub use convert::{
@@ -23,6 +25,11 @@ pub use install::{
 
 #[cfg(feature = "dem")]
 pub use dem_build::{DemBuildProgress, DemBuildRequest, DemBuildResult, dem_fetch_build};
+#[cfg(feature = "dem")]
+pub use grid_build::{
+    GridBuildProgress, GridBuildRequest, GridBuildResult, GridEstimateDto, GridModeDto,
+    grid_estimate, grid_fetch_build,
+};
 #[cfg(feature = "dem")]
 pub use sculpt::{
     SculptCreateBlankRequest, SculptExportRequest, SculptExportResult, SculptLoadPngRequest,

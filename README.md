@@ -19,17 +19,26 @@ Fork of [Meshiest/heightmap2brz](https://github.com/Meshiest/heightmap2brz), hea
 
 ## Launch
 
+**Classic (full Map/Convert/Sculpt/Grid — default app-grid entry):**
+
 ```bash
-brickadia-world-tools-gui    # preferred symlink
+brickadia-world-tools-gui    # preferred symlink → target/release/heightmap_gui
 # or
 heightmap2brz-gui
+cargo build --release --features gui   # after code changes (launcher uses release)
 ```
 
-After code changes (release binary is what the launcher runs):
+**Tauri shell (Convert + Map + Grid + Sculpt MVP):**
 
 ```bash
-cargo build --release --features gui
+brickadia-world-tools-tauri            # ~/.local/bin wrapper
+# or
+cd apps/desktop && deno task tauri:dev
+# release:
+cd apps/desktop && deno task tauri:build
 ```
+
+Program / tickets: [docs/program/PROGRAM.md](./docs/program/PROGRAM.md).
 
 CLI Stage-2 only:
 

@@ -19,8 +19,6 @@ use crate::gui::dem_sources::DemSource;
 use crate::gui::imagery_sources::ImagerySource;
 use crate::gui::tiles::BBoxLatLon;
 
-/// Matches Map-tab `MAX_HORIZONTAL_SCALE` (map_tab.rs).
-const MAX_HORIZONTAL_SCALE: u16 = 128;
 const DEFAULT_STUDS_PER_METER: f32 = 4.0;
 
 fn one_u16() -> u16 {
@@ -108,6 +106,7 @@ fn map_dem_source(s: DemSourceDto) -> DemSource {
         DemSourceDto::AwsTerrarium => DemSource::AwsTerrarium,
         DemSourceDto::MapboxTerrainRgb => DemSource::MapboxTerrainRgb,
         DemSourceDto::OpenTopography => DemSource::OpenTopography,
+        DemSourceDto::OpenTopographyCop30 => DemSource::OpenTopographyCop30,
         DemSourceDto::Usgs3Dep => DemSource::Usgs3Dep,
     }
 }
@@ -127,24 +126,6 @@ fn nonempty(s: Option<String>) -> Option<String> {
         let t = t.trim().to_owned();
         if t.is_empty() { None } else { Some(t) }
     })
-}
-
-/// Same math as Map-tab `derive_scale` (map_tab.rs) — keep in lockstep.
-fn derive_scale(
-    cell_m_eff: f64,
-    studs_per_meter: f32,
-    exaggeration: f32,
-    micro: bool,
-) -> (u16, f32) {
-    let cell_m_eff = cell_m_eff.max(1e-6);
-    let upf = if micro { 1.0 } else { 5.0 };
-    let max_hscale = f64::from(MAX_HORIZONTAL_SCALE) * 5.0 / upf;
-    let hscale = ((f64::from(studs_per_meter) * 5.0 * cell_m_eff) / (2.0 * upf))
-        .round()
-        .clamp(1.0, max_hscale) as u16;
-    let vertical =
-        ((2.0 * f64::from(hscale) * upf / cell_m_eff) * f64::from(exaggeration)) as f32;
-    (hscale, vertical)
 }
 
 fn resolve_tokens(req: &DemBuildRequest) -> (Option<String>, Option<String>) {
@@ -194,7 +175,7 @@ pub fn dem_fetch_build(
     })?;
     let cell_m_eff = pred.cell_m_eff.max(1e-6);
     let (horizontal_scale, vertical_scale) =
-        derive_scale(cell_m_eff, studs, exag, block_type.micro());
+        crate::gui::scale::derive_scale(cell_m_eff, studs, exag, block_type.micro());
 
     let (mapbox_token, opentopo_key) = resolve_tokens(&req);
 
@@ -259,7 +240,7 @@ mod tests {
     #[test]
     fn derive_scale_matches_true_1to1_spirit() {
         // ~3.63 m cells, 4 studs/m, no micro → same spirit as map_tab unit test.
-        let (hs, v) = derive_scale(3.63, 4.0, 1.0, false);
+        let (hs, v) = crate::gui::scale::derive_scale(3.63, 4.0, 1.0, false);
         assert!(hs >= 1);
         let horiz_units_per_m = 2.0 * f64::from(hs) * 5.0 / 3.63;
         assert!(

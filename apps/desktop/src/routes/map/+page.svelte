@@ -9,6 +9,7 @@
     | "aws_terrarium"
     | "mapbox_terrain_rgb"
     | "open_topography"
+    | "open_topography_cop30"
     | "usgs_3dep";
 
   type DemPredictResult = {
@@ -57,6 +58,35 @@
   let buildProgress = $state<BuildProgress | null>(null);
   let buildError = $state("");
   let buildResult = $state<DemBuildResult | null>(null);
+
+  // Grid (BWT-3.8)
+  let gridMode = $state(false);
+  let tileM = $state(750);
+  let gridEst = $state<{
+    tile_count: number;
+    total_cells: number;
+    est_bricks: number;
+    est_seconds: number;
+    fits_ram: boolean;
+    over_cell_budget: boolean;
+    zoom: number;
+    cell_m: number;
+    cols: number;
+    rows: number;
+  } | null>(null);
+  let gridProgress = $state<{
+    phase: string;
+    frac: number;
+    tiles_done: number;
+    tiles_total: number;
+  } | null>(null);
+  let gridResult = $state<{
+    paths: string[];
+    installed_paths: string[];
+    brick_count: number;
+    tile_count: number;
+    warnings: string[];
+  } | null>(null);
 
   let mapEl: HTMLDivElement | undefined = $state();
   let map: maplibregl.Map | null = null;
@@ -327,13 +357,63 @@
     });
   }
 
+  function gridRequest() {
+    return {
+      north,
+      south,
+      east,
+      west,
+      dem_source: demSource,
+      tile_m: tileM,
+      mode: "auto",
+      cols: 2,
+      rows: 2,
+      studs_per_meter: studsPerMeter,
+      vertical_exaggeration: verticalExaggeration,
+      output_name: outputName.trim() || "grid-build",
+      install: installWorld,
+      overwrite,
+      stitched: true,
+      individual: false,
+      mapbox_token: mapboxToken.trim() || null,
+      opentopo_key: opentopoKey.trim() || null,
+      brick_mode: "tile",
+      glow: false,
+      no_collision: false,
+    };
+  }
+
+  async function refreshGridEstimate() {
+    if (!gridMode) {
+      gridEst = null;
+      return;
+    }
+    clampBbox();
+    try {
+      gridEst = await invoke("grid_estimate", { request: gridRequest() });
+    } catch (e) {
+      gridEst = null;
+      buildError = String(e);
+    }
+  }
+
   async function runBuild() {
     clampBbox();
     building = true;
     buildError = "";
     buildResult = null;
+    gridResult = null;
     buildProgress = { phase: "Starting…", frac: 0 };
+    gridProgress = null;
     try {
+      if (gridMode) {
+        const result = await invoke<NonNullable<typeof gridResult>>("grid_fetch_build", {
+          request: gridRequest(),
+        });
+        gridResult = result;
+        buildProgress = { phase: "Finished", frac: 1 };
+        return;
+      }
       const result = await invoke<DemBuildResult>("dem_fetch_build", {
         request: {
           north,
@@ -371,6 +451,36 @@
     });
     return () => unlisten?.();
   });
+
+  $effect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<{ phase: string; frac: number; tiles_done: number; tiles_total: number }>(
+      "grid:progress",
+      (e) => {
+        gridProgress = e.payload;
+        buildProgress = { phase: e.payload.phase, frac: e.payload.frac };
+      },
+    ).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  });
+
+  $effect(() => {
+    const _g = gridMode;
+    const _t = tileM;
+    const _n = north;
+    const _s = south;
+    void _g;
+    void _t;
+    void _n;
+    void _s;
+    if (!gridMode) return;
+    const t = setTimeout(() => {
+      void refreshGridEstimate();
+    }, 200);
+    return () => clearTimeout(t);
+  });
 </script>
 
 <div class="map-page">
@@ -387,7 +497,10 @@
 
   <aside class="panel">
     <h2>DEM region</h2>
-    <p class="hint">Draw a box → predict → Build world (Terrarium free; keys for Mapbox/OpenTopo).</p>
+    <p class="hint">
+      Draw a box → predict → Build (Terrarium free). Enable <strong>Grid</strong> for large areas
+      (tiles). COP30 needs OpenTopo key.
+    </p>
 
     <div class="actions">
       <button
@@ -434,14 +547,58 @@
       <select bind:value={demSource}>
         <option value="aws_terrarium">AWS Terrarium</option>
         <option value="mapbox_terrain_rgb">Mapbox Terrain-RGB</option>
-        <option value="open_topography">OpenTopography</option>
+        <option value="open_topography">OpenTopography SRTM</option>
+        <option value="open_topography_cop30">OpenTopography COP30</option>
         <option value="usgs_3dep">USGS 3DEP</option>
       </select>
     </label>
 
+    <label class="check">
+      <input type="checkbox" bind:checked={gridMode} />
+      Grid build (tiled large worlds)
+    </label>
+    {#if gridMode}
+      <label>
+        Tile size (m)
+        <input type="number" min="100" max="50000" step="50" bind:value={tileM} />
+      </label>
+      {#if gridEst}
+        <div class="predict">
+          <div class="row">
+            <span>Tiles</span>
+            <strong>{gridEst.cols}×{gridEst.rows} = {gridEst.tile_count}</strong>
+          </div>
+          <div class="row">
+            <span>Cells</span>
+            <strong>{fmt(gridEst.total_cells, 0)}</strong>
+          </div>
+          <div class="row">
+            <span>Zoom / m·cell</span>
+            <strong>z{gridEst.zoom} · ~{fmt(gridEst.cell_m, 1)} m</strong>
+          </div>
+          <div class="row">
+            <span>~Time / RAM</span>
+            <strong
+              >~{fmt(gridEst.est_seconds, 0)}s · {gridEst.fits_ram ? "fits" : "OVER RAM"}</strong
+            >
+          </div>
+          {#if gridEst.over_cell_budget}
+            <p class="err">Per-tile over cell budget — raise tile size or shrink box.</p>
+          {/if}
+        </div>
+      {/if}
+    {/if}
+
     <label>
       Downsample density (1–8)
-      <input type="number" min="1" max="8" step="1" bind:value={densityFactor} />
+      <input
+        type="number"
+        min="1"
+        max="8"
+        step="1"
+        bind:value={densityFactor}
+        disabled={gridMode}
+      />
     </label>
 
     <div class="grid2">
@@ -536,6 +693,24 @@
     {#if buildError}
       <p class="err">{buildError}</p>
     {/if}
+    {#if gridResult}
+      <section class="result card-inner">
+        <p class="ok">
+          Grid {gridResult.tile_count} tiles · {gridResult.brick_count.toLocaleString()} bricks
+        </p>
+        <dl>
+          {#each gridResult.paths as p}
+            <div class="notes"><dt>path</dt><dd>{p}</dd></div>
+          {/each}
+          {#each gridResult.installed_paths as p}
+            <div class="notes"><dt>installed</dt><dd>{p}</dd></div>
+          {/each}
+        </dl>
+        {#each gridResult.warnings as w}
+          <p class="err">{w}</p>
+        {/each}
+      </section>
+    {/if}
     {#if buildResult}
       <section class="result card-inner">
         <p class="ok">Wrote {buildResult.path}</p>
@@ -555,7 +730,9 @@
         </dl>
       </section>
     {/if}
-    <p class="build-tip">Large areas: use Grid in the egui app for now.</p>
+    <p class="build-tip">
+      Grid mode tiles large boxes at full zoom. Prefer stitched install for one world.
+    </p>
   </aside>
 </div>
 

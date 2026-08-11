@@ -17,6 +17,7 @@ pub enum DemSourceDto {
     AwsTerrarium,
     MapboxTerrainRgb,
     OpenTopography,
+    OpenTopographyCop30,
     Usgs3Dep,
 }
 
@@ -86,7 +87,7 @@ pub fn predict_dem_cells(req: DemPredictRequest) -> Result<DemPredictResult, Str
     let lat = (req.north + req.south) * 0.5;
 
     match req.dem_source {
-        DemSourceDto::OpenTopography => {
+        DemSourceDto::OpenTopography | DemSourceDto::OpenTopographyCop30 => {
             let cos_lat = lat.to_radians().cos().max(0.01);
             let cell_m = 30.92 * cos_lat.sqrt();
             let height_m = ((req.north - req.south) * KM_PER_DEG_LAT * 1000.0).abs();
@@ -96,13 +97,19 @@ pub fn predict_dem_cells(req: DemPredictRequest) -> Result<DemPredictResult, Str
             let cols = (width_m / cell_m).ceil().max(1.0) as u64;
             let rows = (height_m / cell_m).ceil().max(1.0) as u64;
             let cells = cols.saturating_mul(rows) / density.saturating_mul(density).max(1);
+            let notes = match req.dem_source {
+                DemSourceDto::OpenTopographyCop30 => {
+                    "COP30 ~30 m via OpenTopo; free API key required".into()
+                }
+                _ => "SRTMGL1 ~30 m; free API key required".into(),
+            };
             Ok(DemPredictResult {
                 cell_m,
                 cell_m_eff: cell_m * density as f64,
                 approx_cells: cells,
                 zoom: None,
                 zoom_cap: None,
-                notes: "SRTMGL1 ~30 m; free API key required".into(),
+                notes,
             })
         }
         DemSourceDto::Usgs3Dep => {

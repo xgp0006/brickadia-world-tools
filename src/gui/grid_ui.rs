@@ -171,7 +171,7 @@ pub(crate) struct GridInputs<'a> {
 /// pyramid, so the spec forces z15 (and grid mode WARNS against it — §9).
 fn source_max_zoom_for(dem: DemSource, token: Option<&str>) -> u32 {
     match dem {
-        DemSource::OpenTopography => 15,
+        DemSource::OpenTopography | DemSource::OpenTopographyCop30 => 15,
         src => super::dem_sources::tile_source_for(src, token).map_or(15, |s| s.max_zoom()),
     }
 }
@@ -495,7 +495,10 @@ fn draw_grid_readout(grid: &GridUiState, ui: &mut Ui, inputs: &GridInputs) {
         plan.zoom,
         plan.cell_m,
     ));
-    if inputs.dem_source == DemSource::OpenTopography {
+    if matches!(
+        inputs.dem_source,
+        DemSource::OpenTopography | DemSource::OpenTopographyCop30
+    ) {
         ui.colored_label(
             STATUS_WARN_FG,
             "OpenTopography is geographic (non-Mercator) — grid tiles align at seams \

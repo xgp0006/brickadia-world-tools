@@ -53,7 +53,7 @@ const STUDS_PER_METER_MAX: f32 = 32.0;
 /// cap. 128 lets MICRO — which needs ~5× the integer scale of normal bricks to
 /// hit the same physical scale — reach a fine, faithful 1:1 model; normal bricks
 /// rarely want more than ~32 (above that each cell is a very wide plate).
-const MAX_HORIZONTAL_SCALE: u16 = 128;
+pub(crate) use super::scale::MAX_HORIZONTAL_SCALE;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BBox {
@@ -1166,7 +1166,10 @@ fn draw_zoom_readout(state: &MapTabState, b: BBox, ui: &mut Ui) {
     let token = state.config.mapbox_token.as_deref();
     // OpenTopography is a single-shot bbox API with a per-request AREA cap, not a
     // zoom cap — show the real km² limit instead (the documented 450,000 km²).
-    if state.dem_source == DemSource::OpenTopography {
+    if matches!(
+        state.dem_source,
+        DemSource::OpenTopography | DemSource::OpenTopographyCop30
+    ) {
         let area = build::bbox_area_km2(&bbox);
         let cap = build::OPENTOPO_MAX_AREA_KM2;
         let msg = format!(
@@ -1299,16 +1302,10 @@ fn predicted_cell_m(state: &MapTabState, b: BBox) -> Option<f64> {
     const SRTMGL1_NS_M: f64 = 30.92;
     let bbox = BBoxLatLon { north: b.north, south: b.south, east: b.east, west: b.west };
     match state.dem_source {
-        DemSource::OpenTopography => {
-            // OpenTopography SRTMGL1 is a GEOGRAPHIC (EPSG:4326) grid, NOT Web
-            // Mercator: a cell is 1 arc-second square in degrees, so its E-W
-            // ground size shrinks with cos(lat) (≈30.92*cos) while N-S stays
-            // ~30.92. The mesher renders SQUARE bricks, so no single cell size
-            // captures both axes (geographic sources are inherently aspect-
-            // distorted away from the equator — use AWS Terrarium / Mapbox, which
-            // are Mercator and isotropic, for a faithful 1:1 SHAPE). Use the
-            // geometric mean of the two axes so the relief error is symmetric
-            // (±sqrt over each axis) rather than one axis exact and the other off.
+        DemSource::OpenTopography | DemSource::OpenTopographyCop30 => {
+            // OpenTopography GeoTIFF sources are GEOGRAPHIC (EPSG:4326), NOT Web
+            // Mercator: a cell is ~1 arc-second (SRTM) or ~30 m (COP30). Use the
+            // geometric mean of the two axes so the relief error is symmetric.
             let cos_lat = b.centroid_lat().to_radians().cos().max(0.01);
             Some(SRTMGL1_NS_M * cos_lat.sqrt())
         }
@@ -1328,44 +1325,8 @@ fn predicted_cell_m(state: &MapTabState, b: BBox) -> Option<f64> {
     }
 }
 
-/// Derive the integer horizontal brick scale and the 1:1-matched vertical scale
-/// from the user's target studs-per-meter + exaggeration, the effective
-/// (post-density) DEM cell size in meters, and whether micro bricks are used.
-///
-/// True 1:1: a cell spans `2*size = 2*hscale*upf` world units (`upf` = the
-/// GenOptions size multiplier — 5 for normal bricks, 1 for micro; 1 stud = 5
-/// units) over `cell_m_eff` meters → `2*hscale*upf/cell_m_eff` units/m
-/// horizontally. Surface-Z is `(m-min)*vertical` units → `vertical` units/m.
-/// Setting them equal makes relief faithful; `exaggeration` scales it.
-pub(crate) fn derive_scale(
-    cell_m_eff: f64,
-    studs_per_meter: f32,
-    exaggeration: f32,
-    micro: bool,
-) -> (u16, f32) {
-    debug_assert!(cell_m_eff > 0.0, "derive_scale: cell_m_eff must be positive, got {cell_m_eff}");
-    let upf = if micro { 1.0 } else { 5.0 };
-    // Clamp the PHYSICAL cell span (`hscale * upf`), not the raw integer scale:
-    // micro (upf=1) needs 5× the integer scale of normal (upf=5) to reach the
-    // SAME physical world, so its ceiling is 5× higher. Clamping the raw integer
-    // at a shared 128 made micro saturate 5× too early and shrink 2–5×. The
-    // greedy per-quad clamp (500/size) bounds merged bricks, so the only u16
-    // `BrickSize` concern is a single cell (`size = hscale*upf ≤ 640 << 65535`).
-    let max_hscale = f64::from(MAX_HORIZONTAL_SCALE) * 5.0 / upf;
-    // Solve `2*hscale*upf / cell_m_eff == studs_per_meter * 5` (5 units/stud).
-    let hscale = ((f64::from(studs_per_meter) * 5.0 * cell_m_eff) / (2.0 * upf))
-        .round()
-        .clamp(1.0, max_hscale) as u16;
-    // 1:1 vertical (units/m) == achieved horizontal units/m, times exaggeration.
-    let vertical = ((2.0 * f64::from(hscale) * upf / cell_m_eff) * f64::from(exaggeration)) as f32;
-    (hscale, vertical)
-}
-
-/// Web Mercator ground resolution (meters per 256px-tile pixel) at a latitude.
-pub(crate) fn ground_resolution_m(lat_deg: f64, zoom: u32) -> f64 {
-    const EQUATOR_M_PER_PX_Z0: f64 = 40_075_016.686 / 256.0;
-    EQUATOR_M_PER_PX_Z0 * lat_deg.to_radians().cos() / f64::from(2_u32.pow(zoom.min(30)))
-}
+// Canonical implementations live in `scale` (shared with Grid + dem_build).
+pub(crate) use super::scale::{derive_scale, ground_resolution_m};
 
 fn draw_bbox_readout(b: BBox, ui: &mut Ui) {
     let w_km = b.width_km();
