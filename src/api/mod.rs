@@ -7,14 +7,20 @@ pub mod convert;
 pub mod dem_predict;
 pub mod install;
 
+#[cfg(feature = "dem")]
+pub mod dem_build;
+
 pub use convert::{
     BrickModeDto, ConvertProgress, ConvertRequest, ConvertResult, convert_heightmap,
 };
-pub use dem_predict::{DemPredictRequest, DemPredictResult, predict_dem_cells};
+pub use dem_predict::{DemPredictRequest, DemPredictResult, DemSourceDto, predict_dem_cells};
 pub use install::{
     BRICKADIA_APP_ID, brickadia_saved_dir, brickadia_worlds_dir, builds_dir, install_save,
     install_save_ext, is_prefix_missing, unique_save_path,
 };
+
+#[cfg(feature = "dem")]
+pub use dem_build::{DemBuildProgress, DemBuildRequest, DemBuildResult, dem_fetch_build};
 
 /// Crate version string for shell "about" / health checks.
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");

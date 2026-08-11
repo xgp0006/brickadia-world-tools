@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import maplibregl from "maplibre-gl";
   import "maplibre-gl/dist/maplibre-gl.css";
 
@@ -19,6 +20,19 @@
     notes: string;
   };
 
+  type BuildProgress = { phase: string; frac: number };
+
+  type DemBuildResult = {
+    path: string;
+    installed_path?: string | null;
+    install_warning?: string | null;
+    brick_count: number;
+    dem_width: number;
+    dem_height: number;
+    elevation_min_m: number;
+    elevation_max_m: number;
+  };
+
   /** Default: small Boulder CO box (matches dem_predict tests spirit). */
   let north = $state(40.05);
   let south = $state(39.95);
@@ -26,12 +40,23 @@
   let west = $state(-105.35);
   let demSource = $state<DemSource>("aws_terrarium");
   let densityFactor = $state(1);
+  let studsPerMeter = $state(4);
+  let verticalExaggeration = $state(1);
+  let outputName = $state("map-build");
+  let installWorld = $state(true);
+  let overwrite = $state(false);
+  let mapboxToken = $state("");
+  let opentopoKey = $state("");
 
   let predict = $state<DemPredictResult | null>(null);
   let predictError = $state("");
   let predicting = $state(false);
   let drawMode = $state(false);
   let mapReady = $state(false);
+  let building = $state(false);
+  let buildProgress = $state<BuildProgress | null>(null);
+  let buildError = $state("");
+  let buildResult = $state<DemBuildResult | null>(null);
 
   let mapEl: HTMLDivElement | undefined = $state();
   let map: maplibregl.Map | null = null;
@@ -301,6 +326,51 @@
       minimumFractionDigits: 0,
     });
   }
+
+  async function runBuild() {
+    clampBbox();
+    building = true;
+    buildError = "";
+    buildResult = null;
+    buildProgress = { phase: "Starting…", frac: 0 };
+    try {
+      const result = await invoke<DemBuildResult>("dem_fetch_build", {
+        request: {
+          north,
+          south,
+          east,
+          west,
+          dem_source: demSource,
+          density_factor: densityFactor,
+          studs_per_meter: studsPerMeter,
+          vertical_exaggeration: verticalExaggeration,
+          output_name: outputName.trim() || "map-build",
+          install: installWorld,
+          overwrite,
+          mapbox_token: mapboxToken.trim() || null,
+          opentopo_key: opentopoKey.trim() || null,
+          brick_mode: "tile",
+        },
+      });
+      buildResult = result;
+      buildProgress = { phase: "Done", frac: 1 };
+    } catch (e) {
+      buildError = String(e);
+      buildProgress = null;
+    } finally {
+      building = false;
+    }
+  }
+
+  $effect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<BuildProgress>("build:progress", (e) => {
+      buildProgress = e.payload;
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  });
 </script>
 
 <div class="map-page">
@@ -317,7 +387,7 @@
 
   <aside class="panel">
     <h2>DEM region</h2>
-    <p class="hint">Single-box predict (no fetch yet). Phase 3 shell.</p>
+    <p class="hint">Draw a box → predict → Build world (Terrarium free; keys for Mapbox/OpenTopo).</p>
 
     <div class="actions">
       <button
@@ -374,6 +444,44 @@
       <input type="number" min="1" max="8" step="1" bind:value={densityFactor} />
     </label>
 
+    <div class="grid2">
+      <label>
+        Studs / m
+        <input type="number" min="0.5" max="32" step="0.5" bind:value={studsPerMeter} />
+      </label>
+      <label>
+        Vert. exaggeration
+        <input type="number" min="0.25" max="8" step="0.25" bind:value={verticalExaggeration} />
+      </label>
+    </div>
+
+    <label>
+      Output name
+      <input type="text" bind:value={outputName} placeholder="map-build" />
+    </label>
+
+    <label class="check">
+      <input type="checkbox" bind:checked={installWorld} />
+      Install to Brickadia Worlds
+    </label>
+    <label class="check">
+      <input type="checkbox" bind:checked={overwrite} />
+      Overwrite same name
+    </label>
+
+    {#if demSource === "mapbox_terrain_rgb"}
+      <label>
+        Mapbox token
+        <input type="password" autocomplete="off" bind:value={mapboxToken} placeholder="or config.toml" />
+      </label>
+    {/if}
+    {#if demSource === "open_topography"}
+      <label>
+        OpenTopo API key
+        <input type="password" autocomplete="off" bind:value={opentopoKey} placeholder="or config.toml" />
+      </label>
+    {/if}
+
     <section class="predict card-inner">
       <h3>
         Predict
@@ -411,12 +519,43 @@
     <button
       type="button"
       class="build"
-      disabled
-      title="Phase 3 dem_fetch_build — coming next"
+      disabled={building || !mapReady}
+      onclick={() => void runBuild()}
     >
-      Build world
+      {building ? "Building…" : "Build world"}
     </button>
-    <p class="build-tip">Phase 3 dem_fetch_build — coming next</p>
+
+    {#if buildProgress && (building || buildResult)}
+      <div class="progress card-inner">
+        <div class="progress-label">{buildProgress.phase}</div>
+        <div class="bar">
+          <div class="bar-fill" style="width: {Math.round(Math.min(1, Math.max(0, buildProgress.frac)) * 100)}%"></div>
+        </div>
+      </div>
+    {/if}
+    {#if buildError}
+      <p class="err">{buildError}</p>
+    {/if}
+    {#if buildResult}
+      <section class="result card-inner">
+        <p class="ok">Wrote {buildResult.path}</p>
+        <dl>
+          <div><dt>bricks</dt><dd>{buildResult.brick_count.toLocaleString()}</dd></div>
+          <div><dt>DEM</dt><dd>{buildResult.dem_width}×{buildResult.dem_height}</dd></div>
+          <div>
+            <dt>elev</dt>
+            <dd>{fmt(buildResult.elevation_min_m, 1)}–{fmt(buildResult.elevation_max_m, 1)} m</dd>
+          </div>
+          {#if buildResult.installed_path}
+            <div class="notes"><dt>installed</dt><dd>{buildResult.installed_path}</dd></div>
+          {/if}
+          {#if buildResult.install_warning}
+            <div class="notes"><dt>install</dt><dd class="warn">{buildResult.install_warning}</dd></div>
+          {/if}
+        </dl>
+      </section>
+    {/if}
+    <p class="build-tip">Large areas: use Grid in the egui app for now.</p>
   </aside>
 </div>
 
@@ -571,6 +710,42 @@
     margin: 0;
     font-size: 0.72rem;
     color: #6a6660;
+  }
+  label.check {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.45rem;
+  }
+  label.check input {
+    width: auto;
+  }
+  .progress-label {
+    font-size: 0.78rem;
+    color: #b8b4ae;
+    margin-bottom: 0.35rem;
+  }
+  .bar {
+    height: 0.4rem;
+    border-radius: 3px;
+    background: #2c3140;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    background: #3d7ea6;
+    transition: width 0.15s ease-out;
+  }
+  .ok {
+    margin: 0 0 0.4rem;
+    color: #8bc49a;
+    font-size: 0.78rem;
+    word-break: break-all;
+  }
+  .warn {
+    color: #e0b080 !important;
+  }
+  .result dl {
+    margin-top: 0.25rem;
   }
   /* MapLibre dark chrome tweaks */
   :global(.maplibregl-ctrl-group) {

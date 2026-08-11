@@ -40,7 +40,10 @@ rayon = "1.11.0"
 
 [features]
 default = ["gui"]
+# DEM fetch+mesh+write without egui/walkers (Tauri Map path).
+dem = ["dep:ureq", "dep:tiff", "dep:serde_json", "dep:toml"]
 gui = [
+  "dem",
   "dep:egui",
   "dep:eframe",
   "dep:egui_extras",
@@ -49,10 +52,6 @@ gui = [
   "dep:native-dialog",
   "dep:arboard",
   "dep:walkers",
-  "dep:serde_json",
-  "dep:toml",
-  "dep:ureq",
-  "dep:tiff",
 ]
 
 [[bin]]

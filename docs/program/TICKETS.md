@@ -43,10 +43,10 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 | BWT-3.1 | MapLibre GL (or Leaflet) basemap in Svelte | done |
 | BWT-3.2 | Bbox draw + edit + lat/lon readout | done |
 | BWT-3.3 | Live `dem_predict` panel (m/cell, cells, notes) | done |
-| BWT-3.4 | Feature `dem` / expose fetch+build without full egui | todo |
-| BWT-3.5 | `dem_fetch_build` command + `build:progress` events | todo |
-| BWT-3.6 | DEM source picker (Terrarium/Mapbox/OpenTopo/3DEP) + keys | todo |
-| BWT-3.7 | Install + overwrite + output name | todo |
+| BWT-3.4 | Feature `dem` / expose fetch+build without full egui | done |
+| BWT-3.5 | `dem_fetch_build` command + `build:progress` events | done |
+| BWT-3.6 | DEM source picker (Terrarium/Mapbox/OpenTopo/3DEP) + keys | done |
+| BWT-3.7 | Install + overwrite + output name | done |
 | BWT-3.8 | Grid/tile path (or link “use Grid in egui until…”) | todo |
 | BWT-3.9 | Phase 3 exit: one US 3DEP + one Terrarium world installed | todo |
 

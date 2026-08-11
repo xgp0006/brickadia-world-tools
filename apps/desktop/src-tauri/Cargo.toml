@@ -17,6 +17,6 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Core mesh/DEM/export — no egui. Path is repo root (workspace member).
-heightmap = { path = "../../..", default-features = false }
+# Core mesh/DEM/export — dem feature (no egui/walkers). Path is repo root.
+heightmap = { path = "../../..", default-features = false, features = ["dem"] }
 tauri-plugin-dialog = "2"

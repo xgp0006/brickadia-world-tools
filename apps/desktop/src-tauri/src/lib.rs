@@ -1,8 +1,10 @@
 //! Tauri shell for Brickadia World Tools.
 //! Phase 2: Convert with progress, install-to-Worlds, dialogs.
+//! Phase 3: Map DEM fetch+build (`dem_fetch_build` + `build:progress`).
 
 use heightmap::api::{
-    self, ConvertProgress, ConvertRequest, ConvertResult, DemPredictRequest, DemPredictResult,
+    self, ConvertProgress, ConvertRequest, ConvertResult, DemBuildProgress, DemBuildRequest,
+    DemBuildResult, DemPredictRequest, DemPredictResult,
 };
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
@@ -45,6 +47,26 @@ async fn convert_build(
     .map_err(|e| format!("convert task failed: {e}"))?
 }
 
+/// Fetch DEM for bbox → mesh → write `.brdb` (optional install).
+/// Emits `build:progress` with `{ phase, frac }` during the run.
+#[tauri::command]
+async fn dem_fetch_build(
+    app: AppHandle,
+    request: DemBuildRequest,
+) -> Result<DemBuildResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        api::dem_fetch_build(
+            request,
+            move |p: DemBuildProgress| {
+                let _ = app.emit("build:progress", &p);
+            },
+            || false,
+        )
+    })
+    .await
+    .map_err(|e| format!("dem build task failed: {e}"))?
+}
+
 /// Install an existing save into Brickadia Worlds/Prefabs.
 #[tauri::command]
 fn install_save(path: String, overwrite: bool) -> Result<String, String> {
@@ -62,6 +84,7 @@ pub fn run() {
             builds_dir,
             convert_build,
             dem_predict,
+            dem_fetch_build,
             install_save,
         ])
         .run(tauri::generate_context!())
