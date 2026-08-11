@@ -32,10 +32,14 @@ pub use grid_build::{
 };
 #[cfg(feature = "dem")]
 pub use sculpt::{
-    SculptCreateBlankRequest, SculptExportRequest, SculptExportResult, SculptLoadPngRequest,
-    SculptPreview, SculptProgress, SculptSessionInfo, SculptStrokeRequest, SculptToolDto,
-    sculpt_apply_stroke, sculpt_close, sculpt_create_blank, sculpt_export, sculpt_info,
-    sculpt_load_png, sculpt_preview, sculpt_undo,
+    SculptCreateBlankRequest, SculptExportRequest, SculptExportResult, SculptLayerBoxRequest,
+    SculptLayerInfo, SculptLayerPartResult, SculptLayersExportResult, SculptLayersInfo,
+    SculptLoadPngRequest, SculptPaletteInfo, SculptPreview, SculptProgress, SculptSessionInfo,
+    SculptStrokeRequest, SculptToolDto, SculptZoneAddRectRequest, SculptZonesInfo, StampKindDto,
+    ZoneModeDto, sculpt_apply_stroke, sculpt_close, sculpt_create_blank, sculpt_export,
+    sculpt_export_layers, sculpt_info, sculpt_layer_add, sculpt_layer_paint_box,
+    sculpt_layer_set_active, sculpt_layers_info, sculpt_load_png, sculpt_palette, sculpt_preview,
+    sculpt_undo, sculpt_zone_add_rect, sculpt_zone_clear, sculpt_zones_info,
 };
 
 /// Crate version string for shell "about" / health checks.

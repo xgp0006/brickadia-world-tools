@@ -58,7 +58,7 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 | BWT-4.2 | WebGL/canvas height preview | done |
 | BWT-4.3 | Raise/Lower/Smooth/Flatten/Set | done |
 | BWT-4.4 | Export via convert path | done |
-| BWT-4.5 | Stamps, paint, zones, layers parity | todo |
+| BWT-4.5 | Stamps, paint, zones, layers parity | done |
 
 ## Phase 5 — Cutover
 

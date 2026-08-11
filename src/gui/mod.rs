@@ -49,13 +49,14 @@ mod grid_ui;
 mod map_tab;
 #[cfg(feature = "gui")]
 mod preview_source;
-// Pure heightfield/brush/tools compile under `dem` (Tauri Sculpt API).
-// egui tab + paint/zones convert path stay `gui`-gated inside the module.
+// Pure heightfield/brush/tools/paint/layers compile under `dem` (Tauri Sculpt API).
+// egui tab + full convert path stay `gui`-gated inside the module.
 #[cfg(feature = "dem")]
 pub(crate) mod sculpt;
+// Freedraw zone rasterize is pure geometry (no egui) — shared by Tauri + egui convert.
+#[cfg(feature = "dem")]
+pub(crate) mod zones;
 #[cfg(feature = "gui")]
 mod theme;
-#[cfg(feature = "gui")]
-mod zones;
 #[cfg(feature = "gui")]
 pub use theme::install_theme;

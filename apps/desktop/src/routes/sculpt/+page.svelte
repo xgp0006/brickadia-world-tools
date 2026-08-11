@@ -4,7 +4,17 @@
   import { listen } from "@tauri-apps/api/event";
   import { open, save } from "@tauri-apps/plugin-dialog";
 
-  type SculptTool = "raise" | "lower" | "smooth" | "flatten" | "set";
+  type SculptTool =
+    | "raise"
+    | "lower"
+    | "smooth"
+    | "flatten"
+    | "set"
+    | "stamp"
+    | "paint";
+
+  type StampKind = "cone" | "mesa" | "crater" | "ramp";
+  type ZoneMode = "omit" | "include";
 
   type SessionInfo = {
     session_id: number;
@@ -25,6 +35,8 @@
     min_m: number;
     max_m: number;
     gray: number[];
+    paint?: number[];
+    palette?: number[][];
   };
 
   type Progress = { phase: string; frac: number };
@@ -40,11 +52,50 @@
     elevation_max_m: number;
   };
 
+  type LayersInfo = {
+    session_id: number;
+    active: number;
+    grid_cols: number;
+    grid_rows: number;
+    layers: {
+      id: number;
+      name: string;
+      color: number[];
+      visible: boolean;
+      selected_cells: number;
+    }[];
+  };
+
+  type LayerPartResult = {
+    layer_name: string;
+    path: string;
+    brick_count: number;
+    installed_path?: string | null;
+    install_warning?: string | null;
+  };
+
   let session = $state<SessionInfo | null>(null);
   let tool = $state<SculptTool>("raise");
   let radius = $state(12);
   let strength = $state(3);
   let targetM = $state(10);
+  let stampKind = $state<StampKind>("cone");
+  let peakM = $state(40);
+  let innerRatio = $state(0.4);
+  let angleDeg = $state(0);
+  let paintIndex = $state(1);
+  let paintRes = $state(1);
+  let palette = $state<number[][]>([
+    [154, 163, 126, 255],
+    [200, 90, 60, 255],
+    [79, 138, 91, 255],
+    [60, 110, 168, 255],
+    [217, 194, 122, 255],
+  ]);
+  let zoneMode = $state<ZoneMode>("omit");
+  let zoneCount = $state(0);
+  let zoneDragStart: { x: number; y: number } | null = null;
+  let layers = $state<LayersInfo | null>(null);
   let blankW = $state(128);
   let blankH = $state(128);
   let cellM = $state(1);
@@ -57,11 +108,15 @@
   let exporting = $state(false);
   let progress = $state<Progress | null>(null);
   let exportResult = $state<ExportResult | null>(null);
+  let layerExportParts = $state<LayerPartResult[] | null>(null);
   let buildsDirHint = $state("");
 
   let canvasEl: HTMLCanvasElement | undefined = $state();
   let painting = false;
   let previewTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const heightTools: SculptTool[] = ["raise", "lower", "smooth", "flatten", "set"];
+  const stampKinds: StampKind[] = ["cone", "mesa", "crater", "ramp"];
 
   onMount(() => {
     invoke<string>("builds_dir")
@@ -101,6 +156,24 @@
         min_m: prev.min_m,
         max_m: prev.max_m,
       };
+      if (prev.palette && prev.palette.length > 0) {
+        palette = prev.palette;
+      }
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function refreshLayers() {
+    if (!session) return;
+    try {
+      layers = await invoke<LayersInfo>("sculpt_layers_info", {
+        sessionId: session.session_id,
+      });
+      const z = await invoke<{ count: number }>("sculpt_zones_info", {
+        sessionId: session.session_id,
+      });
+      zoneCount = z.count;
     } catch (e) {
       error = String(e);
     }
@@ -114,13 +187,25 @@
     canvasEl.width = width;
     canvasEl.height = height;
     const img = ctx.createImageData(width, height);
+    const paint = prev.paint ?? [];
+    const pal = prev.palette ?? palette;
     for (let i = 0; i < gray.length; i++) {
       const g = gray[i] ?? 0;
       const o = i * 4;
-      img.data[o] = g;
-      img.data[o + 1] = g;
-      img.data[o + 2] = g;
-      img.data[o + 3] = 255;
+      const idx = paint[i] ?? 0;
+      if (idx > 0 && pal[idx]) {
+        const c = pal[idx];
+        const t = 0.35 + 0.65 * (g / 255);
+        img.data[o] = Math.round((c[0] ?? 128) * t);
+        img.data[o + 1] = Math.round((c[1] ?? 128) * t);
+        img.data[o + 2] = Math.round((c[2] ?? 128) * t);
+        img.data[o + 3] = 255;
+      } else {
+        img.data[o] = g;
+        img.data[o + 1] = g;
+        img.data[o + 2] = g;
+        img.data[o + 3] = 255;
+      }
     }
     ctx.putImageData(img, 0, 0);
   }
@@ -129,6 +214,7 @@
     error = "";
     busy = true;
     exportResult = null;
+    layerExportParts = null;
     try {
       if (session) {
         await invoke("sculpt_close", { sessionId: session.session_id }).catch(() => {});
@@ -146,7 +232,12 @@
       });
       session = info;
       status = `Blank ${info.width}×${info.height} ready.`;
+      const pal = await invoke<{ palette: number[][] }>("sculpt_palette", {
+        sessionId: info.session_id,
+      });
+      palette = pal.palette;
       await refreshPreview();
+      await refreshLayers();
     } catch (e) {
       error = String(e);
     } finally {
@@ -163,6 +254,7 @@
     if (typeof path !== "string") return;
     busy = true;
     exportResult = null;
+    layerExportParts = null;
     try {
       if (session) {
         await invoke("sculpt_close", { sessionId: session.session_id }).catch(() => {});
@@ -179,7 +271,12 @@
       });
       session = info;
       status = `Loaded ${info.source_name} (${info.width}×${info.height}).`;
+      const pal = await invoke<{ palette: number[][] }>("sculpt_palette", {
+        sessionId: info.session_id,
+      });
+      palette = pal.palette;
       await refreshPreview();
+      await refreshLayers();
     } catch (e) {
       error = String(e);
     } finally {
@@ -201,13 +298,16 @@
 
   async function applyAt(ev: PointerEvent, begin: boolean) {
     if (!session || busy || exporting) return;
+    if (mode === "zone" || mode === "layers") return;
     const cell = canvasToCell(ev);
     if (!cell) return;
     // Strength: Raise/Lower use meters; Smooth/Flatten/Set use 0..1 blend.
     const str =
       tool === "raise" || tool === "lower"
         ? strength
-        : Math.min(1, Math.max(0.05, strength / 10));
+        : tool === "stamp" || tool === "paint"
+          ? 0
+          : Math.min(1, Math.max(0.05, strength / 10));
     try {
       const info = await invoke<SessionInfo>("sculpt_apply_stroke", {
         request: {
@@ -219,6 +319,12 @@
           strength: str,
           target_m: targetM,
           begin_stroke: begin,
+          stamp_kind: stampKind,
+          peak_m: peakM,
+          inner_ratio: innerRatio,
+          angle_deg: angleDeg,
+          paint_index: paintIndex,
+          paint_res: paintRes,
         },
       });
       session = info;
@@ -230,6 +336,19 @@
 
   function onPointerDown(ev: PointerEvent) {
     if (!session || ev.button !== 0) return;
+    if (mode === "zone") {
+      const cell = canvasToCell(ev);
+      if (!cell) return;
+      zoneDragStart = cell;
+      painting = true;
+      canvasEl?.setPointerCapture(ev.pointerId);
+      return;
+    }
+    if (mode === "layers") {
+      // Layer box pick on canvas
+      void pickLayerBox(ev);
+      return;
+    }
     painting = true;
     canvasEl?.setPointerCapture(ev.pointerId);
     void applyAt(ev, true);
@@ -237,10 +356,12 @@
 
   function onPointerMove(ev: PointerEvent) {
     if (!painting || !session) return;
+    if (mode === "zone") return; // commit on up
+    if (tool === "stamp") return; // one dab per press
     void applyAt(ev, false);
   }
 
-  function onPointerUp(ev: PointerEvent) {
+  async function onPointerUp(ev: PointerEvent) {
     if (!painting) return;
     painting = false;
     try {
@@ -248,7 +369,57 @@
     } catch {
       /* ignore */
     }
+    if (mode === "zone" && zoneDragStart && session) {
+      const end = canvasToCell(ev);
+      if (end) {
+        try {
+          const z = await invoke<{ count: number }>("sculpt_zone_add_rect", {
+            request: {
+              session_id: session.session_id,
+              mode: zoneMode,
+              x0: zoneDragStart.x,
+              y0: zoneDragStart.y,
+              x1: end.x,
+              y1: end.y,
+            },
+          });
+          zoneCount = z.count;
+          status = `Zone ${zoneMode} added (${zoneCount} total). Applied at export.`;
+        } catch (e) {
+          error = String(e);
+        }
+      }
+      zoneDragStart = null;
+    }
     void refreshPreview();
+  }
+
+  async function pickLayerBox(ev: PointerEvent) {
+    if (!session || !layers) return;
+    const cell = canvasToCell(ev);
+    if (!cell) return;
+    const bi = Math.min(
+      layers.grid_cols - 1,
+      Math.max(0, Math.floor((cell.x / session.width) * layers.grid_cols)),
+    );
+    const bj = Math.min(
+      layers.grid_rows - 1,
+      Math.max(0, Math.floor((cell.y / session.height) * layers.grid_rows)),
+    );
+    try {
+      layers = await invoke<LayersInfo>("sculpt_layer_paint_box", {
+        request: {
+          session_id: session.session_id,
+          bi,
+          bj,
+          on: true,
+          layer_index: layers.active,
+        },
+      });
+      status = `Layer box (${bi},${bj}) selected on active layer.`;
+    } catch (e) {
+      error = String(e);
+    }
   }
 
   async function undo() {
@@ -260,6 +431,44 @@
       });
       status = "Undid last stroke.";
       await refreshPreview();
+      await refreshLayers();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function clearZones() {
+    if (!session) return;
+    try {
+      const z = await invoke<{ count: number }>("sculpt_zone_clear", {
+        sessionId: session.session_id,
+      });
+      zoneCount = z.count;
+      status = "Zones cleared.";
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function addLayer() {
+    if (!session) return;
+    try {
+      layers = await invoke<LayersInfo>("sculpt_layer_add", {
+        sessionId: session.session_id,
+      });
+      status = `Added ${layers.layers[layers.active]?.name ?? "layer"}.`;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function setActiveLayer(index: number) {
+    if (!session) return;
+    try {
+      layers = await invoke<LayersInfo>("sculpt_layer_set_active", {
+        sessionId: session.session_id,
+        index,
+      });
     } catch (e) {
       error = String(e);
     }
@@ -273,6 +482,7 @@
     error = "";
     exporting = true;
     exportResult = null;
+    layerExportParts = null;
     progress = { phase: "Starting…", frac: 0 };
     status = "Exporting…";
     try {
@@ -316,12 +526,62 @@
       progress = null;
     }
   }
+
+  async function runLayerExport() {
+    if (!session) return;
+    error = "";
+    exporting = true;
+    layerExportParts = null;
+    progress = { phase: "Starting…", frac: 0 };
+    status = "Exporting layers…";
+    try {
+      const outDir = buildsDirHint || undefined;
+      const result = await invoke<{ parts: LayerPartResult[] }>("sculpt_export_layers", {
+        request: {
+          session_id: session.session_id,
+          out_file: outDir ?? null,
+          install,
+          overwrite,
+          micro: null,
+          studs_per_meter: studsPerMeter,
+          vertical_exaggeration: 1,
+          cell_m: cellM,
+        },
+      });
+      layerExportParts = result.parts;
+      status = `Exported ${result.parts.length} layer part(s).`;
+    } catch (e) {
+      error = String(e);
+      status = "Layer export failed.";
+    } finally {
+      exporting = false;
+      progress = null;
+    }
+  }
+
+  // UI mode tabs (shape tools vs stamp/paint/zone/layers)
+  type Mode = "shape" | "stamp" | "paint" | "zone" | "layers";
+  let mode = $state<Mode>("shape");
+
+  function setMode(m: Mode) {
+    mode = m;
+    if (m === "shape" && !heightTools.includes(tool)) tool = "raise";
+    if (m === "stamp") tool = "stamp";
+    if (m === "paint") tool = "paint";
+    // zone/layers are not stroke tools
+  }
+
+  function swatchCss(c: number[]): string {
+    return `rgb(${c[0] ?? 0},${c[1] ?? 0},${c[2] ?? 0})`;
+  }
 </script>
 
 <div class="page">
   <aside class="panel">
     <h1>Sculpt</h1>
-    <p class="hint">MVP: Raise / Lower / Smooth (+ Flatten, Set). Greyscale height preview.</p>
+    <p class="hint">
+      Stamp · Paint · Zones · Layers (BWT-4.5). Height tools + greyscale/paint preview.
+    </p>
 
     <section>
       <h2>Field</h2>
@@ -341,36 +601,183 @@
     </section>
 
     <section>
-      <h2>Brush</h2>
+      <h2>Mode</h2>
       <div class="tools">
-        {#each ["raise", "lower", "smooth", "flatten", "set"] as t}
+        {#each ["shape", "stamp", "paint", "zone", "layers"] as m}
           <button
             type="button"
-            class:active={tool === t}
-            onclick={() => (tool = t as SculptTool)}
+            class:active={mode === m}
+            onclick={() => setMode(m as Mode)}
           >
-            {t}
+            {m}
           </button>
         {/each}
       </div>
-      <label class="slider">
-        Radius (cells)
-        <input type="range" min="1" max="80" bind:value={radius} />
-        <span>{radius}</span>
-      </label>
-      <label class="slider">
-        Strength
-        <input type="range" min="0.1" max="20" step="0.1" bind:value={strength} />
-        <span>{strength}</span>
-      </label>
-      {#if tool === "flatten" || tool === "set"}
-        <label class="slider">
-          Target (m)
-          <input type="range" min="0" max="200" step="0.5" bind:value={targetM} />
-          <span>{targetM}</span>
-        </label>
-      {/if}
     </section>
+
+    {#if mode === "shape"}
+      <section>
+        <h2>Brush</h2>
+        <div class="tools">
+          {#each heightTools as t}
+            <button
+              type="button"
+              class:active={tool === t}
+              onclick={() => (tool = t)}
+            >
+              {t}
+            </button>
+          {/each}
+        </div>
+        <label class="slider">
+          Radius (cells)
+          <input type="range" min="1" max="80" bind:value={radius} />
+          <span>{radius}</span>
+        </label>
+        <label class="slider">
+          Strength
+          <input type="range" min="0.1" max="20" step="0.1" bind:value={strength} />
+          <span>{strength}</span>
+        </label>
+        {#if tool === "flatten" || tool === "set"}
+          <label class="slider">
+            Target (m)
+            <input type="range" min="0" max="200" step="0.5" bind:value={targetM} />
+            <span>{targetM}</span>
+          </label>
+        {/if}
+      </section>
+    {:else if mode === "stamp"}
+      <section>
+        <h2>Stamp</h2>
+        <p class="subhint">Click once — cone/mesa/crater/ramp. Drag does not smear.</p>
+        <div class="tools">
+          {#each stampKinds as k}
+            <button
+              type="button"
+              class:active={stampKind === k}
+              onclick={() => (stampKind = k)}
+            >
+              {k}
+            </button>
+          {/each}
+        </div>
+        <label class="slider">
+          Radius (cells)
+          <input type="range" min="1" max="80" bind:value={radius} />
+          <span>{radius}</span>
+        </label>
+        <label class="slider">
+          Peak (m)
+          <input type="range" min="-80" max="120" step="0.5" bind:value={peakM} />
+          <span>{peakM}</span>
+        </label>
+        {#if stampKind === "mesa" || stampKind === "crater"}
+          <label class="slider">
+            Inner ratio
+            <input type="range" min="0.05" max="0.95" step="0.01" bind:value={innerRatio} />
+            <span>{innerRatio.toFixed(2)}</span>
+          </label>
+        {/if}
+        {#if stampKind === "ramp"}
+          <label class="slider">
+            Angle (°)
+            <input type="range" min="0" max="360" step="1" bind:value={angleDeg} />
+            <span>{angleDeg}</span>
+          </label>
+        {/if}
+      </section>
+    {:else if mode === "paint"}
+      <section>
+        <h2>Paint</h2>
+        <p class="subhint">Palette splat → brick colors on export. Index 0 erases.</p>
+        <div class="swatches">
+          {#each palette as c, i}
+            <button
+              type="button"
+              class="swatch"
+              class:active={paintIndex === i}
+              style={`background:${swatchCss(c)}`}
+              title={`index ${i}`}
+              onclick={() => (paintIndex = i)}
+            >
+              {i}
+            </button>
+          {/each}
+        </div>
+        <label class="slider">
+          Radius (cells)
+          <input type="range" min="1" max="80" bind:value={radius} />
+          <span>{radius}</span>
+        </label>
+        <label class="slider">
+          Block res
+          <input type="range" min="1" max="16" bind:value={paintRes} />
+          <span>{paintRes}</span>
+        </label>
+      </section>
+    {:else if mode === "zone"}
+      <section>
+        <h2>Zones</h2>
+        <p class="subhint">
+          Drag a rectangle on the canvas. Omit = hole; Include = keep only inside.
+          Applied at single export (keep-mask). Freehand lasso still egui-only.
+        </p>
+        <div class="tools">
+          <button
+            type="button"
+            class:active={zoneMode === "omit"}
+            onclick={() => (zoneMode = "omit")}>omit</button
+          >
+          <button
+            type="button"
+            class:active={zoneMode === "include"}
+            onclick={() => (zoneMode = "include")}>include</button
+          >
+          <button type="button" disabled={!session || zoneCount === 0} onclick={clearZones}
+            >clear</button
+          >
+        </div>
+        <p class="meta">{zoneCount} zone(s)</p>
+      </section>
+    {:else if mode === "layers"}
+      <section>
+        <h2>Layers</h2>
+        <p class="subhint">
+          Click canvas to select grid boxes on the active layer. Export Parts writes
+          one `.brdb` per non-empty layer (geometry-only; top wins claim).
+        </p>
+        <div class="actions">
+          <button type="button" disabled={!session} onclick={addLayer}>+ Layer</button>
+          <button
+            type="button"
+            class="primary"
+            disabled={!session || busy || exporting}
+            onclick={runLayerExport}
+          >
+            Export parts
+          </button>
+        </div>
+        {#if layers}
+          <ul class="layer-list">
+            {#each layers.layers as L, i}
+              <li>
+                <button
+                  type="button"
+                  class:active={layers.active === i}
+                  onclick={() => setActiveLayer(i)}
+                >
+                  <span class="dot" style={`background:${swatchCss(L.color)}`}></span>
+                  {L.name}
+                  <span class="meta">({L.selected_cells})</span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+          <p class="meta">Grid {layers.grid_cols}×{layers.grid_rows}</p>
+        {/if}
+      </section>
+    {/if}
 
     <section>
       <h2>Export</h2>
@@ -411,6 +818,13 @@
         {exportResult.brick_count} bricks · {exportResult.path}
       </p>
     {/if}
+    {#if layerExportParts}
+      <ul class="ok-list">
+        {#each layerExportParts as p}
+          <li class="ok">{p.layer_name}: {p.brick_count} → {p.path}</li>
+        {/each}
+      </ul>
+    {/if}
   </aside>
 
   <main class="canvas-wrap">
@@ -419,6 +833,7 @@
       <canvas
         bind:this={canvasEl}
         class="height-canvas"
+        class:zone={mode === "zone"}
         onpointerdown={onPointerDown}
         onpointermove={onPointerMove}
         onpointerup={onPointerUp}
@@ -456,10 +871,15 @@
     letter-spacing: 0.06em;
     color: #9a9690;
   }
-  .hint {
+  .hint,
+  .subhint {
     margin: 0 0 0.85rem;
     font-size: 0.8rem;
     color: #9a9690;
+  }
+  .subhint {
+    margin-bottom: 0.5rem;
+    font-size: 0.75rem;
   }
   section {
     margin-bottom: 1rem;
@@ -545,6 +965,38 @@
     font-size: 0.82rem;
     margin: 0.25rem 0;
   }
+  .swatches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin: 0.4rem 0;
+  }
+  .swatch {
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    font-size: 0.65rem;
+    text-shadow: 0 0 2px #000;
+  }
+  .layer-list {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+  }
+  .layer-list button {
+    width: 100%;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.25rem;
+  }
+  .dot {
+    width: 0.65rem;
+    height: 0.65rem;
+    border-radius: 50%;
+    display: inline-block;
+  }
   .meta,
   .status,
   .err,
@@ -561,6 +1013,11 @@
   }
   .ok {
     color: #8c8;
+  }
+  .ok-list {
+    list-style: none;
+    padding: 0;
+    margin: 0.35rem 0 0;
   }
   .progress {
     position: relative;
@@ -601,6 +1058,9 @@
     cursor: crosshair;
     border: 1px solid #2c3140;
     touch-action: none;
+  }
+  .height-canvas.zone {
+    cursor: crosshair;
   }
   .empty {
     color: #9a9690;

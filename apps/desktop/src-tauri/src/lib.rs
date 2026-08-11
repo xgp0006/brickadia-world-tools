@@ -5,8 +5,9 @@ use heightmap::api::{
     self, ConvertProgress, ConvertRequest, ConvertResult, DemBuildProgress, DemBuildRequest,
     DemBuildResult, DemPredictRequest, DemPredictResult, GridBuildProgress, GridBuildRequest,
     GridBuildResult, GridEstimateDto, SculptCreateBlankRequest, SculptExportRequest,
-    SculptExportResult, SculptLoadPngRequest, SculptPreview, SculptProgress, SculptSessionInfo,
-    SculptStrokeRequest,
+    SculptExportResult, SculptLayerBoxRequest, SculptLayersExportResult, SculptLayersInfo,
+    SculptLoadPngRequest, SculptPaletteInfo, SculptPreview, SculptProgress, SculptSessionInfo,
+    SculptStrokeRequest, SculptZoneAddRectRequest, SculptZonesInfo,
 };
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
@@ -156,6 +157,65 @@ async fn sculpt_export(
     .map_err(|e| format!("sculpt export task failed: {e}"))?
 }
 
+#[tauri::command]
+fn sculpt_palette(session_id: u64) -> Result<SculptPaletteInfo, String> {
+    api::sculpt_palette(session_id)
+}
+
+#[tauri::command]
+fn sculpt_zone_add_rect(request: SculptZoneAddRectRequest) -> Result<SculptZonesInfo, String> {
+    api::sculpt_zone_add_rect(request)
+}
+
+#[tauri::command]
+fn sculpt_zone_clear(session_id: u64) -> Result<SculptZonesInfo, String> {
+    api::sculpt_zone_clear(session_id)
+}
+
+#[tauri::command]
+fn sculpt_zones_info(session_id: u64) -> Result<SculptZonesInfo, String> {
+    api::sculpt_zones_info(session_id)
+}
+
+#[tauri::command]
+fn sculpt_layers_info(session_id: u64) -> Result<SculptLayersInfo, String> {
+    api::sculpt_layers_info(session_id)
+}
+
+#[tauri::command]
+fn sculpt_layer_add(session_id: u64) -> Result<SculptLayersInfo, String> {
+    api::sculpt_layer_add(session_id)
+}
+
+#[tauri::command]
+fn sculpt_layer_set_active(session_id: u64, index: usize) -> Result<SculptLayersInfo, String> {
+    api::sculpt_layer_set_active(session_id, index)
+}
+
+#[tauri::command]
+fn sculpt_layer_paint_box(request: SculptLayerBoxRequest) -> Result<SculptLayersInfo, String> {
+    api::sculpt_layer_paint_box(request)
+}
+
+/// Multi-save layer export. Emits `sculpt:progress`.
+#[tauri::command]
+async fn sculpt_export_layers(
+    app: AppHandle,
+    request: SculptExportRequest,
+) -> Result<SculptLayersExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        api::sculpt_export_layers(
+            request,
+            move |p: SculptProgress| {
+                let _ = app.emit("sculpt:progress", &p);
+            },
+            || false,
+        )
+    })
+    .await
+    .map_err(|e| format!("sculpt layer export task failed: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -178,6 +238,15 @@ pub fn run() {
             sculpt_apply_stroke,
             sculpt_undo,
             sculpt_export,
+            sculpt_palette,
+            sculpt_zone_add_rect,
+            sculpt_zone_clear,
+            sculpt_zones_info,
+            sculpt_layers_info,
+            sculpt_layer_add,
+            sculpt_layer_set_active,
+            sculpt_layer_paint_box,
+            sculpt_export_layers,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

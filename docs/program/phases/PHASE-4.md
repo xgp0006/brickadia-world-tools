@@ -1,6 +1,6 @@
 # Phase 4 — Tauri Sculpt
 
-**Status:** MVP in progress (BWT-4.1–4.4 done; 4.5 parity later)  
+**Status:** BWT-4.1–4.5 landed (Tauri sculpt parity)  
 **Tickets:** BWT-4.1–4.5  
 **Depends on:** Phase 3 Map happy path (can load field from DEM or PNG)
 
@@ -10,11 +10,11 @@ Sculpt workspace in Tauri: edit heightfield, export to same mesh path as today.
 
 ## Outcomes
 
-1. **Document model** — height grid + meta (cell_m, studs) + optional paint/zones  
-2. **Preview** — WebGL or canvas height shading  
+1. **Document model** — height grid + meta (cell_m, studs) + paint/zones/layers on session  
+2. **Preview** — canvas height shading (+ paint tint)  
 3. **MVP tools** — Raise, Lower, Smooth, Flatten, Set (+ strength, brush size)  
 4. **Export** — `convert`/greedy path → `.brdb` / install  
-5. **Parity later** — stamps, splat, zones, layers (may stay egui longer if needed)
+5. **Parity (BWT-4.5)** — stamps, paint splat, rect zones, multi-layer export
 
 ## Architecture sketch
 
@@ -43,9 +43,11 @@ Prefer **server-side heightfield** in Rust (authoritative) with preview texture 
 | BWT-4.2 | `/sculpt` Canvas 2D greyscale height preview (min→max normalize) |
 | BWT-4.3 | Raise, Lower, Smooth, Flatten, Set + radius/strength (+ target for Flatten/Set) |
 | BWT-4.4 | Export: `to_dem_raster` → greedy mesh → `.brdb` (+ optional install); event `sculpt:progress` |
+| BWT-4.5 | Stamp (cone/mesa/crater/ramp); paint splat + color export; rect zones keep-mask; multi-layer part export |
 
-Pure engine (`heightfield` / `brush` / `tools`) compiles under `feature = "dem"` (no egui). Full stamps/paint/zones/layers remain egui / BWT-4.5.
+Pure engine under `feature = "dem"`: heightfield / brush / tools / paint / layers + `gui::zones` rasterize.  
+egui-only remains: freehand/polygon zone capture UI, flood-fill paint bucket, splatmap import, tiled convert seam, full convert terrace knobs, rotation bake UI.
 
-## Non-goals (first cut)
+## Non-goals (still open)
 
-Full layers multi-save, free-angle rotation bake (port after MVP), GPU live brick preview.
+Free-angle rotation bake UI, GPU live brick preview, freehand zone lasso in Tauri, per-part paint on layer export.
