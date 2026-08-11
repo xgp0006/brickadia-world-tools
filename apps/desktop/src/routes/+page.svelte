@@ -1,25 +1,62 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
+  import { open, save } from "@tauri-apps/plugin-dialog";
 
   type BrickMode = "default" | "tile" | "smooth_tile" | "stud" | "micro";
+
+  type Progress = { phase: string; frac: number };
 
   let coreVersion = $state("…");
   let heightmapPath = $state("");
   let colormapPath = $state("");
-  let outFile = $state("/tmp/bwt-convert-out.brdb");
+  let outFile = $state("");
   let brickMode = $state<BrickMode>("tile");
   let horizontalSize = $state(1);
   let verticalScale = $state(1);
   let greedy = $state(true);
   let hdmap = $state(false);
   let status = $state("");
+  let progress = $state<Progress | null>(null);
   let busy = $state(false);
 
   $effect(() => {
     invoke<string>("core_version")
       .then((v) => (coreVersion = v))
       .catch((e) => (coreVersion = `error: ${e}`));
+
+    let unlisten: (() => void) | undefined;
+    listen<Progress>("convert:progress", (e) => {
+      progress = e.payload;
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
   });
+
+  async function pickHeightmap() {
+    const path = await open({
+      multiple: false,
+      filters: [{ name: "Heightmap", extensions: ["png", "jpg", "jpeg"] }],
+    });
+    if (typeof path === "string") heightmapPath = path;
+  }
+
+  async function pickColormap() {
+    const path = await open({
+      multiple: false,
+      filters: [{ name: "Colormap", extensions: ["png", "jpg", "jpeg"] }],
+    });
+    if (typeof path === "string") colormapPath = path;
+  }
+
+  async function pickOut() {
+    const path = await save({
+      filters: [{ name: "Brickadia save", extensions: ["brdb", "brz"] }],
+      defaultPath: "world.brdb",
+    });
+    if (typeof path === "string") outFile = path;
+  }
 
   async function runConvert(event: Event) {
     event.preventDefault();
@@ -27,8 +64,13 @@
       status = "Heightmap path required.";
       return;
     }
+    if (!outFile.trim()) {
+      status = "Output path required — use Browse or type a path.";
+      return;
+    }
     busy = true;
     status = "Converting…";
+    progress = { phase: "Reading", frac: 0 };
     try {
       const result = await invoke<{
         out_file: string;
@@ -52,8 +94,10 @@
         },
       });
       status = `OK → ${result.absolute_path ?? result.out_file}`;
+      progress = { phase: "Finished", frac: 1 };
     } catch (e) {
       status = `Error: ${e}`;
+      progress = null;
     } finally {
       busy = false;
     }
@@ -64,7 +108,7 @@
   <header>
     <h1>Brickadia World Tools</h1>
     <p class="sub">
-      Tauri shell · Convert (Phase 2) · core <code>heightmap {coreVersion}</code>
+      Tauri + Deno · Convert · core <code>heightmap {coreVersion}</code>
     </p>
   </header>
 
@@ -72,31 +116,40 @@
     <h2>Convert</h2>
     <p class="hint">
       Heightmap PNG → <code>.brdb</code> / <code>.brz</code>. Same Rust path as the egui Convert
-      tab. Paste absolute paths (file dialog lands next).
+      tab. Install into Brickadia Worlds is Map-tab only for now.
     </p>
 
     <form onsubmit={runConvert}>
       <label>
-        Heightmap path
-        <input
-          type="text"
-          bind:value={heightmapPath}
-          placeholder="/path/to/height.png"
-          disabled={busy}
-        />
+        Heightmap
+        <div class="path-row">
+          <input
+            type="text"
+            bind:value={heightmapPath}
+            placeholder="/path/to/height.png"
+            disabled={busy}
+          />
+          <button type="button" class="sec" onclick={pickHeightmap} disabled={busy}>Browse</button>
+        </div>
       </label>
       <label>
-        Colormap path (optional)
-        <input
-          type="text"
-          bind:value={colormapPath}
-          placeholder="defaults to heightmap"
-          disabled={busy}
-        />
+        Colormap (optional)
+        <div class="path-row">
+          <input
+            type="text"
+            bind:value={colormapPath}
+            placeholder="defaults to heightmap"
+            disabled={busy}
+          />
+          <button type="button" class="sec" onclick={pickColormap} disabled={busy}>Browse</button>
+        </div>
       </label>
       <label>
-        Output path
-        <input type="text" bind:value={outFile} disabled={busy} />
+        Output
+        <div class="path-row">
+          <input type="text" bind:value={outFile} placeholder="world.brdb" disabled={busy} />
+          <button type="button" class="sec" onclick={pickOut} disabled={busy}>Browse</button>
+        </div>
       </label>
 
       <div class="row">
@@ -129,6 +182,15 @@
         >
       </div>
 
+      {#if progress && busy}
+        <div class="prog">
+          <div class="prog-label">{progress.phase} · {Math.round(progress.frac * 100)}%</div>
+          <div class="bar">
+            <div class="fill" style="width: {Math.min(100, progress.frac * 100)}%"></div>
+          </div>
+        </div>
+      {/if}
+
       <button type="submit" disabled={busy}>
         {busy ? "Working…" : "Convert"}
       </button>
@@ -140,7 +202,7 @@
   </section>
 
   <footer>
-    egui GUI still ships via <code>brickadia-world-tools-gui</code> until Map/Sculpt parity.
+    Run: <code>deno task tauri:dev</code> · egui: <code>brickadia-world-tools-gui</code>
   </footer>
 </main>
 
@@ -195,6 +257,14 @@
     color: #b8b4ae;
     text-align: left;
   }
+  .path-row {
+    display: flex;
+    gap: 0.45rem;
+  }
+  .path-row input {
+    flex: 1;
+    min-width: 0;
+  }
   input[type="text"],
   input[type="number"],
   select {
@@ -221,7 +291,7 @@
     gap: 0.4rem;
   }
   button {
-    margin-top: 0.35rem;
+    margin-top: 0.15rem;
     padding: 0.65rem 1rem;
     border: none;
     border-radius: 6px;
@@ -231,12 +301,38 @@
     font-weight: 600;
     cursor: pointer;
   }
+  button.sec {
+    margin: 0;
+    background: #2c3140;
+    font-weight: 500;
+    white-space: nowrap;
+  }
   button:disabled {
     opacity: 0.55;
     cursor: wait;
   }
   button:hover:not(:disabled) {
-    background: #4a93c0;
+    filter: brightness(1.08);
+  }
+  .prog {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .prog-label {
+    font-size: 0.8rem;
+    color: #9a9690;
+  }
+  .bar {
+    height: 6px;
+    background: #0e1016;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .fill {
+    height: 100%;
+    background: #3d7ea6;
+    transition: width 0.12s linear;
   }
   .status {
     margin: 1rem 0 0;

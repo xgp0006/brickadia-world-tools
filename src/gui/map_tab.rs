@@ -1125,7 +1125,7 @@ fn fetch_disabled_reasons(state: &MapTabState) -> Vec<&'static str> {
     if !key_ok_for(&state.config, state.dem_source.required_key()) {
         reasons.push("Selected elevation source needs an API key");
     }
-    // USGS 3DEP / USGS orthoimagery are shown DISABLED ("coming soon") in the
+    // Unwired DEM/imagery sources are shown DISABLED ("coming soon") in the
     // pickers and can never be SELECTED (the picker gates the click on
     // is_fetchable), so state.dem_source / state.imagery_source is always a
     // fetch-wired source — no dead-source Fetch blocker is needed here.
@@ -1182,7 +1182,20 @@ fn draw_zoom_readout(state: &MapTabState, b: BBox, ui: &mut Ui) {
             ui.colored_label(
                 STATUS_WARN_FG,
                 "SRTMGL1 is ~30 m per cell — for areas this small, AWS Terrarium (~5 m/cell at \
-                 z15) gives far finer terrain",
+                 z15) or USGS 3DEP (~1 m, US) gives far finer terrain",
+            );
+        }
+    } else if state.dem_source == DemSource::Usgs3Dep {
+        let area = build::bbox_area_km2(&bbox);
+        ui.small(format!(
+            "DEM: {} · ~1 m target (auto-coarsens for cell budget) · area {area:.0} km² · US only",
+            state.dem_source.display_label(),
+        ));
+        if area > 25.0 {
+            ui.colored_label(
+                STATUS_WARN_FG,
+                "Large 3DEP boxes coarsen toward tens of m/cell to stay under the mesh budget — \
+                 shrink the box or use Grid Build for high-res tiles",
             );
         }
     } else if let Some(src) = super::dem_sources::tile_source_for(state.dem_source, token) {
@@ -1298,6 +1311,12 @@ fn predicted_cell_m(state: &MapTabState, b: BBox) -> Option<f64> {
             // (±sqrt over each axis) rather than one axis exact and the other off.
             let cos_lat = b.centroid_lat().to_radians().cos().max(0.01);
             Some(SRTMGL1_NS_M * cos_lat.sqrt())
+        }
+        DemSource::Usgs3Dep => {
+            // ImageServer export samples at ~1 m, then coarsens to the cell budget.
+            // Report the *target* pitch so the size readout matches the high-fidelity intent;
+            // actual export may be coarser on large boxes (see build::usgs_3dep_export_size).
+            Some(1.0)
         }
         src => {
             let token = state.config.mapbox_token.as_deref();

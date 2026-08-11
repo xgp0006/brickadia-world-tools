@@ -26,7 +26,8 @@ impl DemSource {
     /// so an unwired source can never be selected into a dead state that only
     /// blocks Fetch — the user's "this option does nothing" complaint.
     pub(crate) const fn is_fetchable(self) -> bool {
-        !matches!(self, Self::Usgs3Dep)
+        // All catalog entries have a fetch path (USGS 3DEP = National Map ImageServer).
+        true
     }
 
     pub(crate) const fn display_label(self) -> &'static str {
@@ -72,9 +73,10 @@ impl DemSource {
                  Pair with: larger studs/m if you need walkable size from few cells."
             }
             Self::Usgs3Dep => {
-                "Does: 1 m LiDAR DEM (US only) — highest fidelity target.\n\
-                 In-game: not wired yet (picker disabled). Offline: load a 3DEP GeoTIFF \
-                 via Convert/Sculpt as HD Map heightmap until fetch lands."
+                "Does: USGS 3DEP via National Map ImageServer (CONUS/US). \
+                 Requests ~1 m cells, auto-coarsens if the box would exceed the cell budget.\n\
+                 In-game: highest free US detail — hills/ridges keep LiDAR shape. Outside US = empty/error.\n\
+                 Pair with: small boxes + Downsample=1; Grid Build for large high-res areas."
             }
         }
     }
@@ -183,7 +185,7 @@ pub(crate) fn decode_mapbox_terrain_rgb_pixel(rgb: [u8; 3]) -> f32 {
 /// Construct the `TileSource` for a [`DemSource`] variant. The `token`
 /// parameter is required for token-bearing variants (`MapboxTerrainRgb`);
 /// other variants ignore it. Returns `None` for non-tile variants
-/// (`OpenTopography` fetches via REST in build.rs; `Usgs3Dep` is unwired) and
+/// (`OpenTopography` / `Usgs3Dep` fetch GeoTIFF via REST in build.rs) and
 /// for any variant whose required token is missing or empty.
 pub(crate) fn tile_source_for(
     source: DemSource,
@@ -292,11 +294,9 @@ mod tests {
     #[test]
     fn dem_is_fetchable_matches_real_fetch_path() {
         // is_fetchable() must agree with whether a real fetch path exists, so the
-        // picker greys EXACTLY the sources that cannot fetch (USGS 3DEP) instead
-        // of offering a dead, Fetch-blocking option (the "does nothing" complaint).
-        assert!(!DemSource::Usgs3Dep.is_fetchable(), "USGS 3DEP has no fetch path");
+        // picker greys EXACTLY dead sources — none today (USGS 3DEP is wired).
         for &s in DemSource::ALL {
-            let has_path = matches!(s, DemSource::OpenTopography) // REST GeoTIFF
+            let has_path = matches!(s, DemSource::OpenTopography | DemSource::Usgs3Dep)
                 || tile_source_for(s, Some("pk.token")).is_some();
             assert_eq!(
                 s.is_fetchable(),

@@ -88,10 +88,11 @@ Progress: Tauri events `build:progress { phase, frac }` (mirror current channel)
 | Item | State |
 |------|--------|
 | `heightmap::api::convert_heightmap` | **Done** — shared by egui Convert worker + Tauri |
+| `heightmap::api::predict_dem_cells` | **Done** — pure prediction for Map scaffolding |
 | Workspace | **Done** — members `.` + `apps/desktop/src-tauri` |
-| Tauri + Svelte Convert UI | **Scaffolded** — path inputs → `convert_build` |
-| File dialog / progress events | Next (Phase 2 polish) |
-| Map / Sculpt | Not started |
+| Tauri + Svelte Convert UI | **Phase 2** — dialog browse + `convert:progress` events |
+| Deno package manager | **Done** — `deno task *` (not npm) |
+| Map / Sculpt UI | Not started (core 3DEP fetch is on **egui** Map) |
 
 ### Dev (Tauri) — **Deno**, not npm
 

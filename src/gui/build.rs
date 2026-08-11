@@ -1,7 +1,8 @@
 //! Build orchestrator: bbox → DEM fetch → decode → bricks → .brdb → install.
 //!
 //! DEM paths: AWS Terrarium and Mapbox Terrain-RGB via the shared XYZ tile
-//! stitcher; OpenTopography SRTMGL1 via its single-shot bbox GeoTIFF REST API.
+//! stitcher; OpenTopography SRTMGL1 via its single-shot bbox GeoTIFF REST API;
+//! USGS 3DEP via the National Map Elevation ImageServer `exportImage` GeoTIFF.
 //! Imagery (ESRI World Imagery, Mapbox Satellite) supplies the colormap.
 
 use std::io::{Cursor, Read};
@@ -482,14 +483,16 @@ pub(crate) fn fetch_and_decode_dem(
         token,
         dem_source_label(request.dem_source),
     )?;
-    // OpenTopography is a single-shot bbox GeoTIFF REST API, not an XYZ tile
-    // source, so it bypasses the slippy-tile fetch/stitch path entirely.
+    // Single-shot GeoTIFF REST paths (not XYZ tile pyramids).
     if request.dem_source == DemSource::OpenTopography {
         let key = token.ok_or(BuildError::TokenMissing {
             source_label: dem_source_label(request.dem_source),
             key_name: "OpenTopography API key",
         })?;
         return fetch_opentopo_dem(request.bbox, key, &progress, &cancel);
+    }
+    if request.dem_source == DemSource::Usgs3Dep {
+        return fetch_usgs_3dep_dem(request.bbox, &progress, &cancel);
     }
     let source = dem_tile_source_for(request.dem_source, token)
         .ok_or(BuildError::UnsupportedSource(request.dem_source))?;
@@ -648,6 +651,140 @@ fn fetch_opentopo_dem(
     let raster = decode_geotiff_dem(&bytes)?;
     progress(BuildStage::DecodingDem, 1.0);
     Ok(raster)
+}
+
+/// National Map 3DEP Elevation ImageServer (CONUS + territories). No API key.
+/// Docs: elevation.nationalmap.gov ArcGIS REST `exportImage`.
+const USGS_3DEP_EXPORT: &str =
+    "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage";
+/// Prefer ~1 m LiDAR sampling; auto-coarsen so `cols*rows ≤ MAX_DEM_CELLS`.
+const USGS_3DEP_TARGET_M: f64 = 1.0;
+const USGS_3DEP_TIMEOUT: Duration = Duration::from_secs(120);
+const USGS_3DEP_MAX_BODY_BYTES: u64 = 80 * 1024 * 1024;
+
+/// Fetch USGS 3DEP elevation for a bbox as a GeoTIFF via ImageServer exportImage.
+/// US coverage only; outside CONUS the service may return empty/nodata.
+fn fetch_usgs_3dep_dem(
+    bbox: BBoxLatLon,
+    progress: &ProgressFn,
+    cancel: &AtomicBool,
+) -> Result<DemRaster, BuildError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(BuildError::Cancelled);
+    }
+    let (cols, rows, cell_m) = usgs_3dep_export_size(&bbox);
+    if cols < 2 || rows < 2 {
+        return Err(BuildError::DemApi(
+            "bounding box too small for USGS 3DEP — draw a larger area".into(),
+        ));
+    }
+    info!(
+        "USGS 3DEP export: {cols}×{rows} (~{cell_m:.1} m/cell target after cell budget)"
+    );
+    progress(BuildStage::FetchingTiles, 0.0);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(USGS_3DEP_TIMEOUT)
+        .user_agent(super::USER_AGENT)
+        .build();
+    // ArcGIS exportImage: bbox = xmin,ymin,xmax,ymax in bboxSR (4326 → W,S,E,N).
+    let bbox_q = format!("{},{},{},{}", bbox.west, bbox.south, bbox.east, bbox.north);
+    let size_q = format!("{cols},{rows}");
+    let resp = agent
+        .get(USGS_3DEP_EXPORT)
+        .query("bbox", &bbox_q)
+        .query("bboxSR", "4326")
+        .query("size", &size_q)
+        .query("imageSR", "4326")
+        .query("format", "tiff")
+        .query("pixelType", "F32")
+        .query("noDataInterpretation", "esriNoDataMatchAny")
+        .query("interpolation", "RSP_BilinearInterpolation")
+        .query("f", "image")
+        .call();
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            let body = body.trim();
+            let detail = if body.is_empty() {
+                String::new()
+            } else {
+                // Cap body noise; never log secrets (this endpoint has none).
+                let short: String = body.chars().take(200).collect();
+                format!(": {short}")
+            };
+            return Err(BuildError::DemApi(format!(
+                "USGS 3DEP HTTP {code}{detail} — confirm the box is in the US"
+            )));
+        }
+        Err(e) => {
+            return Err(BuildError::DemApi(format!(
+                "USGS 3DEP network error: {}",
+                super::tiles::redact_secrets(&e.to_string())
+            )));
+        }
+    };
+    if resp.status() != 200 {
+        return Err(BuildError::DemApi(format!(
+            "USGS 3DEP HTTP {} — confirm the box is in the US",
+            resp.status()
+        )));
+    }
+    progress(BuildStage::DecodingDem, 0.0);
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(USGS_3DEP_MAX_BODY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| BuildError::DemApi(format!("reading USGS 3DEP response: {e}")))?;
+    if bytes.len() as u64 > USGS_3DEP_MAX_BODY_BYTES {
+        return Err(BuildError::DemApi(format!(
+            "USGS 3DEP response exceeds {} MiB — draw a smaller box",
+            USGS_3DEP_MAX_BODY_BYTES / (1024 * 1024)
+        )));
+    }
+    // ArcGIS sometimes returns JSON error with 200 + Content-Type application/json.
+    if bytes.starts_with(b"{") || bytes.starts_with(b"[") {
+        let msg = String::from_utf8_lossy(&bytes);
+        let short: String = msg.chars().take(240).collect();
+        return Err(BuildError::DemApi(format!(
+            "USGS 3DEP returned JSON instead of GeoTIFF: {short}"
+        )));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(BuildError::Cancelled);
+    }
+    let raster = decode_geotiff_dem(&bytes)?;
+    progress(BuildStage::DecodingDem, 1.0);
+    Ok(raster)
+}
+
+/// Choose export width/height for 3DEP so cells stay near `USGS_3DEP_TARGET_M`
+/// while `cols * rows ≤ MAX_DEM_CELLS`. Returns `(cols, rows, metres_per_cell)`.
+pub(crate) fn usgs_3dep_export_size(bbox: &BBoxLatLon) -> (u32, u32, f64) {
+    const KM_PER_DEG_LAT: f64 = 110.574;
+    const KM_PER_DEG_LON_EQUATOR: f64 = 111.320;
+    let mid_lat_rad = ((bbox.north + bbox.south) * 0.5).to_radians();
+    let height_m = ((bbox.north - bbox.south) * KM_PER_DEG_LAT * 1000.0).abs();
+    let width_m =
+        ((bbox.east - bbox.west) * KM_PER_DEG_LON_EQUATOR * mid_lat_rad.cos() * 1000.0).abs();
+    let height_m = height_m.max(1.0);
+    let width_m = width_m.max(1.0);
+
+    let mut cell_m = USGS_3DEP_TARGET_M;
+    let max_cells = super::tiles::MAX_DEM_CELLS as f64;
+    // Coarsen until the grid fits the mesher budget (and ArcGIS size sanity).
+    for _ in 0..32 {
+        let cols = (width_m / cell_m).ceil().max(2.0);
+        let rows = (height_m / cell_m).ceil().max(2.0);
+        if cols * rows <= max_cells && cols <= 8000.0 && rows <= 8000.0 {
+            return (cols as u32, rows as u32, cell_m);
+        }
+        cell_m *= 1.5;
+    }
+    // Last resort: fit a square-ish budget grid.
+    let side = (max_cells.sqrt().floor() as u32).max(2).min(8000);
+    let cell_m = (width_m / f64::from(side)).max(height_m / f64::from(side));
+    (side, side, cell_m)
 }
 
 /// Approximate area of a lat/lon bbox in km², via the equirectangular metric:
@@ -1654,6 +1791,38 @@ mod tests {
             "fill_to_base=false must keep flat 2-unit tiles (legacy Convert/CLI \
              behavior), got tallest {tallest}",
         );
+    }
+
+    #[test]
+    fn usgs_3dep_export_size_fits_cell_budget_and_targets_fine_pitch() {
+        // ~500 m box near 40°N — should stay near 1 m and under MAX_DEM_CELLS.
+        let small = BBoxLatLon {
+            north: 40.005,
+            south: 40.0,
+            east: -105.0,
+            west: -105.005,
+        };
+        let (c, r, cell) = usgs_3dep_export_size(&small);
+        assert!(c >= 2 && r >= 2);
+        assert!(
+            u64::from(c) * u64::from(r) <= super::super::tiles::MAX_DEM_CELLS,
+            "export grid must fit mesher budget"
+        );
+        assert!(
+            cell <= 5.0,
+            "small US box should stay near-metre pitch, got {cell} m"
+        );
+
+        // Continent-scale: must coarsen, not overflow.
+        let huge = BBoxLatLon {
+            north: 49.0,
+            south: 25.0,
+            east: -66.0,
+            west: -125.0,
+        };
+        let (c2, r2, cell2) = usgs_3dep_export_size(&huge);
+        assert!(u64::from(c2) * u64::from(r2) <= super::super::tiles::MAX_DEM_CELLS);
+        assert!(cell2 > 100.0, "huge box must coarsen, got {cell2} m");
     }
 
     #[test]

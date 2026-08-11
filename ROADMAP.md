@@ -19,8 +19,8 @@ Full analysis: [docs/FIDELITY_AND_PRODUCT_PLAN.md](./docs/FIDELITY_AND_PRODUCT_P
 
 | Priority | Item | Notes |
 |----------|------|--------|
-| P0 | **Fidelity clarity + window + tooltips** | Density rename (downsample≠detail); always-on-top desync; game-linked help |
-| P1 | **Higher DEM fidelity** | Raise cell budget (host-aware); wire USGS 3DEP 1m; Grid at max zoom |
+| P0 | **Fidelity clarity + window + tooltips** | **Done** 2026-08-11 |
+| P1 | **Higher DEM fidelity** | **USGS 3DEP wired** (National Map ImageServer); MAX_DEM_CELLS 400k; Grid still for large high-res |
 | P1 | **Layers Phase 2+** | Lasso regions, per-layer settings, resolution multiplier (see sculpt-layers-design) |
 | P1 | **Project save** `.h2bproj` | Phase 1b zones/sculpt state — specs under freedraw-zones |
 | P2 | Streaming/columnar mesher | Lifts `MAX_DEM_CELLS` honestly (`opt/generate.rs`) |
