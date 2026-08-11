@@ -1,62 +1,71 @@
 # Brickadia World Tools
 
-**User-facing name:** Brickadia World Tools  
-**Crate / binaries (internal):** `heightmap` · `heightmap_gui` · `heightmap` (CLI)
-
-Fork of [Meshiest/heightmap2brz](https://github.com/Meshiest/heightmap2brz), heavily extended for real-world DEM → Brickadia terrain.
+**Product:** DEM / heightmap → Brickadia `.brdb` / `.brz`  
+**Shell:** **Tauri 2 + Svelte 5 + Deno** (primary)  
+**Crate:** `heightmap` (Rust core; egui GUI **deprecated**)
 
 | | |
 |--|--|
 | **Repo** | https://github.com/xgp0006/brickadia-world-tools |
-| **Upstream** | https://github.com/Meshiest/heightmap2brz (`upstream` remote) |
+| **Upstream** | https://github.com/Meshiest/heightmap2brz |
 | **Host path** | `~/Projects/brickadia/heightmap2brz` (desktop) |
 
-## What it does
-
-- **Map tab** — fetch DEM (AWS Terrarium, Mapbox Terrain-RGB, OpenTopography SRTMGL1), imagery, bbox, brick type, density, scale, generate `.brdb`/`.brz`, install into Brickadia’s Proton prefix (APPID `2199420`).
-- **Convert tab** — heightmap PNG (+ optional colormap) → save.
-- **Sculpt tab** — brushes, stamps, splat paint, terrace, freedraw omit/include zones, free-angle rotation (baked into export), **export layers** (box-selected multi-save), heightmap PNG export.
-
-## Launch
-
-**Classic (full Map/Convert/Sculpt/Grid — default app-grid entry):**
+## Launch (primary)
 
 ```bash
-brickadia-world-tools-gui    # preferred symlink → target/release/heightmap_gui
-# or
+brickadia-world-tools          # preferred
+# aliases (same binary):
+brickadia-world-tools-gui
 heightmap2brz-gui
-cargo build --release --features gui   # after code changes (launcher uses release)
 ```
 
-**Tauri shell (Convert + Map + Grid + Sculpt MVP):**
+App menu: **Brickadia World Tools**.
+
+Tabs: **Convert** · **Map** (DEM + Grid) · **Sculpt**.
+
+### Rebuild after code changes
 
 ```bash
-brickadia-world-tools-tauri            # ~/.local/bin wrapper
-# or
+cd apps/desktop
+deno task install              # once / after package.json changes
+deno task tauri:build          # → target/release/brickadia-world-tools
+# re-link if binary path unchanged (symlink already points at release)
+```
+
+Dev (hot reload UI):
+
+```bash
 cd apps/desktop && deno task tauri:dev
-# release:
-cd apps/desktop && deno task tauri:build
 ```
 
-Program / tickets: [docs/program/PROGRAM.md](./docs/program/PROGRAM.md).
+## Deprecated: egui shell
 
-CLI Stage-2 only:
+The old immediate-mode GUI (`heightmap_gui`) is **deprecated**. Prefer Tauri.
 
 ```bash
-cargo build --release --bin heightmap   # if bin exists without gui feature
-heightmap2brz --help
+# only if you need the legacy binary:
+brickadia-world-tools-legacy-egui
+cargo build --release --features gui --bin heightmap_gui
 ```
 
-Legacy full GeoTIFF pipeline (parent tree): `brickadia-map` → `../legacy/geotiff2heightmap/`.
+Desktop entry for legacy is **hidden** (`NoDisplay=true`).
+
+## CLI (Stage-2 only, still supported)
+
+```bash
+cargo build --release --bin heightmap
+heightmap2brz --help           # symlink → target/release/heightmap
+```
+
+Legacy full GeoTIFF pipeline: `brickadia-map` → `../legacy/geotiff2heightmap/`.
 
 ## Develop
 
 ```bash
 cargo test --lib
-cargo clippy --all-targets --all-features -- -D warnings   # preferred gate
+cargo test --lib --no-default-features --features dem
+cd apps/desktop && deno task build
 ```
-
-Requires Rust **1.88+**, edition **2024**.
 
 Config / API keys: `~/.config/heightmap2brz/config.toml` (mode 600).
 
@@ -64,13 +73,11 @@ Config / API keys: `~/.config/heightmap2brz/config.toml` (mode 600).
 
 | Path | |
 |------|--|
-| [ROADMAP.md](./ROADMAP.md) | Status + next work |
-| [docs/IN_GAME_TEST.md](./docs/IN_GAME_TEST.md) | Manual Brickadia checklist |
-| [docs/superpowers/specs/](./docs/superpowers/specs/) | Feature design specs |
-| [CHANGELOG.md](./CHANGELOG.md) | Notable changes |
-
-Vault (desktop): `brickadia-world-tools` project · `brickadia-heightmap-toolkit` reference.
+| [docs/program/PROGRAM.md](./docs/program/PROGRAM.md) | Phase board + tickets |
+| [ROADMAP.md](./ROADMAP.md) | Status |
+| [docs/IN_GAME_TEST.md](./docs/IN_GAME_TEST.md) | Brickadia QA |
+| [docs/program/fidelity/](./docs/program/fidelity/) | F3 mesher · F5 flats |
 
 ## License / attribution
 
-Upstream authorship retained in history (`Meshiest` / heightmap2brz). See upstream README for original license terms; keep attribution when redistributing.
+Upstream authorship retained (`Meshiest` / heightmap2brz). Keep attribution when redistributing.

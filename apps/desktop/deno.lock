@@ -5,6 +5,7 @@
     "npm:@sveltejs/kit@^2.9.0": "2.70.2_@sveltejs+vite-plugin-svelte@5.1.1__svelte@5.56.8__vite@6.4.3_svelte@5.56.8_typescript@5.6.3_vite@6.4.3",
     "npm:@sveltejs/vite-plugin-svelte@5": "5.1.1_svelte@5.56.8_vite@6.4.3",
     "npm:@tauri-apps/api@2": "2.11.1",
+    "npm:@tauri-apps/cli@*": "2.11.4",
     "npm:@tauri-apps/cli@2": "2.11.4",
     "npm:@tauri-apps/plugin-dialog@2": "2.7.2",
     "npm:@tauri-apps/plugin-opener@2": "2.5.4",

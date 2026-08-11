@@ -66,7 +66,7 @@ Status legend: `todo` · `doing` · `done` · `blocked`
 |----|-------|--------|
 | BWT-5.1 | Desktop entry → Tauri binary | done |
 | BWT-5.2 | Symlink `brickadia-world-tools-gui` dual-run period | done |
-| BWT-5.3 | Archive egui bin behind feature or docs-only | deferred (dual-run is product choice) |
+| BWT-5.3 | Archive egui bin behind feature or docs-only | done (legacy hidden; Tauri primary) |
 | BWT-5.4 | README single-path user docs | done |
 
 ## Fidelity track

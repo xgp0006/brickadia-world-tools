@@ -61,7 +61,7 @@ Progress: Tauri events `build:progress { phase, frac }` (mirror current channel)
 | **2** | Tauri app: Convert-only UI calling `convert_build` | produce `.brdb` from PNG end-to-end |
 | **3** | Map: basemap + bbox + predict + fetch/build/install | parity Map happy path |
 | **4** | Sculpt MVP (raise/lower + export) | then stamps/paint/zones/layers |
-| **5** | Cut over launcher `brickadia-world-tools-gui` → Tauri binary; archive egui bin | dual-run period ends |
+| **5** | Cut over launcher → Tauri binary; deprecate egui | **DONE 2026-08-11** |
 
 ## egui freeze policy
 

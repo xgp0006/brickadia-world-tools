@@ -39,9 +39,12 @@ tiff = { version = "0.9", optional = true }
 rayon = "1.11.0"
 
 [features]
-default = ["gui"]
-# DEM fetch+mesh+write without egui/walkers (Tauri Map path).
+# Product UI is Tauri (apps/desktop). Default = dem core for tests/Tauri.
+# Legacy egui: cargo build --release --features gui --bin heightmap_gui
+default = ["dem"]
+# DEM fetch+mesh+write without egui/walkers (Tauri path).
 dem = ["dep:ureq", "dep:tiff", "dep:serde_json", "dep:toml"]
+# DEPRECATED immediate-mode shell (heightmap_gui). Prefer Tauri.
 gui = [
   "dem",
   "dep:egui",

@@ -1,6 +1,6 @@
-# Brickadia World Tools — desktop shell (Tauri + Svelte)
+# Brickadia World Tools — Tauri + Svelte (primary UI)
 
-**Package manager: Deno** (`deno task …`). `package.json` only lists deps for Deno’s `nodeModulesDir`.
+**Package manager: Deno** (`deno task …`). This app is the **default product**.
 
 ## Setup
 
@@ -9,26 +9,28 @@ cd apps/desktop
 deno task install
 ```
 
-## Run
+## Dev
 
 ```bash
-deno task tauri:dev      # frontend + Rust
-deno task dev            # Vite only (port 1420)
-cargo check -p brickadia-world-tools   # from repo root
+deno task tauri:dev
 ```
 
-## Build
+## Release build
 
 ```bash
 deno task tauri:build
-# binary under apps/desktop/src-tauri/target/release/ (see tauri product name)
+# → ../../target/release/brickadia-world-tools
+# AppImage step may fail (linuxdeploy); the binary is still fine.
 ```
 
-## Dual-run with egui
+Daily launch (after build; symlinks normally already set):
 
-| | |
-|--|--|
-| **egui (full)** | `brickadia-world-tools-gui` — default app-grid entry |
-| **Tauri** | `deno task tauri:dev` — Convert `/` · Map `/map` · Sculpt `/sculpt` |
+```bash
+brickadia-world-tools
+```
 
-Program phases: `docs/program/PROGRAM.md`. Core APIs: `heightmap::api::{convert, install, dem_predict, dem_fetch_build, sculpt}`.
+Routes: `/` Convert · `/map` Map+Grid · `/sculpt` Sculpt.
+
+**Legacy egui (deprecated):** `brickadia-world-tools-legacy-egui`
+
+Program: `docs/program/PROGRAM.md` · Phase 5 cutover complete.
