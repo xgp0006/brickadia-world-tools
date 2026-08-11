@@ -54,50 +54,46 @@ type Progress = (&'static str, f32);
 struct ConvertJob {
     out_file: String,
     to_clipboard: bool,
-    options: GenOptions,
-    heightmap_files: Vec<PathBuf>,
-    colormap_file: Option<PathBuf>,
+    request: crate::api::ConvertRequest,
 }
 
-/// Body of the conversion worker thread: decode inputs, generate bricks,
-/// write the save, optionally copy the path to the clipboard. Failures are
-/// logged here so the GUI promise only has to display them.
+/// Body of the conversion worker thread: shared [`crate::api::convert_heightmap`]
+/// path, then optional clipboard. Failures logged here for the GUI promise.
 fn convert_worker(
     job: ConvertJob,
     progress: &impl Fn(&'static str, f32),
     is_stopped: &impl Fn() -> bool,
 ) -> Result<(), String> {
     info!("Reading image files...");
-    let (heightmap, colormap) =
-        maps_from_files(&job.options, job.heightmap_files, job.colormap_file)
-            .inspect_err(|err| error!("{err}"))?;
-
-    if is_stopped() {
-        return Err(CANCELLED_MSG.to_string());
-    }
-    progress("Generating", 0.10);
-
-    let bricks = gen_opt_heightmap(&*heightmap, &*colormap, job.options, None, None, |p| {
-        progress("Generating", 0.1 + 0.85 * p);
-        !is_stopped()
-    })
-    .inspect_err(|err| error!("{err}"))?;
-    if is_stopped() {
-        return Err(CANCELLED_MSG.to_string());
-    }
-
-    info!("Writing Save to {}", job.out_file);
-    progress("Writing", 0.95);
-    write_save(&job.out_file, bricks).inspect_err(|err| error!("{err}"))?;
+    let out = job.out_file.clone();
+    crate::api::convert_heightmap(
+        job.request,
+        |p| {
+            // Map dynamic phase names to the static labels the progress bar expects.
+            let label: &'static str = match p.phase.as_str() {
+                "Reading" => "Reading",
+                "Generating" => "Generating",
+                "Writing" => "Writing",
+                "Finished" => "Finished",
+                _ => "Working",
+            };
+            progress(label, p.frac);
+        },
+        is_stopped,
+    )
+    .map_err(|err| {
+        error!("{err}");
+        if err == "cancelled" {
+            CANCELLED_MSG.to_string()
+        } else {
+            err
+        }
+    })?;
 
     if job.to_clipboard {
-        copy_path_to_clipboard(&job.out_file).inspect_err(|err| error!("{err}"))?;
+        copy_path_to_clipboard(&out).inspect_err(|err| error!("{err}"))?;
     }
 
-    if is_stopped() {
-        return Err(CANCELLED_MSG.to_string());
-    }
-    progress("Finished", 1.0);
     info!("Done!");
     Ok(())
 }
@@ -194,41 +190,30 @@ impl HeightmapApp {
         self.heightmaps.iter().any(check_image) || self.colormap.as_ref().is_some_and(check_image)
     }
 
-    fn options(&self) -> GenOptions {
-        GenOptions {
-            size: if self.mode == BrickMode::Micro {
-                self.horizontal_size
-            } else {
-                self.horizontal_size * 5
-            },
-            scale: self.vertical_scale,
+    fn convert_request(&self) -> crate::api::ConvertRequest {
+        use crate::api::BrickModeDto;
+        let brick_mode = match self.mode {
+            BrickMode::Default => BrickModeDto::Default,
+            BrickMode::Tile => BrickModeDto::Tile,
+            BrickMode::SmoothTile => BrickModeDto::SmoothTile,
+            BrickMode::Stud => BrickModeDto::Stud,
+            BrickMode::Micro => BrickModeDto::Micro,
+        };
+        crate::api::ConvertRequest {
+            heightmaps: self.heightmaps.clone(),
+            colormap: self.colormap.clone(),
+            out_file: PathBuf::from(&self.out_file),
+            brick_mode,
+            horizontal_size: self.horizontal_size,
+            vertical_scale: self.vertical_scale,
+            greedy: self.optimization == OptimizationMode::Greedy,
+            quadtree: self.optimization == OptimizationMode::Quad,
             cull: self.opt_cull,
-            asset: match self.mode {
-                BrickMode::Default => PB_DEFAULT_BRICK,
-                BrickMode::Tile => PB_DEFAULT_TILE,
-                BrickMode::SmoothTile => PB_DEFAULT_SMOOTH_TILE,
-                BrickMode::Stud => PB_DEFAULT_STUDDED,
-                BrickMode::Micro => PB_DEFAULT_MICRO_BRICK,
-            },
-            micro: self.mode == BrickMode::Micro,
-            stud: self.mode == BrickMode::Stud,
-            snap: self.opt_snap,
-            img: self.heightmaps.is_empty() && self.colormap.is_some(),
+            nocollide: self.opt_nocollide,
             glow: self.opt_glow,
             hdmap: self.opt_hdmap,
             lrgb: self.opt_lrgb,
-            nocollide: self.opt_nocollide,
-            quadtree: self.optimization == OptimizationMode::Quad,
-            greedy: self.optimization == OptimizationMode::Greedy,
-            // Convert-tab heights are un-normalized and vertical_scale reaches
-            // 100 with no brick cap, so keep the legacy flat surface (no base
-            // fill) to avoid an unbounded brick stack.
-            fill_to_base: false,
-            // Convert tab never skips the floor — output stays byte-identical.
-            skip_floor: false,
-            // Convert tab never omits columns (skip_floor is off); inert.
-            omit_below_h: 0,
-            max_brick_units: crate::opt::MAX_BRICK_UNITS,
+            snap: self.opt_snap,
         }
     }
 
@@ -236,9 +221,7 @@ impl HeightmapApp {
         let job = ConvertJob {
             out_file: self.out_file.clone(),
             to_clipboard: self.out_clipboard,
-            options: self.options(),
-            heightmap_files: self.heightmaps.clone(),
-            colormap_file: self.colormap.clone(),
+            request: self.convert_request(),
         };
 
         let progress_tx = self.progress_channel.0.clone();

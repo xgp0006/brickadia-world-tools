@@ -1,10 +1,13 @@
+[workspace]
+members = [".", "apps/desktop/src-tauri"]
+resolver = "2"
+
 [package]
 name = "heightmap"
 version = "0.8.1"
 authors = ["Isaac <gpg@reheatedcake.io>"]
 edition = "2024"
 rust-version = "1.88"
-
 
 [dependencies]
 image = { version = "0.25.8", features = ["png"] }
@@ -25,7 +28,8 @@ egui_extras = { version = "0.33.3", features = [
 ], optional = true }
 egui-phosphor = { version = "0.11", optional = true }
 walkers = { version = "0.52", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
+# Always on: public `api` DTOs (Tauri/egui shells).
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }
 dirs = { version = "5", optional = true }
@@ -44,7 +48,6 @@ gui = [
   "dep:native-dialog",
   "dep:arboard",
   "dep:walkers",
-  "dep:serde",
   "dep:serde_json",
   "dep:toml",
   "dep:dirs",

@@ -1,13 +1,20 @@
 /target
+**/target
 **/*.rs.bk
 *.brs
 *.brz
 *.brdb
 maps
 
-
-
 # local artifacts
 /builds/
 *.brdb
 *.brz
+
+# Tauri / Svelte shell (Deno)
+apps/desktop/node_modules/
+apps/desktop/build/
+apps/desktop/.svelte-kit/
+apps/desktop/src-tauri/target/
+# deno.lock is committed when present
+

@@ -83,10 +83,28 @@ Progress: Tauri events `build:progress { phase, frac }` (mirror current channel)
 | Wayland WebView quirks | Spike Phase 2 week 1 on this host |
 | Double maintenance | Short dual-run; core tests only in Rust |
 
-## Next concrete step
+## Status (2026-08-11)
 
-1. Phase 1 workspace split (extract pure API from `gui/build.rs` / `tiles` without egui types)  
-2. `cargo create` Tauri app under `apps/desktop` when Phase 1 API stabilizes  
-3. Convert tab spike as acceptance  
+| Item | State |
+|------|--------|
+| `heightmap::api::convert_heightmap` | **Done** — shared by egui Convert worker + Tauri |
+| Workspace | **Done** — members `.` + `apps/desktop/src-tauri` |
+| Tauri + Svelte Convert UI | **Scaffolded** — path inputs → `convert_build` |
+| File dialog / progress events | Next (Phase 2 polish) |
+| Map / Sculpt | Not started |
 
-Do **not** start a greenfield Svelte sculpt before Convert E2E works.
+### Dev (Tauri) — **Deno**, not npm
+
+```bash
+cd apps/desktop
+deno task install          # nodeModulesDir auto from package.json
+deno task tauri:dev        # or: deno task tauri -- dev
+# Rust-only:
+cargo check -p brickadia-world-tools
+```
+
+`tauri.conf.json` hooks: `beforeDevCommand` / `beforeBuildCommand` = `deno task dev|build`.
+
+egui still: `cargo build --release --features gui` → `brickadia-world-tools-gui`.
+
+Do **not** start a greenfield Svelte sculpt before Convert E2E is solid (dialog + progress + install).

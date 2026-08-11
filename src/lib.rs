@@ -1,3 +1,4 @@
+pub mod api;
 pub mod map;
 pub mod opt;
 pub mod util;
